@@ -1,1 +1,6 @@
-/data/
+/data
+/models/
+/runs/
+__pycache__/
+*.onnx
+*.engine
