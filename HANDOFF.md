@@ -45,7 +45,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 下拉選單切換 `models/*.pth`（顯示 `.json` 裡的 label、params、MACs、val loss）；PyTorch 和 TRT `.pth` 自動判斷，TRT 的輸入 dtype 從 engine 讀。
 - 即時畫面＋預測點＋steering 條；x、y、angle、steering、左右馬達、P、D、FPS、推論延遲。
 - 投影片四個滑桿（speed gain、steering gain、kd、bias）。
-- 「允許移動」預設關閉；「停止」立刻停車並取消許可；切換模型時先停車並 reset 控制器。
+- 「允許移動」預設關閉；「停止」立刻停車並取消許可；切換模型時停車、**取消允許移動**、reset 控制器。
 - 「輸入干擾」：在即時畫面上加柏林噪聲／壓縮失真，測穩健性（額外加的功能）。
 - 「錄製 CSV」寫到 `runs/drive_*.csv`；第 5 節 `benchmark()` 在相同條件下量所有模型的延遲，供報告使用。
 - `CAMERA_SOURCE='dummy'` 或 `'folder'` 加上 `USE_ROBOT=False`，沒有 JetBot 也能跑。
@@ -68,10 +68,19 @@ Nano：把 `models/*.pth`、`*.json`、`*.onnx` 和 `project4/*.py`、`live_demo
 ```bash
 /usr/src/tensorrt/bin/trtexec --onnx=models/X.onnx --saveEngine=models/X.engine --fp16
 python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','models/X_trt.pth')"
-cp models/X.json models/X_trt.json   # 可選：讓 UI 顯示 label（再把 label 加上 ' | TRT'）
+# wrap_trt_engine 會自動把 models/X.json 複製成 X_trt.json，label 加上 ' | TensorRT'
 ```
 
+完整的車子操作步驟（DEMO 前一天建 engine、當天架高測試、調參順序、疑難排解）寫在 `project4/README.md`。
+
 然後開 `live_demo.ipynb` 由上往下執行。`models/` 裡 PyTorch 和 TRT 的 `.pth` 會一起出現在下拉選單。
+
+## 第二階段（README 與 DEMO 操作）
+
+- `project4/README.md` 改寫：各模組簡介、PC 訓練指令、DEMO 前一天建 TRT engine、DEMO 當天操作步驟、調參順序（P.72）、報告證據清單、疑難排解。
+- `compression.wrap_trt_engine` 會自動產生 TRT 版的 `.json`（label 加上 `| TensorRT`），讓下拉選單分得出 PyTorch 版和 TRT 版。用假 engine 測過 ✅
+- live_demo：切換模型時自動取消「允許移動」，避免新模型一載入完車子就自己開走。nbclient 測過：切換前左馬達 0.546 → 切換後 0 / 0、`allow_move=False` ✅
+- notebook 由 scratchpad 裡的 `make_nb.py` 產生（沒有進 repo）；之後改 notebook 可以直接在 Jupyter 裡改。
 
 ## 未完成 / 未驗證
 

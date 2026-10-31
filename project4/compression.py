@@ -13,6 +13,7 @@ Robot side (no torch-pruning needed):
 imported on the Nano just for ``wrap_trt_engine``.
 """
 import copy
+import os
 
 import torch
 import torch.nn as nn
@@ -96,4 +97,13 @@ def wrap_trt_engine(engine_path, out_path, input_names=("input_0",), output_name
     torch.save({"engine": bytearray(engine_bytes),
                 "input_names": list(input_names),
                 "output_names": list(output_names)}, out_path)
+
+    # Carry over the PyTorch model's metadata (X.json next to X.engine) so the
+    # live-demo dropdown shows e.g. "ResNet18 | aug=none | DepGraph 30% | TensorRT".
+    from model import read_meta, write_meta
+    meta = read_meta(engine_path)
+    if meta:
+        meta = dict(meta, label=meta.get("label", "") + " | TensorRT", runtime="tensorrt",
+                    engine=os.path.basename(engine_path))
+        write_meta(out_path, meta)
     return out_path

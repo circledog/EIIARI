@@ -1,1 +1,236 @@
 # Project 4：AI 道路辨識
+
+JetBot 道路跟隨：模型從相機畫面預測「要前往的目標點 (x, y)」，再用 PD + bias 控制左右輪。
+
+```
+PC / Colab   Data Loader → Data Augmentation → Model training → Model compression (DepGraph)
+                                                                        │ .pth / .onnx
+Jetson Nano  Camera Input → Model inferencing (PyTorch 或 TensorRT) → Motor controlling (PD + bias)
+```
+
+## 檔案一覽
+
+| 檔案 | 在哪裡跑 | 用途 |
+|---|---|---|
+| `project4_data_collection_gamepad.ipynb` | Nano | 收集資料（操作見 `使用說明.txt`） |
+| `data_collection_gamepad.ipynb`、`train_model.ipynb` | — | 課程原始範例，留作參考 |
+| `data_loader.py` | PC | 資料集與 DataLoader |
+| `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
+| `model.py` | PC + Nano | 模型定義、載入 |
+| `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
+| `camera.py` | Nano | 相機輸入與前處理 |
+| `control.py` | Nano | PD + bias 差速控制 |
+| `train.py` | PC | 訓練 → 剪枝 → finetune → 匯出 |
+| `live_demo.ipynb` | Nano | 推論＋控制的操作介面 |
+| `requirements-pc.txt` | PC | PC / Colab 端套件 |
+
+資料放在 `data/`、模型放在 `models/`、行駛紀錄放在 `runs/`，這三個資料夾都不進 git。
+
+## 各模組簡介
+
+### `data_loader.py`
+
+- `XYDataset(directory=None, augmenter=None)`：讀取 `xy_<x>_<y>_<uuid>.jpg`，從檔名取出像素座標，再正規化到 [-1, 1]。
+  - `directory` 預設是 `data/dataset_xy_2026-10-21/dataset_xy`。
+- `make_loaders(directory, general, perlin, compression, ...)`：回傳 train / val 的 DataLoader。
+  - 用固定 seed 隨機切 9:1。
+  - **只有訓練集做 augmentation**，驗證集一律用原圖。
+- 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
+- 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
+
+### `augmentation.py`
+
+`Augmenter(general=False, perlin=False, compression=False)`，呼叫方式是 `aug(image, x, y) -> (image, x, y)`。三個開關**全關時原樣輸出**。
+
+| 開關 | 內容 |
+|---|---|
+| `general` | 水平翻轉、±10° 旋轉、80~100% 裁切再放大、亮度 / 對比 / 飽和度 ±0.3。幾何變換會同步移動標籤座標 |
+| `perlin` | 柏林噪聲做出大片明暗不均，模擬光線和陰影 |
+| `compression` | JPEG 低品質（q 5~35）重壓，或像 YouTube 144p 那樣縮小、重壓再放大 |
+
+### `model.py`
+
+- `build_model()`：ImageNet 預訓練的 ResNet-18，`fc = Linear(512, 2)`（投影片 P.39、P.45）。
+  - `arch` 參數是給之後換別的模型用的，目前只支援 `resnet18`。
+- `rebuild_resnet18_from_state_dict(sd)`：依權重的形狀重建網路。剪枝後 channel 數變少，直接 `load_state_dict` 會 size mismatch。
+- `load_model(path)`：自動判斷 `.pth` 是 PyTorch 權重還是 TensorRT 包裝。TRT 的輸入 dtype 從 engine 讀，所以 trtexec 建的 FP32 輸入不會被誤餵 half。
+- `list_models(dir)`：給介面下拉選單用，顯示名稱來自同名的 `.json`。
+
+### `compression.py`
+
+- `prune_model(model, ratio)`：DepGraph 結構化剪枝。
+  - 用 torch-pruning 的 `MetaPruner` + `GroupMagnitudeImportance(p=2)`，`fc` 不剪，`round_to=8`。
+  - 有殘差連接的層會一起剪，剪完仍是合法的 ResNet-18，只是 channel 變少。
+- `count_macs_params()`、`export_onnx()`：ONNX 用 opset 11，輸入輸出名稱是 `input_0` / `output_0`。
+- `wrap_trt_engine(engine, out)`：把 `trtexec` 建好的 engine 包成 `TRTModule` 能讀的 `.pth`，並自動產生 label 加上「| TensorRT」的 `.json`。
+
+| 剪枝比例 | MACs | Params |
+|---|---|---|
+| 不剪 | 1.82G | 11.18M |
+| 30% | 0.84G | 5.27M |
+| 50% | 0.49G | 2.80M |
+
+### `camera.py`
+
+- `open_camera(source)`：`'jetbot'`（CSI 相機）、`'opencv'`（USB）、`'folder'`（輪播資料集圖片）、`'dummy'`（假畫面）。後兩種沒有車也能測。
+- `preprocess(frame, device, dtype)`：投影片 P.59 的前處理，dtype 依模型決定，不再寫死 `.half()`。
+- `degrade()`：在即時畫面上加柏林噪聲 / 壓縮失真，給介面的「輸入干擾」用。
+- `draw_overlay()`、`to_jpeg()`：畫預測點和轉向條，供畫面顯示。
+
+### `control.py`
+
+依投影片 P.69、P.75 的 `execute()`：
+
+```
+x = xy[0];  y = (0.5 - xy[1]) / 2
+angle    = arctan2(x, y)
+steering = Kp·angle + Kd·(angle − angle_last) + bias
+left  = clip(speed + steering, 0, 1)
+right = clip(speed − steering, 0, 1)
+```
+
+同一個 steering 一邊加、一邊減，兩輪互相拮抗產生轉向：steering > 0 右轉，< 0 左轉。用法是 `PDController(speed, kp, kd, bias).update(x, y) -> (left, right)`，各項中間值放在 `.last`。
+
+### `train.py`
+
+```bash
+pip install -r requirements-pc.txt
+python train.py --help
+```
+
+| 參數 | 說明 |
+|---|---|
+| `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
+| `--epochs 70` `--lr 1e-3` `--batch-size 8` | baseline 訓練（預設值同課程） |
+| `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
+| `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
+| `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
+| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（augmentation 設定沿用它的 .json） |
+| `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
+
+產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
+
+### `live_demo.ipynb`
+
+| 區塊 | 內容 |
+|---|---|
+| 變因 | 模型下拉選單（augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
+| 畫面 | 即時影像、綠色預測點、上方橘色轉向條 |
+| 控制參數 | speed gain、steering gain (Kp)、steering kd、steering bias（投影片 P.71 的範圍） |
+| 即時讀數 | x、y、angle、steering、左右馬達、P / D 項、FPS、推論延遲 |
+| 運轉 | 開始推論、**停止**、**允許移動**（預設關閉）、錄製 CSV |
+
+---
+
+## DEMO 前（PC / Colab，有 GPU）
+
+```bash
+cd project4
+python train.py --prune 0.3 0.5 --onnx                                   # 無 augmentation
+python train.py --general --prune 0.3 0.5 --onnx                         # 一般做法
+python train.py --general --perlin --prune 0.3 0.5 --onnx                # + 柏林噪聲
+python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓縮失真
+```
+
+看 log 裡的 val loss：如果剪枝 50% 的 finetune 後明顯比 baseline 差，DEMO 就用 30% 的版本。
+
+## DEMO 前一天（Nano）：建 TensorRT engine
+
+engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO 當天**。
+
+1. 把以下檔案同步到板子的同一個資料夾（例如 `~/project4/`）：
+   - `*.py`、`live_demo.ipynb`
+   - `models/` 裡的 `.pth`、`.json`、`.onnx`
+2. 在板子的終端機，對每個 `.onnx` 建 engine 並包裝：
+
+   ```bash
+   cd ~/project4/models
+   for f in *.onnx; do
+     n="${f%.onnx}"
+     /usr/src/tensorrt/bin/trtexec --onnx="$f" --saveEngine="$n.engine" --fp16
+   done
+   cd ..
+   python3 -c "
+   import glob; from compression import wrap_trt_engine
+   for e in glob.glob('models/*.engine'):
+       print(wrap_trt_engine(e, e[:-len('.engine')] + '_trt.pth'))"
+   ```
+
+3. 開 `live_demo.ipynb`，執行到第 4 節，選一個 `| TensorRT` 的模型按「開始推論」，**先確認 TRT 能載入**。
+   - 如果出錯，看「已知風險」那一節。PyTorch 的 `.pth` 一樣可以 DEMO。
+4. 第 5 節的 `benchmark()` 可以先跑一次，記下各模型的延遲給報告用。
+
+## DEMO 當天：操作車子
+
+### 1. 開機連線
+
+1. 車子開機，筆電連上板子的 AP，打開 Jupyter（port 8888）。
+2. **把其他 notebook 的 kernel 都關掉**，尤其是資料收集那本。相機同時只能被一個程式佔用。
+   - 用 Running 分頁或 Kernel → Shut Down。
+
+### 2. 啟動介面
+
+1. 開 `live_demo.ipynb`，確認第 1 節的設定是 `CAMERA_SOURCE = 'jetbot'`、`USE_ROBOT = True`。
+2. 由上往下執行第 1 到第 4 節。第 3 節會出現介面。
+
+### 3. 架高測試（輪子離地）
+
+1. 下拉選單選要 DEMO 的模型，按 **開始推論**。
+2. 把車子放在跑道上不同位置，確認綠點落在該去的方向，FPS 和延遲合理。
+3. 把車架高讓輪子離地，speed gain 調到 0.1，勾 **允許移動**。
+   - 兩輪都會轉。目標在右邊時左輪比較快，目標在左邊時右輪比較快。
+   - 方向反了就先停下來檢查接線或程式。
+4. 按 **停止**。
+
+### 4. 放到跑道上
+
+照投影片 P.72 的原則：先用低速，一次只改一個參數。
+
+1. 起始值：speed gain **0.10~0.15**、steering gain 0.2、kd 0、bias 0。
+2. 把車放在直線段，勾 **允許移動**。
+3. **先調 steering gain (Kp)**：轉彎轉不過去就加大；左右擺動就減小。
+4. 擺動還是明顯時，**再加 kd**，從 0.01~0.05 慢慢加。太大會放大預測雜訊，反而抖。
+5. 直線上一直往同一邊偏，就調 **bias**（-0.3~0.3），補償左右馬達的差異。
+6. 穩定之後再慢慢提高 speed gain。速度變快通常要重新微調 Kp / Kd。
+
+### 5. 比較不同變因
+
+- 從下拉選單換模型時，車子會**自動停下並取消「允許移動」**。
+  - 換完先看綠點正不正常，再手動勾回「允許移動」。
+- 勾「輸入干擾」可以現場示範：有柏林噪聲 / 壓縮 augmentation 的模型在干擾下比較穩。
+- 勾 **錄製 CSV**，每一幀的模型、x、y、steering、左右馬達、延遲、Kp / Kd / bias 都會寫進 `runs/drive_*.csv`，報告可以用來畫圖。
+
+### 6. 停車與結束
+
+- 隨時按 **停止**：立刻停車、取消允許移動、停止推論。
+- 狀況不對時，直接把車拿起來再按停止。
+  - Jupyter 的 interrupt（■）**停不了背景推論迴圈**，要用「停止」按鈕。
+- 結束時執行第 6 節：停車並釋放相機。下次要開別的 notebook 前一定要做。
+
+### 報告要留的證據（投影片 P.79、P.80）
+
+- [ ] 各模型 `.json`：epoch 數、訓練 / 驗證張數、loss 曲線、MACs / params
+- [ ] `benchmark()` 的延遲 / FPS，所有模型在相同條件下量
+- [ ] `runs/drive_*.csv` 和行駛影片：跑幾圈、有沒有出界、擺動情況
+- [ ] 最後用的 speed gain、Kp、Kd、bias，以及調整過程
+
+## 疑難排解
+
+| 狀況 | 處理 |
+|---|---|
+| 相機開不起來或畫面沒更新 | 其他 notebook 還佔著相機：關掉所有 kernel 再試，還不行就 `sudo systemctl restart nvargus-daemon` |
+| 綠點亂跳或完全不對 | 是模型或資料的問題，不是控制的問題（投影片 P.61）。換一個模型比較看看 |
+| 綠點合理但車子擺動 | 是控制的問題：降低 Kp 或 speed gain，再加一點 Kd |
+| 選 TRT 模型出錯 | 見下方「已知風險」，先改用同名的 PyTorch `.pth` |
+| `No module named torch2trt` | 只有 TRT 模型需要 torch2trt。在 Nano 上確認有裝 |
+| 介面卡住沒反應 | 按停止，重新執行第 4 節，再按開始推論 |
+
+## 已知風險（沙盒內無法驗證）
+
+- **TensorRT**：舊版 torch2trt 的 `TRTModule` 用 implicit batch 的 `execute_async`，碰到 trtexec 建的 explicit batch engine 可能報錯。
+  - 備案是用 PyTorch `.pth` DEMO（CUDA 上自動 FP16）。
+  - 或照投影片 P.55 用 `torch2trt` 轉：模型改用 `rebuild_resnet18_from_state_dict()` 建立。
+- Nano 上的 Python 3.6 / 舊版 ipywidgets 只做過靜態語法檢查，介面排版可能和 PC 上不同。
+- 和投影片流程不同的地方，報告要寫清楚，DEMO 前建議先問助教：
+  - 訓練和剪枝在 PC 上做，不是在 JetBot 上（P.79）。
+  - TensorRT 轉換走 ONNX → trtexec，不是 torch2trt（P.56）。
