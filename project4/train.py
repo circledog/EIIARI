@@ -9,6 +9,7 @@ Examples
     python train.py --general --perlin --prune 0.3 0.5 --onnx
 
     # prune an existing baseline without retraining it
+    # (augmentation switches and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
 
 Outputs in ``--out`` (default ``models/``), per run name ``resnet18_<aug>``:
@@ -106,6 +107,18 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     os.makedirs(args.out, exist_ok=True)
+
+    if args.base:
+        # Reuse the baseline's augmentation switches and run name unless overridden,
+        # so pruned files stay grouped with (and labelled like) their baseline.
+        base_aug = read_meta(args.base).get("augmentation", {})
+        if not (args.general or args.perlin or args.compression):
+            args.general = bool(base_aug.get("general"))
+            args.perlin = bool(base_aug.get("perlin"))
+            args.compression = bool(base_aug.get("compression"))
+        stem = os.path.splitext(os.path.basename(args.base))[0]
+        if args.name is None and stem.endswith("_base"):
+            args.name = stem[:-len("_base")]
 
     train_loader, val_loader, aug = make_loaders(
         args.data, general=args.general, perlin=args.perlin, compression=args.compression,

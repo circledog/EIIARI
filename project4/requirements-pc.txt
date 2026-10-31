@@ -1,0 +1,9 @@
+# PC / Colab side (training, pruning, ONNX). The Nano uses its JetPack torch + torch2trt.
+torch
+torchvision
+torch-pruning
+onnx
+onnxruntime
+numpy
+pillow
+opencv-python

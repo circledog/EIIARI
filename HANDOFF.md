@@ -50,20 +50,67 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 「錄製 CSV」寫到 `runs/drive_*.csv`；第 5 節 `benchmark()` 在相同條件下量所有模型的延遲，供報告使用。
 - `CAMERA_SOURCE='dummy'` 或 `'folder'` 加上 `USE_ROBOT=False`，沒有 JetBot 也能跑。
 
-## 未完成
+## 使用流程
 
-- 用真實資料在 CPU 上跑 train.py 的 smoke test（含剪枝、ONNX）。
-- 用 dummy 相機與假 robot 執行一次 live_demo.ipynb。
-- 板子端（TRT、實際行駛）只能由使用者實測。
+PC / Colab（`pip install -r requirements-pc.txt`）：
+
+```bash
+cd project4
+python train.py --prune 0.3 0.5 --onnx                                   # 無 augmentation
+python train.py --general --prune 0.3 0.5 --onnx                         # 一般做法
+python train.py --general --perlin --prune 0.3 0.5 --onnx                # + 柏林噪聲
+python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓縮失真
+# 產出 models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}
+```
+
+Nano：把 `models/*.pth`、`*.json`、`*.onnx` 和 `project4/*.py`、`live_demo.ipynb` 同步到板子後：
+
+```bash
+/usr/src/tensorrt/bin/trtexec --onnx=models/X.onnx --saveEngine=models/X.engine --fp16
+python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','models/X_trt.pth')"
+cp models/X.json models/X_trt.json   # 可選：讓 UI 顯示 label（再把 label 加上 ' | TRT'）
+```
+
+然後開 `live_demo.ipynb` 由上往下執行。`models/` 裡 PyTorch 和 TRT 的 `.pth` 會一起出現在下拉選單。
+
+## 未完成 / 未驗證
+
+- **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
+- **Nano 上沒有實際跑過**：jetbot.Camera / Robot、Python 3.6 環境（只用 vermin 靜態檢查過）、ipywidgets 舊版的介面排版。
+- 正式訓練（70 epochs、各種 augmentation 組合）還沒跑，smoke test 只跑了 2 epochs。
+- 「other model」尚未決定。
+- 若 Nano 上的 torch 沒有 `torch.load(..., weights_only=...)` 會 fallback；舊 torchvision 的 `pretrained=` 已處理。
 
 ## 測試指令與結果
 
+Python 環境：`/tmp/claude-1000/.../scratchpad/venv`（Python 3.12，torch 2.15 CPU from PyPI，torch-pruning 1.6.0）。
+
 ```bash
-# Python 3.6 相容性（Nano 端模組）
+# 1. Python 3.6 相容性（Nano 端模組）
 vermin --no-tips -t=3.6- model.py control.py camera.py compression.py augmentation.py
 # → Minimum required versions: 3.3  ✅
+
+# 2. 真實資料 smoke test（200 張 → 180 train / 20 val）
+python train.py --general --perlin --compression --epochs 2 --prune 0.3 --finetune-epochs 1 --onnx --workers 2 --out <tmp>/models
+# → base val 0.0867；剪枝 30%：MACs 1.82G→0.84G、params 11.18M→5.27M，finetune 1 epoch 後 val 0.0435  ✅ 約 50 秒
+python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.5 --finetune-epochs 1
+# → MACs 1.82G→0.49G、params 11.18M→2.80M；檔名、augmentation 沿用 baseline 的 .json  ✅
+
+# 3. 一致性
+# - load_model 用 shape 重建 base / pruned30 → 與 onnxruntime 最大差 ~1e-7，opset 11，
+#   op 只有 Add/Conv/Flatten/Gemm/GlobalAveragePool/MaxPool/Relu  ✅
+# - 訓練前處理 (data_loader) vs 相機前處理 (camera.preprocess) 同一張圖：差 0  ✅
+# - 控制：目標在右 (x=0.5,y=0.25)→ 左 0.63 / 右 0.00（右轉）；目標在左 → 左 0 / 右 0.74  ✅
+# - augmentation 幾何標籤誤差平均 0.65 px  ✅
+
+# 4. live_demo.ipynb 用 nbclient 無頭執行（CAMERA_SOURCE='dummy'、USE_ROBOT=False）
+# → 推論 ~33 FPS（CPU）；未勾允許移動時馬達 0、勾了才送值；切模型＋輸入干擾正常；
+#   停止後馬達 0、允許移動取消；CSV 263 行；benchmark：pruned30 12 ms、base 43 ms（CPU）  ✅
 ```
 
 ## 下一步
 
-- sandbox 的 `download.pytorch.org` 被防火牆擋（需 host 審核），改從 PyPI 安裝 torch 中。
+1. 在 PC / Colab 用 GPU 跑正式訓練（四種 augmentation 組合 × base / pruned30 / pruned50）。
+2. 板子上跑 trtexec → wrap → live_demo，先驗證 TRT 載入（風險最高）。
+3. 驗證 Nano 上的介面與相機，再調 PD 參數。
+4. 決定 other model 後在 `model.build_model(arch=...)` 和 `rebuild_*` 加上對應的分支。
