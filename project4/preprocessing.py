@@ -3,13 +3,21 @@ mark the lane lines (white tape) on the image.
 
     Data Loader -> Preprocessing -> Data Augmentation -> Model training
 
-Unlike augmentation (random, training only), preprocessing is applied the same
-way every time -- in training *and* on the robot. Whether a model was trained
-with it is saved in the model's ``.json``; ``live_demo.ipynb`` rebuilds the
-same ``Preprocessor`` when it loads the model.
+Always on (no switch). ``train.py`` calls ``preprocess_dataset()`` first: it
+writes a lane-marked copy of every image to an output folder (kept on disk,
+lossless PNG with the same ``xy_<x>_<y>_<uuid>`` name), and training reads
+that folder. ``live_demo.ipynb`` calls ``apply_frame()`` on every camera frame,
+so the robot sees exactly what the model was trained on.
 
-What it does (``lanes=True``; ``lanes=False`` = identity, old models unaffected)
-------------------------------------------------------------------------------
+    data/<name>/dataset_xy/xy_*.jpg  ->  data/<name>/dataset_xy_lanes/xy_*.png
+                                         + preprocessing.json (parameters)
+
+The output folder sits next to the input, so ``metadata/`` (``--split
+session``) is still found. Re-running only processes new images; if the
+parameters change everything is redone and stale files are removed.
+
+What it does
+------------
 Every pixel that looks like lane tape is painted pure red, so the model gets
 the lane lines handed to it while still seeing the rest of the picture (3
 colour channels, ResNet unchanged). The labels are not touched.
@@ -33,19 +41,22 @@ Parameters are tuned on 224x224 frames; other sizes scale the kernels. On the
 198-image training set every image gets tape marked, no label point ends up on
 marked pixels, and it takes ~6 ms per frame on a PC CPU.
 
-On the robot:
-    prep = Preprocessor.from_config(model.meta.get("preprocessing"))
-    frame_in = prep.apply_frame(frame)          # BGR uint8 in, BGR uint8 out
+Usage:
+    out_dir = preprocess_dataset("data/x/dataset_xy")   # PC, called by train.py
+    frame_in = apply_frame(frame)                       # robot, BGR uint8 in/out
 
 Python 3.6 compatible (runs on the Jetson Nano).
 """
+import glob
+import json
 import os
 
 import cv2
 import numpy as np
 import PIL.Image
 
-__all__ = ["Preprocessor", "lane_mask", "mark_lanes", "LANE_COLOR_BGR", "DEFAULT_PARAMS"]
+__all__ = ["preprocess_dataset", "default_output_dir", "apply_frame", "lane_mask", "mark_lanes",
+           "LANE_COLOR_BGR", "DEFAULT_PARAMS", "CONFIG"]
 
 LANE_COLOR_BGR = (0, 0, 255)   # pure red: does not occur on the track
 DEFAULT_PARAMS = {"delta": 70, "th_top": 35, "delta_top": 40, "tophat": 21,
@@ -94,84 +105,91 @@ def mark_lanes(bgr, params=None):
     return out
 
 
-class Preprocessor(object):
-    """Callable ``(PIL image, x_px, y_px) -> (PIL image, x_px, y_px)``."""
+def apply_frame(frame):
+    """Robot side: lane marking for a camera frame (HxWx3 BGR uint8)."""
+    return mark_lanes(frame, DEFAULT_PARAMS)
 
-    def __init__(self, lanes=False, params=None):
-        self.lanes = bool(lanes)
-        self.params = dict(DEFAULT_PARAMS)
-        self.params.update(params or {})
 
-    # ---- config (saved in the model .json) ------------------------------- #
-    def config(self):
-        return {"lanes": self.lanes, "params": dict(self.params) if self.lanes else None}
+CONFIG = {"method": "lane_marking", "color_bgr": list(LANE_COLOR_BGR), "params": DEFAULT_PARAMS}
 
-    @classmethod
-    def from_config(cls, cfg):
-        """Rebuild from a model's ``meta['preprocessing']`` (None -> identity)."""
-        cfg = cfg or {}
-        if cfg.get("roi_top") or cfg.get("fixed_y") is not None:
-            print("warning: this model was trained with ROI crop / fixed y, which no longer "
-                  "exist; retrain it")
-        return cls(lanes=cfg.get("lanes", False), params=cfg.get("params"))
 
-    @property
-    def enabled(self):
-        return self.lanes
+def default_output_dir(src_dir):
+    """``<parent>/<name>_lanes`` next to the input folder."""
+    src_dir = os.path.normpath(os.path.abspath(src_dir))
+    return src_dir + "_lanes"
 
-    def tag(self):
-        """Short name for file names ('' when off)."""
-        return "lanes" if self.lanes else ""
 
-    def __repr__(self):
-        return "Preprocessor(lanes=%s)" % self.lanes
+def preprocess_dataset(src_dir, out_dir=None, verbose=True):
+    """Write a lane-marked PNG of every ``xy_*.jpg`` in ``src_dir`` to ``out_dir``.
 
-    # ---- sample level (training) ----------------------------------------- #
-    def __call__(self, image, x, y):
-        if self.lanes:
-            bgr = np.asarray(image.convert("RGB"))[..., ::-1]
-            image = PIL.Image.fromarray(np.ascontiguousarray(mark_lanes(bgr, self.params)[..., ::-1]))
-        return image, x, y
+    Returns ``out_dir``. Already processed images are skipped unless the
+    parameters changed; files whose source is gone are removed.
+    """
+    out_dir = out_dir or default_output_dir(src_dir)
+    srcs = sorted(glob.glob(os.path.join(src_dir, "xy_*.jpg")))
+    if not srcs:
+        raise FileNotFoundError("no xy_*.jpg found in %s" % src_dir)
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    cfg_path = os.path.join(out_dir, "preprocessing.json")
+    old_cfg = None
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            old_cfg = json.load(f).get("config")
+    redo = old_cfg != json.loads(json.dumps(CONFIG))
 
-    # ---- robot side ------------------------------------------------------- #
-    def apply_frame(self, frame):
-        """Same transform for a camera frame (HxWx3 BGR uint8)."""
-        return mark_lanes(frame, self.params) if self.lanes else frame
+    wanted = set()
+    done = 0
+    for p in srcs:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        dst = os.path.join(out_dir, stem + ".png")
+        wanted.add(os.path.basename(dst))
+        if not redo and os.path.exists(dst):
+            continue
+        img = cv2.imread(p)
+        if img is None:
+            raise IOError("cannot read %s" % p)
+        cv2.imwrite(dst, mark_lanes(img, DEFAULT_PARAMS))
+        done += 1
+    removed = 0
+    for q in glob.glob(os.path.join(out_dir, "xy_*.png")):
+        if os.path.basename(q) not in wanted:
+            os.remove(q)
+            removed += 1
+    with open(cfg_path, "w") as f:
+        json.dump({"config": CONFIG, "source": os.path.abspath(src_dir), "n_images": len(srcs)},
+                  f, indent=1)
+    if verbose:
+        print("preprocessing: %d images in %s (%d new, %d removed)" % (len(srcs), out_dir, done, removed))
+    return out_dir
 
 
 # --------------------------------------------------------------------------- #
-# Preview / review tool (PC)
+# CLI (PC)
 # --------------------------------------------------------------------------- #
 def _review(args):
-    """Contact sheet of every image with the lane marking and its label.
-
-    With --model the model's own preprocessing is used and the sheet is sorted
-    by the model's error, worst first.
-    """
-    import glob
+    """Contact sheet of the preprocessed images with labels (and predictions)."""
     from data_loader import DEFAULT_DATA_DIR, parse_xy
 
-    paths = sorted(glob.glob(os.path.join(args.data or DEFAULT_DATA_DIR, "xy_*.jpg")))
+    out_dir = preprocess_dataset(args.data or DEFAULT_DATA_DIR, args.output)
+    paths = sorted(glob.glob(os.path.join(out_dir, "xy_*.png")))
     model = None
-    prep = Preprocessor(lanes=not args.no_lanes)
     if args.model:
         import camera as cam_mod
         from model import load_model
         model = load_model(args.model, "cpu")
-        prep = Preprocessor.from_config(model.meta.get("preprocessing"))
     rows = []
     for p in paths:
         img = cv2.imread(p)
         h, w = img.shape[:2]
         x, y = parse_xy(p)
-        shown = prep.apply_frame(img)
         err, pred = 0.0, None
         if model is not None:
-            out = model(cam_mod.preprocess(shown, "cpu", model.dtype)).float().numpy().flatten()
+            out = model(cam_mod.preprocess(img, "cpu", model.dtype)).float().numpy().flatten()
             px, py = (out[0] + 1) * w / 2.0, (out[1] + 1) * h / 2.0
             err = float(np.hypot(px - x, py - y))
             pred = (int(px), int(py))
-        rows.append((err, p, shown, (int(min(x, w - 1)), int(min(y, h - 1))), pred))
+        rows.append((err, p, img, (int(min(x, w - 1)), int(min(y, h - 1))), pred))
     if model is not None:
         rows.sort(key=lambda r: -r[0])
 
@@ -196,17 +214,23 @@ def _review(args):
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Preprocessing tools")
+    ap = argparse.ArgumentParser(description="Preprocessing (lane marking) tools")
     sub = ap.add_subparsers(dest="cmd")
-    r = sub.add_parser("review", help="contact sheet: lane marking + labels (sorted by error with --model)")
-    r.add_argument("--data", default=None)
-    r.add_argument("--model", default=None, help="a .pth from train.py: its preprocessing, sorted by error")
-    r.add_argument("--no-lanes", action="store_true", help="show the images without lane marking")
+    r0 = sub.add_parser("run", help="write the preprocessed folder (train.py does this itself)")
+    r0.add_argument("--data", default=None, help="folder with xy_*.jpg")
+    r0.add_argument("--output", default=None, help="default: <data>_lanes")
+    r = sub.add_parser("review", help="contact sheet of the preprocessed images + labels")
+    r.add_argument("--data", default=None, help="folder with xy_*.jpg")
+    r.add_argument("--output", default=None, help="preprocessed folder (default: <data>_lanes)")
+    r.add_argument("--model", default=None, help="a .pth from train.py: sort by its error")
     r.add_argument("--out", default="label_review.jpg")
     r.add_argument("--cols", type=int, default=10)
     r.add_argument("--tile", type=int, default=160)
     a = ap.parse_args()
-    if a.cmd == "review":
+    if a.cmd == "run":
+        from data_loader import DEFAULT_DATA_DIR
+        preprocess_dataset(a.data or DEFAULT_DATA_DIR, a.output)
+    elif a.cmd == "review":
         _review(a)
     else:
         ap.print_help()

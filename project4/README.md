@@ -3,9 +3,9 @@
 JetBot 道路跟隨：模型從相機畫面預測「要前往的目標點 (x, y)」，再用 PD + bias 控制左右輪。
 
 ```
-PC / Colab   Data Loader → Preprocessing → Data Augmentation → Model training → Model compression (DepGraph)
-                                │ 設定存進模型 .json                                     │ .pth / .onnx
-Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing (PyTorch / TensorRT) → Motor controlling (PD + bias)
+PC / Colab   Preprocessing → Data Loader → Data Augmentation → Model training → Model compression (DepGraph)
+             │ 原圖資料夾 → <資料夾>_lanes/（標好車道線的 PNG，留在硬碟）              │ .pth / .onnx
+Jetson Nano  Camera Input → Preprocessing（同一個函式）→ Model inferencing (PyTorch / TensorRT) → Motor controlling (PD + bias)
 ```
 
 ## 檔案一覽
@@ -14,7 +14,7 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 |---|---|---|
 | `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
-| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；附預覽工具 |
+| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；固定開啟，輸出存在 `<資料夾>_lanes/` |
 | `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
 | `model.py` | PC + Nano | 模型定義、載入 |
 | `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
@@ -41,7 +41,15 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 
 ### `preprocessing.py`
 
-位在 data loader 和 augmentation 之間，**只做一件事：把車道線標出來**。跟 augmentation 的差別是：每次都做一樣的處理，而且車上推論時也要做。所以模型有沒有開前處理會存進 `.json`，`live_demo.ipynb` 載入模型時會自動套用同一套。開關是 `train.py --lanes`，不加就不做，舊模型不受影響。
+**只做一件事：把車道線標出來**，而且**固定開啟、沒有開關**。
+
+- `preprocess_dataset(src_dir)`：`train.py` 一開始就會呼叫。把 `src_dir` 裡每張 `xy_*.jpg` 標好車道線，存成同名的 `xy_*.png`，放在旁邊的 **`<src_dir>_lanes/`**，例如 `data/new/dataset_xy` → `data/new/dataset_xy_lanes`。訓練讀的是這個資料夾。
+  - 檔案會留在硬碟上，可以直接打開檢查。資料夾裡另有 `preprocessing.json`，記錄參數、來源和張數。
+  - 用 PNG 是因為無損，訓練看到的像素和車上即時標出來的完全相同。
+  - 再跑一次只處理新增的圖；原圖刪掉的會跟著刪；參數改了會全部重做。
+  - 想換輸出位置：`train.py --preprocessed <資料夾>`。
+- `apply_frame(frame)`：車上用。`live_demo.ipynb` 對每一幀都會呼叫。
+- 只想產生資料夾、不訓練：`python preprocessing.py run --data <資料夾>`。
 
 - **做法**：把看起來像白膠帶的像素塗成純紅色 (BGR 0,0,255)。模型仍然看得到原本的畫面（3 通道，ResNet 不用改），只是車道線被明確標出來。標籤不變。
 - **能處理彎道**：逐像素判斷，不是用直線去套。彎道、髮夾彎、鏡頭前面很寬的膠帶都標得出來。
@@ -52,14 +60,14 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 - 參數是用 224×224 的畫面調的，其他尺寸會等比例縮放 kernel。參數存在模型 `.json`，車上用同一組。
 - **在預計訓練的 198 張上測過**：每張都有標出膠帶；沒有任何一張的標籤點（綠點）落在被標成紅色的地方；PC CPU 每張約 6 ms。Nano 上會更慢，`live_demo` 顯示的延遲已經包含前處理時間。
 - 已知的不完美：畫面最上方的人、腳、椅子偶爾有小塊被標紅；場外木地板的紋路偶爾有雜點。
-- `Preprocessor(lanes)(image, x, y)` 訓練時用；`apply_frame(frame)` 車上用。兩邊走同一段程式，餵進模型的 tensor 完全相同（已驗證差 0）。
-- 順序是先標車道線、再做 augmentation，所以顏色擾動、柏林噪聲也會套到紅線上，模型會學到紅線不一定是完全一樣的紅色。
+- 訓練（讀 `_lanes/` 的 PNG）和車上（`apply_frame` 即時標）餵進模型的 tensor 完全相同（已驗證差 0）。
+- 順序是先標車道線、再做 augmentation。顏色擾動、柏林噪聲也會套到紅線上，所以模型會學到紅線不一定是完全一樣的紅色。
 
 **預覽工具**（PC）：
 
 ```bash
-python preprocessing.py review --data <資料夾>                         # 全部畫上車道線標示和標籤
-python preprocessing.py review --data <資料夾> --model models/X.pth    # 用模型的前處理，依誤差排序，最差的在前面
+python preprocessing.py review --data <資料夾>                         # 前處理後的圖加上標籤，排成一張總覽
+python preprocessing.py review --data <資料夾> --model models/X.pth    # 依模型誤差排序，最差的在前面
 ```
 
 會產生 `label_review.jpg`：紅色是標出的車道線，綠點是標籤，青色圈是模型的預測。終端機也會依同樣的順序列出檔名。
@@ -136,24 +144,24 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
-| `--lanes` | 前處理開關：標示車道線。不加 = 不做前處理 |
+| `--preprocessed DIR` | 前處理輸出的資料夾（預設 `<--data>_lanes`）。前處理固定會做 |
 | `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
 | `--epochs 70` `--lr 1e-3` `--batch-size 8` | baseline 訓練（預設值同課程） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
 | `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
-| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json，剪枝後的模型輸入一定和 baseline 相同） |
+| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（augmentation 設定沿用它的 .json） |
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
 
-產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`；有開前處理時是 `resnet18_lanes_<aug>_...`，例如 `resnet18_lanes_gen_base.pth`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
+產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
 
 ### `live_demo.ipynb`
 
 | 區塊 | 內容 |
 |---|---|
 | 變因 | 模型下拉選單（augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
-| 畫面 | 模型實際看到的影像（用 `--lanes` 訓練的模型會看到紅色車道線）、綠色預測點、上方橘色轉向條 |
+| 畫面 | 模型實際看到的影像（紅色車道線）、綠色預測點、上方橘色轉向條。舊模型（不是用車道線資料訓練的）會在資訊列顯示紅字警告 |
 | 控制參數 | speed gain、steering gain (Kp)、steering kd、steering bias（投影片 P.71 的範圍） |
 | 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
 | 即時讀數 | x、y、angle、steering、實際 speed、左右馬達（−1~1）、P / D 項、FPS、推論延遲 |
@@ -171,16 +179,14 @@ python train.py --general --perlin --prune 0.3 0.5 --onnx                # + 柏
 python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓縮失真
 ```
 
+資料不在預設的 `data/dataset_xy_2026-10-21/dataset_xy` 時，每行加上 `--data <資料夾>`。第一次跑會先產生 `<資料夾>_lanes/`，之後直接沿用。
+
 看 log 裡的 val loss：如果剪枝 50% 的 finetune 後明顯比 baseline 差，DEMO 就用 30% 的版本。
 
-加上前處理（標示車道線）的流程：
+前處理固定會做，訓練前可以先檢查車道線標得對不對：
 
 ```bash
-# 1. 先看車道線標得對不對
-python preprocessing.py review --data <資料夾>
-# 2. 有開、沒開各訓練一組，比 val loss 和行駛結果
-python train.py --data <資料夾> --general --prune 0.3 0.5 --onnx
-python train.py --data <資料夾> --lanes --general --prune 0.3 0.5 --onnx
+python preprocessing.py review --data <資料夾>     # 看 label_review.jpg，或直接打開 <資料夾>_lanes/ 裡的 PNG
 ```
 
 ## DEMO 前一天（Nano）：建 TensorRT engine

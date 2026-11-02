@@ -1,8 +1,8 @@
 """Dataset / DataLoader for the road-following (x, y) data.
 
-Per-sample pipeline:
-    load jpg + label  ->  Preprocessor (lane marking, also used on the robot)
-                      ->  Augmenter (random, training split only)  ->  tensor
+Pipeline:
+    preprocessing.preprocess_dataset()  (lane marking, written to <data>_lanes/, called by train.py)
+    -> load image + label  ->  Augmenter (random, training split only)  ->  tensor
 
 File name convention (from the data-collection notebook):
     xy_<x>_<y>_<uuid>.jpg      x, y = pixel coordinates in that image
@@ -25,7 +25,6 @@ import torch
 import torchvision.transforms.functional as TF
 
 from augmentation import Augmenter
-from preprocessing import Preprocessor
 
 __all__ = ["DEFAULT_DATA_DIR", "XYDataset", "parse_xy", "image_to_tensor",
            "split_indices", "split_by_session", "default_metadata_dir", "make_loaders",
@@ -59,23 +58,22 @@ class XYDataset(torch.utils.data.Dataset):
     Parameters
     ----------
     directory : str
-        Folder with ``xy_*.jpg``. Defaults to ``DEFAULT_DATA_DIR``.
-    preprocessor : Preprocessor or None
-        Deterministic transform applied first (lane marking). None -> none.
+        Folder with ``xy_*.jpg`` / ``xy_*.png`` (the preprocessed folder when
+        training). Defaults to ``DEFAULT_DATA_DIR``.
     augmenter : Augmenter or None
-        Applied to (image, x, y) after preprocessing. None -> no augmentation.
+        Applied to (image, x, y). None -> no augmentation.
     indices : list[int] or None
         Use only these files (indices into the sorted list of all files).
     """
 
-    def __init__(self, directory=None, augmenter=None, indices=None, preprocessor=None):
+    def __init__(self, directory=None, augmenter=None, indices=None):
         self.directory = directory or DEFAULT_DATA_DIR
-        paths = sorted(glob.glob(os.path.join(self.directory, "xy_*.jpg")))
+        paths = sorted(glob.glob(os.path.join(self.directory, "xy_*.jpg"))
+                       + glob.glob(os.path.join(self.directory, "xy_*.png")))
         if not paths:
-            raise FileNotFoundError("no xy_*.jpg found in %s" % self.directory)
+            raise FileNotFoundError("no xy_*.jpg / xy_*.png found in %s" % self.directory)
         self.all_paths = paths
         chosen = paths if indices is None else [paths[i] for i in indices]
-        self.preprocessor = preprocessor
         self.image_paths = chosen
         self.augmenter = augmenter
 
@@ -83,12 +81,10 @@ class XYDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
 
     def load(self, idx):
-        """Raw sample: (PIL image, x_px, y_px) after preprocessing + augmentation, before tensor."""
+        """Raw sample: (PIL image, x_px, y_px) after augmentation, before tensor."""
         path = self.image_paths[idx]
         image = PIL.Image.open(path).convert("RGB")
         x, y = parse_xy(path)
-        if self.preprocessor is not None:
-            image, x, y = self.preprocessor(image, x, y)
         if self.augmenter is not None:
             image, x, y = self.augmenter(image, x, y)
         return image, x, y
@@ -194,12 +190,13 @@ def split_by_session(paths, metadata_dir, val_ratio=0.1, seed=0, segment_gap=60.
 
 def make_loaders(directory=None, general=False, perlin=False, compression=False,
                  val_ratio=0.1, batch_size=8, num_workers=4, seed=0, augmenter=None,
-                 preprocessor=None, split="random", metadata_dir=None, segment_gap=60.0):
+                 split="random", metadata_dir=None, segment_gap=60.0):
     """Train/val DataLoaders.
 
-    Preprocessing is applied to both splits; augmentation to the training split
-    only. Pass the three augmentation switches, or a pre-configured
-    ``augmenter`` (overrides them).
+    Augmentation is applied to the training split only. Pass the preprocessed
+    folder (``preprocessing.preprocess_dataset``) as ``directory``. Pass the
+    three augmentation switches, or a pre-configured ``augmenter`` (overrides
+    them).
 
     ``split='random'`` (default) splits images at random; ``split='session'``
     keeps shooting segments together (needs the collection ``metadata`` folder,
@@ -223,8 +220,8 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
         split_info = {"split": "random"}
     else:
         raise ValueError("split must be 'random' or 'session'")
-    train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx, preprocessor=preprocessor)
-    val_ds = XYDataset(directory, augmenter=None, indices=val_idx, preprocessor=preprocessor)
+    train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx)
+    val_ds = XYDataset(directory, augmenter=None, indices=val_idx)
     g = torch.Generator()
     g.manual_seed(seed)
     train_loader = torch.utils.data.DataLoader(

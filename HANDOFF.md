@@ -14,7 +14,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 | 檔案 | 內容 |
 |---|---|
 | `data_loader.py` | `XYDataset`，路徑參數，預設 `data/dataset_xy_2026-10-21/dataset_xy` |
-| `preprocessing.py` | 只做車道線標示：白膠帶塗成紅色，彎道也適用（`train.py --lanes` 開關）；設定存進模型 .json，車上也套用；`review` 預覽工具 |
+| `preprocessing.py` | 只做車道線標示：白膠帶塗成紅色，彎道也適用；固定開啟。`preprocess_dataset()` 由 train 呼叫，輸出留在 `<data>_lanes/`；車上用 `apply_frame()` |
 | `augmentation.py` | 三組開關：一般（幾何＋色彩）、柏林噪聲、壓縮失真（JPEG / 144p）。全關＝原樣輸出 |
 | `model.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)`；依 state_dict 重建剪枝後網路；TRT 載入 |
 | `compression.py` | DepGraph 剪枝（torch-pruning `MetaPruner` + `GroupMagnitudeImportance(p=2)`）、MACs/params、ONNX 匯出、engine 包裝 |
@@ -32,7 +32,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 修正課程 `XYDataset` 不看 `random_hflips` 的 bug；驗證集不做任何 augmentation。
 - 現有資料集只有 jpg、沒有 metadata → 預設 train/val 隨機 9:1（固定 seed）。之後新拍的資料連 `metadata/` 一起複製，就可以用 `--split session` 照拍攝段落切（第六階段）。
 - Nano 是 **Python 3.6.9**（原本收集 notebook 的 metadata 寫的），板子會 import 的模組保持 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別、`datetime.fromisoformat`。
-- 前處理的設定存進模型 `.json`，live_demo 依模型自動套用；舊模型＝不處理（第五階段）。
+- 前處理固定開啟、沒有開關；訓練前先把整個資料夾處理成 `<data>_lanes/*.png` 留在硬碟，訓練讀這個資料夾；live_demo 每幀都套用（第十階段）。
 - 控制的髮夾彎擴充（轉彎減速、內側輪反轉）預設關閉，關閉時和投影片公式完全一樣（第四階段）。
 - 換模型後清空相機佇列：jetbot 來源用重啟管線，另外提供 `'csi'`（`drop=true`）來源（第四階段）。
 - 資料收集不在這個分支的範圍：收集 notebook（隊友版與課程原始版）、`lane_label.py`、`使用說明.txt` 都已刪除（第八階段）。第六、七階段的紀錄保留作歷史，內容要看 git 歷史（`14f384d` 之前）。
@@ -58,7 +58,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 - `CAMERA_SOURCE='dummy'` 或 `'folder'` 加上 `USE_ROBOT=False`，沒有 JetBot 也能跑。
 - 髮夾彎擴充：「轉彎減速 k」滑桿、「內側輪可反轉」勾選框（預設關閉）；左右馬達讀數 −1~1，另外顯示實際 speed。
 - 換模型：載入 → warmup → `camera.flush()`（`FLUSH_ON_SWITCH`）；畫面更新上限 `DISPLAY_FPS=15`。
-- 依模型 `.json` 套用前處理（標示車道線）；畫面顯示模型實際看到的影像；延遲數字包含前處理。
+- 每幀固定套用前處理（標示車道線）；畫面顯示模型實際看到的影像；延遲數字包含前處理；舊模型的 `.json` 沒有 `lane_marking` 時在資訊列顯示紅字警告。
 - 推論迴圈出錯時，模型選單下方會顯示紅字和 traceback；第 6 節「結束」是按鈕（Run All 不會關掉相機），按過之後再按開始會提示要 Restart Kernel。
 
 ## 使用流程
@@ -87,9 +87,10 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 前處理（標示車道線）與照段落切分（PC）：
 
 ```bash
-python preprocessing.py review --data <資料夾>                          # 預覽車道線標示 + 標籤
+python preprocessing.py run --data <資料夾>                             # 只產生 <資料夾>_lanes/（train.py 也會自己做）
+python preprocessing.py review --data <資料夾>                          # 前處理後的圖 + 標籤總覽
 python preprocessing.py review --data <資料夾> --model models/X.pth     # 依模型誤差排序
-python train.py --data <資料夾> --lanes --general --prune 0.3 0.5 --onnx
+python train.py --data <資料夾> --general --prune 0.3 0.5 --onnx
 python train.py --split session --general ...                           # 需要 dataset_xy 旁邊的 metadata/
 ```
 
@@ -206,7 +207,7 @@ python train.py --split session --general ...                           # 需要
 - `train.py`：`--roi-top [FRAC]`、`--fixed-y [FRAC]` 變成開關，不給數值時用 `preprocessing.ROI_TOP_DEFAULT=0.3` / `FIXED_Y_DEFAULT=0.65`；新增 `--no-preprocess` 強制全關（也蓋過 `--base` 沿用的設定；baseline 有 ROI 時會印警告）。舊的寫法 `--roi-top 0.3 --fixed-y 0.65` 照樣能用。
 - 已測：無參數 → 全關；`--roi-top` → 0.3；`--roi-top 0.4 --fixed-y` → 0.4 / 0.65；`--fixed-y --general` → 0.65；`--roi-top --no-preprocess` → 全關 ✅；以 `--roi-top --fixed-y` 訓練 1 epoch 的 baseline，`--base` 沿用 roi30+fy65、加 `--no-preprocess` 則全關 ✅。
 
-## 第九階段（前處理改成只做車道線標示，2026-11-02）
+## 第九階段（前處理改成只做車道線標示，2026-11-02；`--lanes` 開關與 `Preprocessor` 類別已被第十階段取代）
 
 使用者要求：「Preprocessing 只做標示車道線，要能處理彎道」，並提供預計訓練的資料（`data.tar.gz`：198 張 224×224 魚眼畫面，另有 16 張 `.ipynb_checkpoints` 不會被讀到）。資料檔名的 xy 就是「綠點」，可以當行進方向的參考，但推論時沒有。確認的決定：結果直接畫在原圖上給模型看；ROI、固定 y、排除清單全部拿掉。
 
@@ -224,13 +225,32 @@ python train.py --split session --general ...                           # 需要
   - `preprocessing.py review`（有無 `--model`）✅；vermin `preprocessing.py camera.py data_loader.py` → 3.3 ✅
 - 沒有實機驗證：Nano 上的前處理速度（OpenCV morphology 大約多 10~30 ms，推估）、實際相機畫面（未經 JPEG 壓縮）和訓練圖的差異。
 
+## 第十階段（前處理固定開啟、輸出存成資料夾，2026-11-02）
+
+使用者要求：「Preprocessing 的輸出在哪個資料夾？取消開關，但還是要留前處理過後的檔案。前處理做成函式給 train 叫，直接寫死在裡面，不用開關。」（第九階段的前處理是在 DataLoader 裡即時做的，沒有輸出檔案。）
+
+- `preprocessing.py`：拿掉 `Preprocessor` 類別，改成函式：
+  - `preprocess_dataset(src_dir, out_dir=None)`：把每張 `xy_*.jpg` 標好車道線後，存成同名的 PNG 到 `<src_dir>_lanes/`（無損），並寫入 `preprocessing.json`（參數、來源、張數）。已處理過的跳過；原圖不見的會刪掉；參數改了全部重做。
+  - `apply_frame(frame)`：車上用，固定參數。
+  - `CONFIG`：寫進模型 `.json` 的 `preprocessing`（加上 `dir`）。
+  - CLI：`run`（只產生資料夾）、`review`（讀前處理後的資料夾）。
+- 輸出放在原資料夾旁邊，這樣 `metadata/` 還是在同一層。`train.py` 的 `--split session` 預設改從 `--data` 找 metadata，所以 `--preprocessed` 指到別處也不受影響。
+- `train.py`：拿掉 `--lanes`，新增 `--preprocessed DIR`（輸出位置，不是開關）。一開始固定呼叫 `preprocess_dataset()`，再用輸出資料夾建 DataLoader。檔名回到 `resnet18_<aug>_*`，label 拿掉 `pre=`。
+- `data_loader.py`：拿掉 `preprocessor` 參數；`XYDataset` 同時讀 `xy_*.jpg` 和 `xy_*.png`。
+- `live_demo`（`make_nb.py` 重新產生）：`from preprocessing import apply_frame as mark_lanes`，每幀固定套用；模型 `.json` 的 `preprocessing.method` 不是 `lane_marking` 時顯示紅字警告。
+- 已測：
+  - `train.py --data <copy>/dataset_xy --general --epochs 2 --prune 0.3`：產生 `dataset_xy_lanes/`（198 張 PNG＋`preprocessing.json`）；178/20；val loss 和第九階段完全相同（0.14322），表示處理結果一樣 ✅
+  - 再跑一次：0 張新處理 ✅；刪掉 1 張原圖再跑：刪掉 1 張 PNG ✅
+  - PNG（訓練）和 `apply_frame`（車上）餵進模型的 tensor 最大差 0 ✅
+  - `live_demo` 用 nbclient 跑：可以切換模型、畫面有紅色車道線、benchmark 正常 ✅；`review --model` ✅；vermin 3.3 ✅
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
 - **Nano 實測進度**：使用者在板子上跑過 live_demo，修好舊版 torchvision 的 `TypeError` 後，模型能載入、畫面能更新（第三階段）。以下**還沒在板子上驗證**：
   - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
   - 髮夾彎擴充（轉彎減速、內側輪反轉）的實際行駛效果。
-  - 帶前處理（`--lanes`）的模型在板子上的推論速度與效果。
+  - 前處理在板子上的速度（每幀都做）與效果。
 - 正式訓練（70 epochs、各種 augmentation／前處理組合）的結果還沒回報；sandbox 只跑過 1~3 epochs 的 smoke test。
 - 「other model」尚未決定。
 - 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
@@ -268,7 +288,7 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 ## 下一步
 
 1. 補拍彎道、髮夾彎、偏離回正的畫面（收集工具不在這個分支）；有 `metadata/` 的話一起搬到 PC。
-2. PC 上用新的 198 張資料，比較有沒有 `--lanes`、各種 augmentation 的結果（val loss 和實際行駛）。
+2. PC 上用新的 198 張資料（`--data`）訓練，比較各種 augmentation 的結果（val loss 和實際行駛）。
 3. 板子上跑 trtexec → wrap → live_demo，驗證 TRT 載入（風險最高）；驗證換模型的 flush。
 4. 調 PD 參數；髮夾彎再試轉彎減速／內側輪反轉。
 5. 決定 other model 後在 `model.build_model(arch=...)` 和 `rebuild_*` 加上對應的分支。
