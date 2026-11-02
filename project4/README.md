@@ -12,9 +12,7 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 
 | 檔案 | 在哪裡跑 | 用途 |
 |---|---|---|
-| `project4_data_collection_gamepad.ipynb` | Nano | 收集資料（操作見 `使用說明.txt` 和下面的「資料收集」） |
-| `lane_label.py` | Nano（`eval` 在 PC） | 資料收集用的車道線偵測與自動標記，從 notebook 搬出來，可離線評估 |
-| `data_collection_gamepad.ipynb`、`train_model.ipynb` | — | 課程原始範例，留作參考 |
+| `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
 | `preprocessing.py` | PC + Nano | 固定的前處理（ROI 裁切、固定 y、排除壞標籤）與標籤檢視工具 |
 | `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
@@ -36,19 +34,19 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
   - `directory` 預設是 `data/dataset_xy_2026-10-21/dataset_xy`。
 - `make_loaders(directory, general, perlin, compression, ..., split='random')`：回傳 train / val 的 DataLoader。
   - `split='random'`：用固定 seed 隨機切 9:1。
-  - `split='session'`：讀資料收集存的 `metadata/`，**照拍攝段落切**。同一個 `session_id`（一次 notebook 執行）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
+  - `split='session'`：讀資料集旁邊的 `metadata/`（每張圖一個同名 JSON，含 `session_id`、`captured_at`），**照拍攝段落切**。同一個 `session_id`（一次收集）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
   - **只有訓練集做 augmentation**，驗證集一律用原圖。
 - 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
 - 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
 
 ### `preprocessing.py`
 
-位在 data loader 和 augmentation 之間。跟 augmentation 的差別是：**每次都做一樣的處理，而且車上推論時也要做**。所以設定會存進模型的 `.json`，`live_demo.ipynb` 載入模型時會自動套用同一套前處理，再把預測點換算回完整畫面給控制使用。三個開關預設都關閉，舊模型不受影響。
+位在 data loader 和 augmentation 之間。跟 augmentation 的差別是：**每次都做一樣的處理，而且車上推論時也要做**。所以設定會存進模型的 `.json`，`live_demo.ipynb` 載入模型時會自動套用同一套前處理，再把預測點換算回完整畫面給控制使用。三個開關預設都關閉，舊模型不受影響。`train.py` 用旗標開關，和 augmentation 一樣（見下方 `train.py`）。
 
 | 參數 | 作用 | 建議值 |
 |---|---|---|
 | `roi_top` | 裁掉畫面上方這個比例（牆、人、椅子），剩下的拉回原尺寸，標籤跟著移動 | 0.3（最高的標籤在 0.32，不會被切到） |
-| `fixed_y` | 所有標籤的 y 改成固定高度，模型只需要學 x。現在的 y 從 72 到 212 都有，不一致 | 0.65（自動標記用的高度；資料中位數 0.63） |
+| `fixed_y` | 所有標籤的 y 改成固定高度，模型只需要學 x。現在的 y 從 72 到 212 都有，不一致 | 0.65（資料的中位數是 0.63） |
 | `exclude` | 文字檔，一行一個檔名（`#` 後面是註解），列在裡面的圖不拿來訓練 | 用下面的檢視工具找 |
 
 - `Preprocessor(roi_top, fixed_y, exclude)(image, x, y)`：訓練時用。
@@ -137,13 +135,14 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
-| `--roi-top 0.3` `--fixed-y 0.65` `--exclude bad_labels.txt` | 前處理，全不加 = 不做前處理 |
+| `--roi-top` `--fixed-y` `--exclude bad_labels.txt` | 前處理開關，全不加 = 不做前處理。不給數值時用預設值（ROI 0.3、y 0.65），也可以指定，例如 `--roi-top 0.4` |
+| `--no-preprocess` | 強制關掉所有前處理，連 `--base` 沿用的設定也關掉 |
 | `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
 | `--epochs 70` `--lr 1e-3` `--batch-size 8` | baseline 訓練（預設值同課程） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
 | `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
-| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json） |
+| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json；要關前處理加 `--no-preprocess`） |
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
 
@@ -159,30 +158,6 @@ python train.py --help
 | 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
 | 即時讀數 | x、y、angle、steering、實際 speed、左右馬達（−1~1）、P / D 項、FPS、推論延遲 |
 | 運轉 | 開始推論、**停止**、**允許移動**（預設關閉）、錄製 CSV |
-
-### 資料收集（`project4_data_collection_gamepad.ipynb` + `lane_label.py`）
-
-操作步驟見 `使用說明.txt`，這裡只寫重點：
-
-- **標記規則：目標點一律放在高度 65% 的參考線上，只決定左右。**
-  - 自動標記本來就是這個高度。
-  - 手動點選時預設鎖定 y（勾選框「手動點選鎖定 y」），點哪個高度都會被換成 65%。
-  - 左圖會畫黃色虛線當參考，**只畫在顯示用的圖上，存進訓練集的原圖沒有疊圖**。
-  - 舊資料 200 張裡有 198 張是手動點的，y 從 72 到 212 都有，遠近不一致，所以才加這個規則。
-- **自動標記只在約 37% 的畫面有效**（`python lane_label.py eval` 對舊資料測的）。主要失敗在彎道：前方膠帶接近水平、內側膠帶在畫面外，65% 高度上根本沒有兩條線。
-  - 試過「由下往上追蹤膠帶」和「單線加半個車道寬推估」都沒改善，後者在彎道還會指錯方向（誤差中位數 60 px），所以沒有採用。
-  - **彎道、髮夾彎、偏離後回正的畫面請暫停後手動點選。**
-- 「**標籤 x 分布**」長條圖：每存一張就更新，紅色格子表示資料少於平均一半，要優先補拍那個方向。
-- **近似重複**：和上一張存的畫面幾乎一樣時會先擋下來，再按一次才會存。
-- 手動點選的座標用圖片在瀏覽器上實際顯示的大小換算，視窗太窄、圖片被縮小時也不會偏。
-- 剛開相機還沒有影格時會等待，最多 10 秒，不會直接報錯停止。
-- **手把自動連線、自動綁定**：同時監看 0~3 號手把（`GAMEPAD_INDEX=None`），按一下任一鍵就會連上並綁定拍照／前進／停止。斷線會停車，再連回來會自動重綁；每次綁定都先取消「允許移動」。
-  - 「按任一鍵」這一步省不掉，因為瀏覽器規定按過鍵網頁才讀得到手把。Jupyter 分頁也要停在前景。
-- **搬資料到 PC 時，`dataset_xy` 和 `metadata` 要一起複製**，放在同一層，`--split session` 才能用。
-
-```bash
-python lane_label.py eval --sheet lane_eval.jpg   # 對既有資料集跑自動標記，跟手動標籤比較
-```
 
 ---
 
@@ -207,7 +182,7 @@ python preprocessing.py review --model models/resnet18_gen_base.pth
 #    看 label_review.jpg，把確定標錯的檔名寫進 bad_labels.txt
 
 # 2. 開前處理重新訓練，跟步驟 1 的模型比 val loss 和行駛結果
-python train.py --roi-top 0.3 --fixed-y 0.65 --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx
+python train.py --roi-top --fixed-y --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx
 ```
 
 注意：開了 `--fixed-y` 的模型 y 是固定的，val loss 只剩 x 的誤差，數字會比較小。跟沒開的模型比較時，請以行駛結果為主。
@@ -243,7 +218,7 @@ engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO �
 ### 1. 開機連線
 
 1. 車子開機，筆電連上板子的 AP，打開 Jupyter（port 8888）。
-2. **把其他 notebook 的 kernel 都關掉**，尤其是資料收集那本。相機同時只能被一個程式佔用。
+2. **把其他 notebook 的 kernel 都關掉**。相機同時只能被一個程式佔用。
    - 用 Running 分頁或 Kernel → Shut Down。
 
 ### 2. 啟動介面
@@ -319,7 +294,6 @@ engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO �
   - 或照投影片 P.55 用 `torch2trt` 轉：模型改用 `rebuild_resnet18_from_state_dict()` 建立。
 - Nano 上的 Python 3.6 / 舊版 ipywidgets 只做過靜態語法檢查，介面排版可能和 PC 上不同。
 - 換模型時的 flush（重啟 jetbot 相機管線）和 `CAMERA_SOURCE = 'csi'` 都還沒在板子上試過。flush 有問題就把 `FLUSH_ON_SWITCH` 改成 `False`。
-- 資料收集 notebook 的新功能（手把自動綁定、y 鎖定、x 分布圖、近似重複判斷）只在 sandbox 用假手把、假相機測過。板子上的 ClickableImageWidget 如果是舊版、沒有回傳顯示大小，點選座標會改用 widget 設定的寬度換算；可以看右側檢查圖的黃色圈是否對準點的位置。
 - 和投影片流程不同的地方，報告要寫清楚，DEMO 前建議先問助教：
   - 訓練和剪枝在 PC 上做，不是在 JetBot 上（P.79）。
   - TensorRT 轉換走 ONNX → trtexec，不是 torch2trt（P.56）。

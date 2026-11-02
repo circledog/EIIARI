@@ -8,8 +8,12 @@ Examples
     # general + Perlin augmentation, then prune 30 % and 50 %, export ONNX
     python train.py --general --perlin --prune 0.3 0.5 --onnx
 
-    # preprocessing: crop the top 30 %, fix label y at 0.65, drop bad labels
-    python train.py --roi-top 0.3 --fixed-y 0.65 --exclude bad_labels.txt --general
+    # preprocessing switches: crop the top 30 %, fix label y at 0.65 (defaults
+    # when no value is given), drop bad labels
+    python train.py --roi-top --fixed-y --exclude bad_labels.txt --general
+    python train.py --roi-top 0.4 --general          # custom crop fraction
+
+    # --no-preprocess forces every preprocessing step off (also overrides --base)
 
     # prune an existing baseline without retraining it
     # (augmentation switches and run name are taken from its .json)
@@ -34,7 +38,7 @@ import torch.nn.functional as F
 from compression import count_macs_params, export_onnx, prune_model
 from data_loader import DEFAULT_DATA_DIR, make_loaders
 from model import build_model, read_meta, rebuild_resnet18_from_state_dict, write_meta
-from preprocessing import Preprocessor
+from preprocessing import FIXED_Y_DEFAULT, ROI_TOP_DEFAULT, Preprocessor
 
 
 def evaluate(model, loader, device):
@@ -93,10 +97,14 @@ def main():
     ap.add_argument("--data", default=DEFAULT_DATA_DIR, help="folder with xy_*.jpg")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
     ap.add_argument("--name", default=None, help="run name (default resnet18_<aug>)")
-    pg = ap.add_argument_group("preprocessing (all off = none; also applied on the robot)")
-    pg.add_argument("--roi-top", type=float, default=0.0, help="crop this top fraction, e.g. 0.3")
-    pg.add_argument("--fixed-y", type=float, default=None, help="fix label y at this height fraction, e.g. 0.65")
+    pg = ap.add_argument_group("preprocessing switches (all off = none; also applied on the robot)")
+    pg.add_argument("--roi-top", type=float, nargs="?", const=ROI_TOP_DEFAULT, default=0.0, metavar="FRAC",
+                    help="crop the top of the image (no value = %.1f)" % ROI_TOP_DEFAULT)
+    pg.add_argument("--fixed-y", type=float, nargs="?", const=FIXED_Y_DEFAULT, default=None, metavar="FRAC",
+                    help="fix label y at this height fraction (no value = %.2f)" % FIXED_Y_DEFAULT)
     pg.add_argument("--exclude", default=None, help="file with image names to drop (bad labels)")
+    pg.add_argument("--no-preprocess", action="store_true",
+                    help="turn every preprocessing step off (overrides the switches above and --base)")
     g = ap.add_argument_group("augmentation switches (all off = none)")
     g.add_argument("--general", action="store_true", help="flip / rotate / crop / colour jitter")
     g.add_argument("--perlin", action="store_true", help="Perlin-noise lighting")
@@ -130,7 +138,8 @@ def main():
         # Reuse the baseline's preprocessing, augmentation switches and run name
         # unless overridden, so pruned files stay grouped with their baseline.
         base_pre = read_meta(args.base).get("preprocessing") or {}
-        if not args.roi_top and args.fixed_y is None and args.exclude is None:
+        if (not args.no_preprocess and not args.roi_top and args.fixed_y is None
+                and args.exclude is None):
             args.roi_top = base_pre.get("roi_top") or 0.0
             args.fixed_y = base_pre.get("fixed_y")
             ex = base_pre.get("exclude_path")
@@ -148,6 +157,10 @@ def main():
         if args.name is None and stem.endswith("_base"):
             args.name = stem[:-len("_base")]
 
+    if args.no_preprocess:
+        if args.base and (read_meta(args.base).get("preprocessing") or {}).get("roi_top"):
+            print("warning: the baseline was trained with ROI cropping; --no-preprocess feeds it full frames")
+        args.roi_top, args.fixed_y, args.exclude = 0.0, None, None
     prep = Preprocessor(roi_top=args.roi_top, fixed_y=args.fixed_y, exclude=args.exclude)
     train_loader, val_loader, aug = make_loaders(
         args.data, general=args.general, perlin=args.perlin, compression=args.compression,

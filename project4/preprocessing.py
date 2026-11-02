@@ -7,15 +7,18 @@ way every time -- in training *and* on the robot. Its settings are saved in
 each model's ``.json`` and ``live_demo.ipynb`` rebuilds the same
 ``Preprocessor`` when it loads the model.
 
-Three switches, all off by default (= identity, so old models are unaffected):
+Three switches, all off by default (= identity, so old models are unaffected).
+In ``train.py`` they are flags like the augmentation switches: ``--roi-top`` /
+``--fixed-y`` without a value use the defaults below, ``--no-preprocess``
+turns everything off.
 
 * ``roi_top``  (0~0.9)  Crop away the top fraction of the image (walls, people,
                         chairs) and stretch the rest back to the original size,
                         so the model only sees the floor. Labels move with it.
 * ``fixed_y``  (0~1)    Replace every label's y by a constant (fraction of the
                         height). The data's y is inconsistent (72~212 px); with
-                        y fixed the model only has to learn x. 0.65 matches the
-                        auto-labeller's look-ahead (median of the data: 0.63).
+                        y fixed the model only has to learn x. 0.65 is close to the
+                        median label height of the data (0.63).
 * ``exclude``  (file)   Text file with one image file name per line (``#`` for
                         comments); those images are dropped from training.
                         Use ``python preprocessing.py review`` to find them.
@@ -32,7 +35,10 @@ import os
 import numpy as np
 import PIL.Image
 
-__all__ = ["Preprocessor", "read_exclude"]
+__all__ = ["Preprocessor", "read_exclude", "ROI_TOP_DEFAULT", "FIXED_Y_DEFAULT"]
+
+ROI_TOP_DEFAULT = 0.3    # value used by ``train.py --roi-top`` with no number
+FIXED_Y_DEFAULT = 0.65   # value used by ``train.py --fixed-y`` with no number
 
 
 def read_exclude(path):

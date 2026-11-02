@@ -14,8 +14,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 | 檔案 | 內容 |
 |---|---|
 | `data_loader.py` | `XYDataset`，路徑參數，預設 `data/dataset_xy_2026-10-21/dataset_xy` |
-| `preprocessing.py` | ROI 裁切、固定 y、排除清單；設定存進模型 .json，車上也套用；`review` 標籤檢視工具 |
-| `lane_label.py` | 資料收集用的車道線偵測／自動標記（從收集 notebook 搬出）；`eval` 對既有資料集評估 |
+| `preprocessing.py` | ROI 裁切、固定 y、排除清單（`train.py` 用 `--roi-top` / `--fixed-y` / `--exclude` 開關，`--no-preprocess` 全關）；設定存進模型 .json，車上也套用；`review` 標籤檢視工具 |
 | `augmentation.py` | 三組開關：一般（幾何＋色彩）、柏林噪聲、壓縮失真（JPEG / 144p）。全關＝原樣輸出 |
 | `model.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)`；依 state_dict 重建剪枝後網路；TRT 載入 |
 | `compression.py` | DepGraph 剪枝（torch-pruning `MetaPruner` + `GroupMagnitudeImportance(p=2)`）、MACs/params、ONNX 匯出、engine 包裝 |
@@ -32,12 +31,12 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 前處理沿用課程慣例：相機給 BGR，訓練時 `[::-1]` 把 RGB 轉 BGR，兩邊都是 BGR 進網路。
 - 修正課程 `XYDataset` 不看 `random_hflips` 的 bug；驗證集不做任何 augmentation。
 - 現有資料集只有 jpg、沒有 metadata → 預設 train/val 隨機 9:1（固定 seed）。之後新拍的資料連 `metadata/` 一起複製，就可以用 `--split session` 照拍攝段落切（第六階段）。
-- Nano 是 **Python 3.6.9**（收集 notebook 的 metadata 寫的），板子會 import 的模組保持 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別、`datetime.fromisoformat`。
+- Nano 是 **Python 3.6.9**（原本收集 notebook 的 metadata 寫的），板子會 import 的模組保持 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別、`datetime.fromisoformat`。
 - 前處理（ROI、fixed y）的設定存進模型 `.json`，live_demo 依模型自動套用，再把預測換算回完整畫面；舊模型＝不處理（第五階段）。
 - 控制的髮夾彎擴充（轉彎減速、內側輪反轉）預設關閉，關閉時和投影片公式完全一樣（第四階段）。
 - 換模型後清空相機佇列：jetbot 來源用重啟管線，另外提供 `'csi'`（`drop=true`）來源（第四階段）。
-- 收集 notebook 的自動標記演算法**維持原樣**：由下往上追蹤、單線推估都試過但沒改善或有害；彎道改靠手動點選並鎖定 y=0.65（第六階段）。
-- 手把用多個 `Controller` 背景輪詢、自動綁定；「按任一鍵」是瀏覽器限制，省不掉（第七階段）。
+- 資料收集不在這個分支的範圍：收集 notebook（隊友版與課程原始版）、`lane_label.py`、`使用說明.txt` 都已刪除（第八階段）。第六、七階段的紀錄保留作歷史，內容要看 git 歷史（`14f384d` 之前）。
+- 前處理在 `train.py` 是開關式旗標：不給數值就用預設值 ROI 0.3 / y 0.65，`--no-preprocess` 強制全關（第八階段）。
 - `project4/data` 在 worktree 裡是指向 `/run/sandbox/source/project4/data` 的 symlink（gitignore 已改為 `/data` 才能涵蓋 symlink）。
 
 ## 已完成
@@ -89,14 +88,13 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 
 ```bash
 python preprocessing.py review --model models/resnet18_gen_base.pth     # 依誤差排序，找出標錯的圖 → bad_labels.txt
-python train.py --roi-top 0.3 --fixed-y 0.65 --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx
+python train.py --roi-top --fixed-y --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx   # 不給數值 = 0.3 / 0.65
+python train.py --roi-top 0.4 --general                                  # 指定數值
+python train.py --base models/X_base.pth --no-preprocess --prune 0.3     # 強制關掉前處理
 python train.py --split session --general ...                           # 需要 dataset_xy 旁邊的 metadata/
-python lane_label.py eval --sheet lane_eval.jpg                         # 評估收集用的自動標記
 ```
 
-資料收集（Nano）：`project4_data_collection_gamepad.ipynb` 要和 `lane_label.py` 放在同一個資料夾。手把按任一鍵會自動連線綁定；手動點選時 y 鎖在 65%；搬資料時 `dataset_xy` 和 `metadata` 一起複製。
-
-完整的車子操作步驟（DEMO 前一天建 engine、當天架高測試、調參順序、疑難排解）、資料收集重點都寫在 `project4/README.md`；收集的操作步驟在 `project4/使用說明.txt`。
+完整的車子操作步驟（DEMO 前一天建 engine、當天架高測試、調參順序、疑難排解）都寫在 `project4/README.md`。
 
 ## 第二階段（README 與 DEMO 操作）
 
@@ -200,18 +198,26 @@ python lane_label.py eval --sheet lane_eval.jpg                         # 評估
 - 已測（`gamepad_test.py`，在 kernel 裡用 `set_trait` 模擬前端送來的更新）：2 號連上 → 自動綁定 ✅；13 / 5 / 1 號鍵分別觸發拍照 / 前進 / 停止 ✅；斷線 → 解除綁定、停車 ✅；0 號重連（先送 connected 再送 buttons）→ 自動重綁並可拍照 ✅；只有 4 個按鍵 → 提示 ✅；重新建立時手把已連著 → 直接綁定 ✅；改按鍵編號後手動重綁 ✅。`collect_test.py` 回歸測試全過 ✅；vermin 3.5 ✅。
 - 沒有實機驗證：Nano 上舊版 ipywidgets 的 Controller 行為（推測相同）、實體手把。
 
+## 第八階段（刪除資料收集、前處理開關，2026-11-02）
+
+使用者要求：「刪掉 data collection」（確認範圍：三個全刪）、「Preprocessing 做成可開關」（確認：訓練用旗標開關）。
+
+- 刪除 `project4_data_collection_gamepad.ipynb`、`data_collection_gamepad.ipynb`（課程原始）、`lane_label.py`，以及只描述收集 notebook 的 `使用說明.txt`。README 的「資料收集」小節、檔案表、已知風險裡的相關內容一併刪除。
+- 保留 `--split session`：它只讀 `dataset_xy` 旁邊的 `metadata/*.json`（`session_id`、`captured_at`），不依賴收集 notebook。
+- `train.py`：`--roi-top [FRAC]`、`--fixed-y [FRAC]` 變成開關，不給數值時用 `preprocessing.ROI_TOP_DEFAULT=0.3` / `FIXED_Y_DEFAULT=0.65`；新增 `--no-preprocess` 強制全關（也蓋過 `--base` 沿用的設定；baseline 有 ROI 時會印警告）。舊的寫法 `--roi-top 0.3 --fixed-y 0.65` 照樣能用。
+- 已測：無參數 → 全關；`--roi-top` → 0.3；`--roi-top 0.4 --fixed-y` → 0.4 / 0.65；`--fixed-y --general` → 0.65；`--roi-top --no-preprocess` → 全關 ✅；以 `--roi-top --fixed-y` 訓練 1 epoch 的 baseline，`--base` 沿用 roi30+fy65、加 `--no-preprocess` 則全關 ✅。
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
 - **Nano 實測進度**：使用者在板子上跑過 live_demo，修好舊版 torchvision 的 `TypeError` 後，模型能載入、畫面能更新（第三階段）。以下**還沒在板子上驗證**：
   - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
   - 髮夾彎擴充（轉彎減速、內側輪反轉）的實際行駛效果。
-  - 新的資料收集 notebook：手把自動綁定（舊版 ipywidgets 的 Controller）、ClickableImageWidget 是否會送 `width`/`height`（不會就改用 widget 寬度）、x 分布圖和近似重複判斷。
   - 帶前處理的模型在板子上的推論。
 - 正式訓練（70 epochs、各種 augmentation／前處理組合）的結果還沒回報；sandbox 只跑過 1~3 epochs 的 smoke test。
 - 「other model」尚未決定。
 - 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
-- **測試腳本不在 repo 裡**：各階段寫的測試（`collect_test.py`、`gamepad_test.py`、`eval_old.py`、假模組 `fakejet/`、`fakecollect/`、notebook 產生器 `make_nb.py`）都放在 sandbox 的 scratchpad，sandbox 刪除後就不見了。需要的話要搬進 repo（例如 `project4/tests/`）。
+- **測試腳本不在 repo 裡**：各階段寫的測試（`fakejet/`、notebook 產生器 `make_nb.py`；收集相關的 `collect_test.py`、`gamepad_test.py`、`eval_old.py`、`fakecollect/` 已隨收集 notebook 失去用途）都放在 sandbox 的 scratchpad，sandbox 刪除後就不見了。需要的話要搬進 repo（例如 `project4/tests/`）。
 
 ## 測試指令與結果
 
@@ -244,8 +250,8 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 
 ## 下一步
 
-1. 板子上更新 `lane_label.py`、`project4_data_collection_gamepad.ipynb`，照新規則（y 鎖在 65%、看 x 分布補紅色格子）補拍彎道、髮夾彎、偏離回正的畫面；`dataset_xy` 和 `metadata` 一起搬到 PC。
-2. PC 上先訓練一個模型，用 `preprocessing.py review` 找出壞標籤，再比較有沒有前處理（`--roi-top 0.3 --fixed-y 0.65 --exclude …`）、各種 augmentation、`--split session` 的結果。
+1. 補拍彎道、髮夾彎、偏離回正的畫面（收集工具不在這個分支）；有 `metadata/` 的話一起搬到 PC。
+2. PC 上先訓練一個模型，用 `preprocessing.py review` 找出壞標籤，再比較有沒有前處理（`--roi-top --fixed-y --exclude …` vs `--no-preprocess`）、各種 augmentation、`--split session` 的結果。
 3. 板子上跑 trtexec → wrap → live_demo，驗證 TRT 載入（風險最高）；驗證換模型的 flush。
 4. 調 PD 參數；髮夾彎再試轉彎減速／內側輪反轉。
 5. 決定 other model 後在 `model.build_model(arch=...)` 和 `rebuild_*` 加上對應的分支。
