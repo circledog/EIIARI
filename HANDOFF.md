@@ -168,6 +168,17 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 
 沒有實機驗證：收集 notebook 在 Nano 上的實際操作（手把、ClickableImageWidget 的版本是否會送 width）。
 
+## 第七階段（手把自動連線與綁定，2026-11-02）
+
+- 查了 ipywidgets 前端原始碼：`ControllerModel.initialize()` 在前端建立時就會開始 `wait_loop`（用 `requestAnimationFrame` 輪詢 `navigator.getGamepads()[index]`），不需要顯示 view；斷線時 `reset_gamepad()` 會回到 `wait_loop`。瀏覽器規定按過鍵才讀得到手把，這一步省不掉。
+- 收集 notebook：
+  - `GAMEPAD_INDEX=None` → 建立 0~3 號四個 `Controller`，介面用 `controller_box` 只顯示目前使用中的那一支。
+  - `GamepadBinding(lane, controllers)` 改寫：監看每支的 `connected` / `buttons`，第一支「已連線且按鍵數量夠」的就自動綁定；使用中的那支斷線 → 解除綁定、停車、改用另一支已連線的（如果有）；按鍵列表變了 → 自動重綁；按鍵不足會提示；重新執行那一格時，已經連著的手把會直接綁定。每次綁定都會先 `stop_all()`（取消允許移動）。
+  - 「綁定手把」按鈕改成「重新綁定手把」，會重新讀取按鍵編號。
+  - markdown、`使用說明.txt`、README 都更新了。
+- 已測（`gamepad_test.py`，在 kernel 裡用 `set_trait` 模擬前端送來的更新）：2 號連上 → 自動綁定 ✅；13 / 5 / 1 號鍵分別觸發拍照 / 前進 / 停止 ✅；斷線 → 解除綁定、停車 ✅；0 號重連（先送 connected 再送 buttons）→ 自動重綁並可拍照 ✅；只有 4 個按鍵 → 提示 ✅；重新建立時手把已連著 → 直接綁定 ✅；改按鍵編號後手動重綁 ✅。`collect_test.py` 回歸測試全過 ✅；vermin 3.5 ✅。
+- 沒有實機驗證：Nano 上舊版 ipywidgets 的 Controller 行為（推測相同）、實體手把。
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
