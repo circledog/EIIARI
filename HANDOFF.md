@@ -14,6 +14,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 | 檔案 | 內容 |
 |---|---|
 | `data_loader.py` | `XYDataset`，路徑參數，預設 `data/dataset_xy_2026-10-21/dataset_xy` |
+| `preprocessing.py` | ROI 裁切、固定 y、排除清單；設定存進模型 .json，車上也套用；`review` 標籤檢視工具 |
 | `augmentation.py` | 三組開關：一般（幾何＋色彩）、柏林噪聲、壓縮失真（JPEG / 144p）。全關＝原樣輸出 |
 | `model.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)`；依 state_dict 重建剪枝後網路；TRT 載入 |
 | `compression.py` | DepGraph 剪枝（torch-pruning `MetaPruner` + `GroupMagnitudeImportance(p=2)`）、MACs/params、ONNX 匯出、engine 包裝 |
@@ -111,6 +112,27 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
   - flush：0.08 秒 → 0.09 秒 ✅
   - 新的控制選項有正確傳到控制器；vermin 檢查 3.6 相容 ✅
 - 沒有實機驗證：jetbot `Camera.stop()` / `start()` 重啟在 Nano 上是否穩定、要多久；`'csi'` 管線字串（照 jetbot 0.4 的預設：3280×2464、sensor-mode 3）。
+
+## 第五階段（preprocessing.py，2026-11-02）
+
+使用者要求：在 data loader 和 augmentation 之間加一個 `preprocessing.py`，並更新 ipynb 和文件。
+
+- 分類：標籤清理、ROI、固定 y 屬於前處理，這次已實作。合成偏離畫面（隨機）屬於 augmentation，Huber loss 是訓練設定，推論平滑屬於控制，這三項都**還沒做**。
+- `Preprocessor(roi_top=0, fixed_y=None, exclude=None)`：三個開關全關時不做任何處理。
+  - 訓練：`__call__(PIL, x, y)`。順序是先 fixed_y，再裁切並換算標籤。
+  - 車上：`apply_frame(frame)` 走同一段 PIL 程式，`to_full(xy)` 把預測點換算回完整畫面座標。
+  - `config()` 存進 `.json` 的 `preprocessing` 欄位（含 `exclude_path`），`from_config()` 讀回來；舊模型沒有這個欄位＝不處理。
+- `data_loader`：切分先在全部 200 張上做，再從兩邊拿掉排除的圖，所以有沒有排除，驗證集都是同一批圖。
+- `train.py`：新增 `--roi-top`、`--fixed-y`、`--exclude`。檔名和 label 會帶上前處理的 tag。`--base` 會沿用 baseline 的前處理設定和排除清單（如果檔案還在）。
+- `live_demo`：載入模型時建立對應的 Preprocessor，推論前套用；預測點換算回完整畫面後再給控制和顯示。被裁掉的部分變暗，並畫一條青色線。benchmark 也有套用前處理。
+- `camera.draw_overlay(..., roi_top=0)` 新增畫出 ROI 的功能。
+- 已測：
+  - 標籤換算和 `to_full` 來回一致，誤差 0；fixed 0.65 + roi 0.3 → 標籤落在裁切後的正中間，換算回完整畫面是 0.3 ✅
+  - 訓練端和車上端的輸入，同一張圖差 0 ✅
+  - 排除清單 2 張：200 → 198 張，切分 179 / 19 ✅
+  - `train.py --roi-top 0.3 --fixed-y 0.65 --exclude … --general --prune 0.3 --onnx` 3 epochs：val 0.0275 ✅；`--base` 沿用前處理和排除清單 ✅
+  - `preprocessing.py review --model …` 產生依誤差排序的總覽圖 ✅
+  - notebook（folder 相機）：新模型 roi 0.3 / fixed_y 0.65 有套用、畫面上方有變暗；換回舊模型時 roi 0 ✅；vermin 3.6 ✅
 
 ## 未完成 / 未驗證
 

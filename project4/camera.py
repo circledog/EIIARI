@@ -232,10 +232,18 @@ def degrade(frame, perlin=False, compression=False):
 # --------------------------------------------------------------------------- #
 # Display helpers
 # --------------------------------------------------------------------------- #
-def draw_overlay(frame, xy=None, steering=None):
-    """Copy of ``frame`` with the predicted target point and a steering bar."""
+def draw_overlay(frame, xy=None, steering=None, roi_top=0.0):
+    """Copy of ``frame`` with the predicted target point and a steering bar.
+
+    ``xy`` is in full-frame normalised coordinates. With ``roi_top`` > 0 the
+    part the model does not see is darkened and a cyan line marks the crop.
+    """
     out = frame.copy()
     h, w = out.shape[:2]
+    if roi_top > 0:
+        top = int(round(roi_top * h))
+        out[:top] = (out[:top] * 0.45).astype(out.dtype)
+        cv2.line(out, (0, top), (w - 1, top), (255, 255, 0), 1)
     if xy is not None:
         px = int(round((float(xy[0]) + 1) * w / 2.0))
         py = int(round((float(xy[1]) + 1) * h / 2.0))

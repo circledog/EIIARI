@@ -3,9 +3,9 @@
 JetBot 道路跟隨：模型從相機畫面預測「要前往的目標點 (x, y)」，再用 PD + bias 控制左右輪。
 
 ```
-PC / Colab   Data Loader → Data Augmentation → Model training → Model compression (DepGraph)
-                                                                        │ .pth / .onnx
-Jetson Nano  Camera Input → Model inferencing (PyTorch 或 TensorRT) → Motor controlling (PD + bias)
+PC / Colab   Data Loader → Preprocessing → Data Augmentation → Model training → Model compression (DepGraph)
+                                │ 設定存進模型 .json                                     │ .pth / .onnx
+Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing (PyTorch / TensorRT) → Motor controlling (PD + bias)
 ```
 
 ## 檔案一覽
@@ -15,6 +15,7 @@ Jetson Nano  Camera Input → Model inferencing (PyTorch 或 TensorRT) → Motor
 | `project4_data_collection_gamepad.ipynb` | Nano | 收集資料（操作見 `使用說明.txt`） |
 | `data_collection_gamepad.ipynb`、`train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
+| `preprocessing.py` | PC + Nano | 固定的前處理（ROI 裁切、固定 y、排除壞標籤）與標籤檢視工具 |
 | `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
 | `model.py` | PC + Nano | 模型定義、載入 |
 | `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
@@ -37,6 +38,30 @@ Jetson Nano  Camera Input → Model inferencing (PyTorch 或 TensorRT) → Motor
   - **只有訓練集做 augmentation**，驗證集一律用原圖。
 - 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
 - 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
+
+### `preprocessing.py`
+
+位在 data loader 和 augmentation 之間。跟 augmentation 的差別是：**每次都做一樣的處理，而且車上推論時也要做**。所以設定會存進模型的 `.json`，`live_demo.ipynb` 載入模型時會自動套用同一套前處理，再把預測點換算回完整畫面給控制使用。三個開關預設都關閉，舊模型不受影響。
+
+| 參數 | 作用 | 建議值 |
+|---|---|---|
+| `roi_top` | 裁掉畫面上方這個比例（牆、人、椅子），剩下的拉回原尺寸，標籤跟著移動 | 0.3（最高的標籤在 0.32，不會被切到） |
+| `fixed_y` | 所有標籤的 y 改成固定高度，模型只需要學 x。現在的 y 從 72 到 212 都有，不一致 | 0.65（自動標記用的高度；資料中位數 0.63） |
+| `exclude` | 文字檔，一行一個檔名（`#` 後面是註解），列在裡面的圖不拿來訓練 | 用下面的檢視工具找 |
+
+- `Preprocessor(roi_top, fixed_y, exclude)(image, x, y)`：訓練時用。
+- `apply_frame(frame)`、`to_full(xy)`：車上用。和訓練走同一段 PIL 程式，輸入完全相同（已驗證差 0）。
+- train / val 的切分在「全部 200 張」上做，排除的圖再從兩邊拿掉。所以有沒有排除壞標籤，驗證集都是同一批圖，可以直接比較。
+
+**標籤檢視工具**（PC）：
+
+```bash
+python preprocessing.py review                                  # 全部 200 張畫上標籤
+python preprocessing.py review --model models/X_base.pth        # 依模型誤差排序，最差的在前面
+python preprocessing.py review --model models/X_base.pth --exclude bad_labels.txt
+```
+
+會產生 `label_review.jpg`：綠點是標籤，紅圈是模型的預測，紅色編號表示已經在排除清單裡。終端機也會依同樣的順序列出檔名。誤差最大的幾張常常就是標錯的，確認後把檔名貼進 `bad_labels.txt` 再重新訓練。
 
 ### `augmentation.py`
 
@@ -110,22 +135,23 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
+| `--roi-top 0.3` `--fixed-y 0.65` `--exclude bad_labels.txt` | 前處理，全不加 = 不做前處理 |
 | `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
 | `--epochs 70` `--lr 1e-3` `--batch-size 8` | baseline 訓練（預設值同課程） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
 | `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
-| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（augmentation 設定沿用它的 .json） |
+| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json） |
 | `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
 
-產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
+產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`；有開前處理時是 `resnet18_<pre>_<aug>_...`，例如 `resnet18_roi30+fy65+ex12_gen_base.pth`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
 
 ### `live_demo.ipynb`
 
 | 區塊 | 內容 |
 |---|---|
 | 變因 | 模型下拉選單（augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
-| 畫面 | 即時影像、綠色預測點、上方橘色轉向條 |
+| 畫面 | 即時影像、綠色預測點、上方橘色轉向條；模型有 ROI 裁切時，看不到的部分變暗，並用青色線標出 |
 | 控制參數 | speed gain、steering gain (Kp)、steering kd、steering bias（投影片 P.71 的範圍） |
 | 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
 | 即時讀數 | x、y、angle、steering、實際 speed、左右馬達（−1~1）、P / D 項、FPS、推論延遲 |
@@ -144,6 +170,20 @@ python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓
 ```
 
 看 log 裡的 val loss：如果剪枝 50% 的 finetune 後明顯比 baseline 差，DEMO 就用 30% 的版本。
+
+加上前處理的流程：
+
+```bash
+# 1. 先訓練一個沒有前處理的模型，用它找出標錯的圖
+python train.py --general
+python preprocessing.py review --model models/resnet18_gen_base.pth
+#    看 label_review.jpg，把確定標錯的檔名寫進 bad_labels.txt
+
+# 2. 開前處理重新訓練，跟步驟 1 的模型比 val loss 和行駛結果
+python train.py --roi-top 0.3 --fixed-y 0.65 --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx
+```
+
+注意：開了 `--fixed-y` 的模型 y 是固定的，val loss 只剩 x 的誤差，數字會比較小。跟沒開的模型比較時，請以行駛結果為主。
 
 ## DEMO 前一天（Nano）：建 TensorRT engine
 

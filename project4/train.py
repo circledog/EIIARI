@@ -8,11 +8,15 @@ Examples
     # general + Perlin augmentation, then prune 30 % and 50 %, export ONNX
     python train.py --general --perlin --prune 0.3 0.5 --onnx
 
+    # preprocessing: crop the top 30 %, fix label y at 0.65, drop bad labels
+    python train.py --roi-top 0.3 --fixed-y 0.65 --exclude bad_labels.txt --general
+
     # prune an existing baseline without retraining it
     # (augmentation switches and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
 
-Outputs in ``--out`` (default ``models/``), per run name ``resnet18_<aug>``:
+Outputs in ``--out`` (default ``models/``), per run name ``resnet18_<aug>``
+(``resnet18_<pre>_<aug>`` when preprocessing is on):
     <name>_base.pth / .json          baseline state_dict + metadata
     <name>_pruned30.pth / .json      pruned + finetuned state_dict + metadata
     <name>_*.onnx                    with --onnx (for trtexec on the Nano)
@@ -30,6 +34,7 @@ import torch.nn.functional as F
 from compression import count_macs_params, export_onnx, prune_model
 from data_loader import DEFAULT_DATA_DIR, make_loaders
 from model import build_model, read_meta, rebuild_resnet18_from_state_dict, write_meta
+from preprocessing import Preprocessor
 
 
 def evaluate(model, loader, device):
@@ -71,6 +76,10 @@ def fit(model, train_loader, val_loader, device, epochs, lr, tag):
     return best_loss, history
 
 
+def _variant_label(prep, aug):
+    return ("pre=%s | aug=%s" % (prep.tag(), aug.tag())) if prep.tag() else "aug=%s" % aug.tag()
+
+
 def save(model, path, meta, onnx):
     torch.save(model.state_dict(), path)
     if onnx:
@@ -84,6 +93,10 @@ def main():
     ap.add_argument("--data", default=DEFAULT_DATA_DIR, help="folder with xy_*.jpg")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
     ap.add_argument("--name", default=None, help="run name (default resnet18_<aug>)")
+    pg = ap.add_argument_group("preprocessing (all off = none; also applied on the robot)")
+    pg.add_argument("--roi-top", type=float, default=0.0, help="crop this top fraction, e.g. 0.3")
+    pg.add_argument("--fixed-y", type=float, default=None, help="fix label y at this height fraction, e.g. 0.65")
+    pg.add_argument("--exclude", default=None, help="file with image names to drop (bad labels)")
     g = ap.add_argument_group("augmentation switches (all off = none)")
     g.add_argument("--general", action="store_true", help="flip / rotate / crop / colour jitter")
     g.add_argument("--perlin", action="store_true", help="Perlin-noise lighting")
@@ -109,8 +122,18 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     if args.base:
-        # Reuse the baseline's augmentation switches and run name unless overridden,
-        # so pruned files stay grouped with (and labelled like) their baseline.
+        # Reuse the baseline's preprocessing, augmentation switches and run name
+        # unless overridden, so pruned files stay grouped with their baseline.
+        base_pre = read_meta(args.base).get("preprocessing") or {}
+        if not args.roi_top and args.fixed_y is None and args.exclude is None:
+            args.roi_top = base_pre.get("roi_top") or 0.0
+            args.fixed_y = base_pre.get("fixed_y")
+            ex = base_pre.get("exclude_path")
+            if ex and os.path.exists(ex):
+                args.exclude = ex
+            elif base_pre.get("exclude"):
+                print("warning: baseline used exclude file %r, not found; pass --exclude"
+                      % base_pre["exclude"])
         base_aug = read_meta(args.base).get("augmentation", {})
         if not (args.general or args.perlin or args.compression):
             args.general = bool(base_aug.get("general"))
@@ -120,20 +143,24 @@ def main():
         if args.name is None and stem.endswith("_base"):
             args.name = stem[:-len("_base")]
 
+    prep = Preprocessor(roi_top=args.roi_top, fixed_y=args.fixed_y, exclude=args.exclude)
     train_loader, val_loader, aug = make_loaders(
         args.data, general=args.general, perlin=args.perlin, compression=args.compression,
-        val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.seed)
-    name = args.name or "resnet18_%s" % aug.tag()
+        val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.seed,
+        preprocessor=prep)
+    variant = "%s_%s" % (prep.tag(), aug.tag()) if prep.tag() else aug.tag()
+    name = args.name or "resnet18_%s" % variant
     common = {
         "arch": "resnet18",
+        "preprocessing": prep.config(),
         "augmentation": {"general": aug.general, "perlin": aug.perlin,
                          "compression": aug.compression, "tag": aug.tag()},
         "data": os.path.abspath(args.data),
         "n_train": len(train_loader.dataset), "n_val": len(val_loader.dataset),
         "val_ratio": args.val_ratio, "seed": args.seed, "batch_size": args.batch_size,
     }
-    print("data: %d train / %d val, %r, device %s"
-          % (common["n_train"], common["n_val"], aug, device))
+    print("data: %d train / %d val, %r, %r, device %s"
+          % (common["n_train"], common["n_val"], prep, aug, device))
 
     # ---- baseline --------------------------------------------------------- #
     if args.base:
@@ -145,7 +172,7 @@ def main():
         model = build_model(pretrained=not args.no_pretrained).to(device)
         best, history = fit(model, train_loader, val_loader, device, args.epochs, args.lr, "base")
         macs, params = count_macs_params(model)
-        base_meta = dict(common, label="ResNet18 | aug=%s | no compression" % aug.tag(),
+        base_meta = dict(common, label="ResNet18 | %s | no compression" % _variant_label(prep, aug),
                          compression=None, epochs=args.epochs, lr=args.lr,
                          best_val_loss=best, macs=macs, params=params, history=history)
         base_path = os.path.join(args.out, name + "_base.pth")
@@ -162,7 +189,7 @@ def main():
         tag = "pruned%02d" % round(ratio * 100)
         best, history = fit(pruned, train_loader, val_loader, device,
                             args.finetune_epochs, args.finetune_lr, tag)
-        meta = dict(common, label="ResNet18 | aug=%s | DepGraph %d%%" % (aug.tag(), round(ratio * 100)),
+        meta = dict(common, label="ResNet18 | %s | DepGraph %d%%" % (_variant_label(prep, aug), round(ratio * 100)),
                     compression=dict(info, method="DepGraph", importance="GroupMagnitude(p=2)"),
                     base=os.path.basename(base_path), base_val_loss=base_meta.get("best_val_loss"),
                     val_loss_before_finetune=before, epochs=args.finetune_epochs, lr=args.finetune_lr,
