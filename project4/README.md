@@ -26,6 +26,8 @@ Jetson Nano  Camera Input →（輸入干擾）→ Preprocessing（同一個函�
 | `live_demo.ipynb` | Nano | 推論＋控制的操作介面 |
 | `requirements-pc.txt` | PC | PC / Colab 端套件 |
 
+程式碼註解規則：每行有實質內容的程式碼，上一行都有一條英文註解（常見的 library import、單獨的括號、docstring 除外）。修改程式時請維持這個格式。
+
 資料放在 `data/`、模型放在 `models/`、行駛紀錄放在 `runs/`，這三個資料夾都不進 git。
 
 ## 各模組簡介

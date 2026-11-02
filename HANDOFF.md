@@ -39,6 +39,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 換模型後清空相機佇列：jetbot 來源用重啟管線，另外提供 `'csi'`（`drop=true`）來源（第四階段）。
 - 資料收集不在這個分支的範圍：收集 notebook（隊友版與課程原始版）、`lane_label.py`、`使用說明.txt` 都已刪除（第八階段）。第六、七階段的紀錄保留作歷史，內容要看 git 歷史（`14f384d` 之前）。
 - 前處理**只做車道線標示**（第九階段，取代第五、八階段的 ROI／固定 y／排除清單）：逐像素偵測白膠帶並塗成純紅色疊在原圖上，模型仍吃 3 通道彩色圖；不用直線擬合，所以彎道可以用。標籤（檔名的綠點）只用來檢查偵測結果，偵測本身不依賴它，因為車上推論時沒有標籤。
+- **程式註解規則**（使用者要求，第十二階段）：每行有實質內容的程式碼，上一行都要有一條英文註解；不可寫在同一行後面。常見的 library import、單獨的括號／收尾、docstring 不加。多行的敘述只在第一行上方加一次。之後新增或修改程式都要照做。
 - `project4/data` 在 worktree 裡是指向 `/run/sandbox/source/project4/data` 的 symlink（gitignore 已改為 `/data` 才能涵蓋 symlink）。
 
 ## 已完成
@@ -283,6 +284,27 @@ python train.py --split session --general ...                           # 需要
 沒有實機驗證：
 - MobileNetV2 在 Nano 上走 TensorRT。ReLU6 會匯出成 Clip，TensorRT 有支援。
 - 板子上舊版 torchvision 有沒有 `mobilenet_v2`（0.3 版以後才有，JetPack 的版本應該有）。
+
+## 第十二階段（每行加英文註解，2026-11-02）
+
+使用者要求的規則：
+- 註解放在所描述那行程式碼的**上一行**，用**英文**。
+- 略過：常見的 library import、沒有實質內容的行（單獨的括號、分號、「end of dict」這類收尾）、docstring。
+
+使用者以為之前提過這個要求，但對話紀錄和專案記憶裡都找不到；這次已寫進專案記憶（`line-comment-rule`）。
+
+- 套用範圍：`project4/` 的 10 個 `.py`（augmentation、camera、compression、control、data_loader、loader、mobilenet_v2、preprocessing、resnet18、train），以及 `live_demo.ipynb` 的程式碼格。`train_model.ipynb` 是課程原始範例，沒有動。
+- 處理方式：
+  - 原本寫在同一行後面的註解，移到上一行。
+  - notebook 原本的中文註解改成英文。介面上的中文字串和 markdown 說明不變。
+  - `else:`、`except`、`finally:`、裝飾器、`def`、`class` 也都有註解。
+  - 本專案自己的模組 import（例如 `from loader import …`）算實質內容，有加註解。
+- 驗證：寫了檢查腳本，兩項都通過 ✅
+  - 每個檔案、每個 notebook 程式碼格，加註解前後的 AST 完全相同，所以程式邏輯沒有任何改變。
+  - 逐行檢查規則：每個需要註解的敘述上一行都是註解，而且沒有寫在同一行後面的註解；結果 0 個問題。
+- 另外確認過：註解裡沒有中文；`train.py --arch mobilenet_v2 … --prune 0.3` 能跑完；`live_demo` 用 nbclient 跑正常。
+- 順手修正：`compression.wrap_trt_engine` 的 docstring 原本寫 `model.load_model`，改成 `loader.load_model`。
+- vermin 對 `train.py` 回報「`compression` 需要 3.14」，這是誤判：Python 3.14 新增了標準庫 `compression`，和本專案的 `compression.py` 同名。腳本所在的資料夾優先，所以實際 import 的是專案的版本；註解前就是這樣。
 
 ## 未完成 / 未驗證
 
