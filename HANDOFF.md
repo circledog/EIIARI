@@ -31,8 +31,13 @@ Camera Input → Model inferencing → Motor controlling                       (
 - augmentation 是訓練期變因 → live demo 的「切換變因」＝切換不同條件訓練出的 checkpoint。
 - 前處理沿用課程慣例：相機給 BGR，訓練時 `[::-1]` 把 RGB 轉 BGR，兩邊都是 BGR 進網路。
 - 修正課程 `XYDataset` 不看 `random_hflips` 的 bug；驗證集不做任何 augmentation。
-- 資料集只有 jpg、沒有 metadata → train/val 隨機 9:1（固定 seed）。
-- Nano 端（JetPack 4.x / Python 3.6，版本未確認）會 import 的模組保持 Python 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別。
+- 現有資料集只有 jpg、沒有 metadata → 預設 train/val 隨機 9:1（固定 seed）。之後新拍的資料連 `metadata/` 一起複製，就可以用 `--split session` 照拍攝段落切（第六階段）。
+- Nano 是 **Python 3.6.9**（收集 notebook 的 metadata 寫的），板子會 import 的模組保持 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別、`datetime.fromisoformat`。
+- 前處理（ROI、fixed y）的設定存進模型 `.json`，live_demo 依模型自動套用，再把預測換算回完整畫面；舊模型＝不處理（第五階段）。
+- 控制的髮夾彎擴充（轉彎減速、內側輪反轉）預設關閉，關閉時和投影片公式完全一樣（第四階段）。
+- 換模型後清空相機佇列：jetbot 來源用重啟管線，另外提供 `'csi'`（`drop=true`）來源（第四階段）。
+- 收集 notebook 的自動標記演算法**維持原樣**：由下往上追蹤、單線推估都試過但沒改善或有害；彎道改靠手動點選並鎖定 y=0.65（第六階段）。
+- 手把用多個 `Controller` 背景輪詢、自動綁定；「按任一鍵」是瀏覽器限制，省不掉（第七階段）。
 - `project4/data` 在 worktree 裡是指向 `/run/sandbox/source/project4/data` 的 symlink（gitignore 已改為 `/data` 才能涵蓋 symlink）。
 
 ## 已完成
@@ -41,8 +46,9 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 寫完全部模組：`data_loader.py`、`augmentation.py`、`model.py`、`compression.py`、`camera.py`、`control.py`、`train.py`、`live_demo.ipynb`。
 - 控制依投影片 P.75 `execute()`：`y=(0.5-xy[1])/2`、`angle=atan2(x,y)`、`steering=Kp·angle+Kd·Δangle+bias`、左 `speed+steering`／右 `speed-steering`，clip 到 [0,1]。
 - augmentation 驗證：幾何變換後標籤誤差平均 0.65 px（最大 2.1 px，來自點的取樣）；全關時回傳同一個物件。
+- 之後的修改依序寫在下方「第二階段」到「第七階段」。
 
-## live_demo.ipynb 功能
+## live_demo.ipynb 功能（目前版本）
 
 - 下拉選單切換 `models/*.pth`（顯示 `.json` 裡的 label、params、MACs、val loss）；PyTorch 和 TRT `.pth` 自動判斷，TRT 的輸入 dtype 從 engine 讀。
 - 即時畫面＋預測點＋steering 條；x、y、angle、steering、左右馬達、P、D、FPS、推論延遲。
@@ -51,6 +57,10 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 「輸入干擾」：在即時畫面上加柏林噪聲／壓縮失真，測穩健性（額外加的功能）。
 - 「錄製 CSV」寫到 `runs/drive_*.csv`；第 5 節 `benchmark()` 在相同條件下量所有模型的延遲，供報告使用。
 - `CAMERA_SOURCE='dummy'` 或 `'folder'` 加上 `USE_ROBOT=False`，沒有 JetBot 也能跑。
+- 髮夾彎擴充：「轉彎減速 k」滑桿、「內側輪可反轉」勾選框（預設關閉）；左右馬達讀數 −1~1，另外顯示實際 speed。
+- 換模型：載入 → warmup → `camera.flush()`（`FLUSH_ON_SWITCH`）；畫面更新上限 `DISPLAY_FPS=15`。
+- 依模型 `.json` 套用前處理（ROI 裁切），預測換算回完整畫面；被裁掉的部分變暗並畫青色線。
+- 推論迴圈出錯時，模型選單下方會顯示紅字和 traceback；第 6 節「結束」是按鈕（Run All 不會關掉相機），按過之後再按開始會提示要 Restart Kernel。
 
 ## 使用流程
 
@@ -73,9 +83,20 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 # wrap_trt_engine 會自動把 models/X.json 複製成 X_trt.json，label 加上 ' | TensorRT'
 ```
 
-完整的車子操作步驟（DEMO 前一天建 engine、當天架高測試、調參順序、疑難排解）寫在 `project4/README.md`。
-
 然後開 `live_demo.ipynb` 由上往下執行。`models/` 裡 PyTorch 和 TRT 的 `.pth` 會一起出現在下拉選單。
+
+前處理、標籤清理與照段落切分（PC）：
+
+```bash
+python preprocessing.py review --model models/resnet18_gen_base.pth     # 依誤差排序，找出標錯的圖 → bad_labels.txt
+python train.py --roi-top 0.3 --fixed-y 0.65 --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx
+python train.py --split session --general ...                           # 需要 dataset_xy 旁邊的 metadata/
+python lane_label.py eval --sheet lane_eval.jpg                         # 評估收集用的自動標記
+```
+
+資料收集（Nano）：`project4_data_collection_gamepad.ipynb` 要和 `lane_label.py` 放在同一個資料夾。手把按任一鍵會自動連線綁定；手動點選時 y 鎖在 65%；搬資料時 `dataset_xy` 和 `metadata` 一起複製。
+
+完整的車子操作步驟（DEMO 前一天建 engine、當天架高測試、調參順序、疑難排解）、資料收集重點都寫在 `project4/README.md`；收集的操作步驟在 `project4/使用說明.txt`。
 
 ## 第二階段（README 與 DEMO 操作）
 
@@ -182,12 +203,19 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
-- **Nano 上沒有實際跑過**：jetbot.Camera / Robot、Python 3.6 環境（只用 vermin 靜態檢查過）、ipywidgets 舊版的介面排版。
-- 正式訓練（70 epochs、各種 augmentation 組合）還沒跑，smoke test 只跑了 2 epochs。
+- **Nano 實測進度**：使用者在板子上跑過 live_demo，修好舊版 torchvision 的 `TypeError` 後，模型能載入、畫面能更新（第三階段）。以下**還沒在板子上驗證**：
+  - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
+  - 髮夾彎擴充（轉彎減速、內側輪反轉）的實際行駛效果。
+  - 新的資料收集 notebook：手把自動綁定（舊版 ipywidgets 的 Controller）、ClickableImageWidget 是否會送 `width`/`height`（不會就改用 widget 寬度）、x 分布圖和近似重複判斷。
+  - 帶前處理的模型在板子上的推論。
+- 正式訓練（70 epochs、各種 augmentation／前處理組合）的結果還沒回報；sandbox 只跑過 1~3 epochs 的 smoke test。
 - 「other model」尚未決定。
-- 若 Nano 上的 torch 沒有 `torch.load(..., weights_only=...)` 會 fallback；舊 torchvision 的 `pretrained=` 已處理。
+- 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
+- **測試腳本不在 repo 裡**：各階段寫的測試（`collect_test.py`、`gamepad_test.py`、`eval_old.py`、假模組 `fakejet/`、`fakecollect/`、notebook 產生器 `make_nb.py`）都放在 sandbox 的 scratchpad，sandbox 刪除後就不見了。需要的話要搬進 repo（例如 `project4/tests/`）。
 
 ## 測試指令與結果
+
+以下是第一階段的測試；之後各階段的測試寫在該階段的「已測」裡。
 
 Python 環境：`/tmp/claude-1000/.../scratchpad/venv`（Python 3.12，torch 2.15 CPU from PyPI，torch-pruning 1.6.0）。
 
@@ -216,7 +244,9 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 
 ## 下一步
 
-1. 在 PC / Colab 用 GPU 跑正式訓練（四種 augmentation 組合 × base / pruned30 / pruned50）。
-2. 板子上跑 trtexec → wrap → live_demo，先驗證 TRT 載入（風險最高）。
-3. 驗證 Nano 上的介面與相機，再調 PD 參數。
-4. 決定 other model 後在 `model.build_model(arch=...)` 和 `rebuild_*` 加上對應的分支。
+1. 板子上更新 `lane_label.py`、`project4_data_collection_gamepad.ipynb`，照新規則（y 鎖在 65%、看 x 分布補紅色格子）補拍彎道、髮夾彎、偏離回正的畫面；`dataset_xy` 和 `metadata` 一起搬到 PC。
+2. PC 上先訓練一個模型，用 `preprocessing.py review` 找出壞標籤，再比較有沒有前處理（`--roi-top 0.3 --fixed-y 0.65 --exclude …`）、各種 augmentation、`--split session` 的結果。
+3. 板子上跑 trtexec → wrap → live_demo，驗證 TRT 載入（風險最高）；驗證換模型的 flush。
+4. 調 PD 參數；髮夾彎再試轉彎減速／內側輪反轉。
+5. 決定 other model 後在 `model.build_model(arch=...)` 和 `rebuild_*` 加上對應的分支。
+6. 視需要把 scratchpad 的測試腳本搬進 repo。

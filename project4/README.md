@@ -318,6 +318,8 @@ engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO �
   - 備案是用 PyTorch `.pth` DEMO（CUDA 上自動 FP16）。
   - 或照投影片 P.55 用 `torch2trt` 轉：模型改用 `rebuild_resnet18_from_state_dict()` 建立。
 - Nano 上的 Python 3.6 / 舊版 ipywidgets 只做過靜態語法檢查，介面排版可能和 PC 上不同。
+- 換模型時的 flush（重啟 jetbot 相機管線）和 `CAMERA_SOURCE = 'csi'` 都還沒在板子上試過。flush 有問題就把 `FLUSH_ON_SWITCH` 改成 `False`。
+- 資料收集 notebook 的新功能（手把自動綁定、y 鎖定、x 分布圖、近似重複判斷）只在 sandbox 用假手把、假相機測過。板子上的 ClickableImageWidget 如果是舊版、沒有回傳顯示大小，點選座標會改用 widget 設定的寬度換算；可以看右側檢查圖的黃色圈是否對準點的位置。
 - 和投影片流程不同的地方，報告要寫清楚，DEMO 前建議先問助教：
   - 訓練和剪枝在 PC 上做，不是在 JetBot 上（P.79）。
   - TensorRT 轉換走 ONNX → trtexec，不是 torch2trt（P.56）。
