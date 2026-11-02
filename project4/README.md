@@ -12,7 +12,8 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 
 | 檔案 | 在哪裡跑 | 用途 |
 |---|---|---|
-| `project4_data_collection_gamepad.ipynb` | Nano | 收集資料（操作見 `使用說明.txt`） |
+| `project4_data_collection_gamepad.ipynb` | Nano | 收集資料（操作見 `使用說明.txt` 和下面的「資料收集」） |
+| `lane_label.py` | Nano（`eval` 在 PC） | 資料收集用的車道線偵測與自動標記，從 notebook 搬出來，可離線評估 |
 | `data_collection_gamepad.ipynb`、`train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
 | `preprocessing.py` | PC + Nano | 固定的前處理（ROI 裁切、固定 y、排除壞標籤）與標籤檢視工具 |
@@ -33,8 +34,9 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 
 - `XYDataset(directory=None, augmenter=None)`：讀取 `xy_<x>_<y>_<uuid>.jpg`，從檔名取出像素座標，再正規化到 [-1, 1]。
   - `directory` 預設是 `data/dataset_xy_2026-10-21/dataset_xy`。
-- `make_loaders(directory, general, perlin, compression, ...)`：回傳 train / val 的 DataLoader。
-  - 用固定 seed 隨機切 9:1。
+- `make_loaders(directory, general, perlin, compression, ..., split='random')`：回傳 train / val 的 DataLoader。
+  - `split='random'`：用固定 seed 隨機切 9:1。
+  - `split='session'`：讀資料收集存的 `metadata/`，**照拍攝段落切**。同一個 `session_id`（一次 notebook 執行）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
   - **只有訓練集做 augmentation**，驗證集一律用原圖。
 - 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
 - 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
@@ -142,6 +144,7 @@ python train.py --help
 | `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
 | `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
 | `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json） |
+| `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
 
 產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`；有開前處理時是 `resnet18_<pre>_<aug>_...`，例如 `resnet18_roi30+fy65+ex12_gen_base.pth`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
@@ -156,6 +159,28 @@ python train.py --help
 | 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
 | 即時讀數 | x、y、angle、steering、實際 speed、左右馬達（−1~1）、P / D 項、FPS、推論延遲 |
 | 運轉 | 開始推論、**停止**、**允許移動**（預設關閉）、錄製 CSV |
+
+### 資料收集（`project4_data_collection_gamepad.ipynb` + `lane_label.py`）
+
+操作步驟見 `使用說明.txt`，這裡只寫重點：
+
+- **標記規則：目標點一律放在高度 65% 的參考線上，只決定左右。**
+  - 自動標記本來就是這個高度。
+  - 手動點選時預設鎖定 y（勾選框「手動點選鎖定 y」），點哪個高度都會被換成 65%。
+  - 左圖會畫黃色虛線當參考，**只畫在顯示用的圖上，存進訓練集的原圖沒有疊圖**。
+  - 舊資料 200 張裡有 198 張是手動點的，y 從 72 到 212 都有，遠近不一致，所以才加這個規則。
+- **自動標記只在約 37% 的畫面有效**（`python lane_label.py eval` 對舊資料測的）。主要失敗在彎道：前方膠帶接近水平、內側膠帶在畫面外，65% 高度上根本沒有兩條線。
+  - 試過「由下往上追蹤膠帶」和「單線加半個車道寬推估」都沒改善，後者在彎道還會指錯方向（誤差中位數 60 px），所以沒有採用。
+  - **彎道、髮夾彎、偏離後回正的畫面請暫停後手動點選。**
+- 「**標籤 x 分布**」長條圖：每存一張就更新，紅色格子表示資料少於平均一半，要優先補拍那個方向。
+- **近似重複**：和上一張存的畫面幾乎一樣時會先擋下來，再按一次才會存。
+- 手動點選的座標用圖片在瀏覽器上實際顯示的大小換算，視窗太窄、圖片被縮小時也不會偏。
+- 剛開相機還沒有影格時會等待，最多 10 秒，不會直接報錯停止。
+- **搬資料到 PC 時，`dataset_xy` 和 `metadata` 要一起複製**，放在同一層，`--split session` 才能用。
+
+```bash
+python lane_label.py eval --sheet lane_eval.jpg   # 對既有資料集跑自動標記，跟手動標籤比較
+```
 
 ---
 

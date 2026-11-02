@@ -105,6 +105,11 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--val-ratio", type=float, default=0.1)
+    ap.add_argument("--split", choices=["random", "session"], default="random",
+                    help="session: keep shooting segments together (needs the metadata folder)")
+    ap.add_argument("--metadata", default=None, help="metadata folder (default: next to --data)")
+    ap.add_argument("--segment-gap", type=float, default=60.0,
+                    help="seconds between captures that start a new segment (--split session)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--base", default=None, help="existing baseline .pth: skip baseline training")
@@ -147,7 +152,7 @@ def main():
     train_loader, val_loader, aug = make_loaders(
         args.data, general=args.general, perlin=args.perlin, compression=args.compression,
         val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.seed,
-        preprocessor=prep)
+        preprocessor=prep, split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap)
     variant = "%s_%s" % (prep.tag(), aug.tag()) if prep.tag() else aug.tag()
     name = args.name or "resnet18_%s" % variant
     common = {
@@ -158,9 +163,11 @@ def main():
         "data": os.path.abspath(args.data),
         "n_train": len(train_loader.dataset), "n_val": len(val_loader.dataset),
         "val_ratio": args.val_ratio, "seed": args.seed, "batch_size": args.batch_size,
+        "split": train_loader.split_info,
     }
     print("data: %d train / %d val, %r, %r, device %s"
           % (common["n_train"], common["n_val"], prep, aug, device))
+    print("split: %s" % train_loader.split_info)
 
     # ---- baseline --------------------------------------------------------- #
     if args.base:

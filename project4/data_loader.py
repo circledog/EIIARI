@@ -14,7 +14,9 @@ Tensor pre-processing also follows the course so that models stay compatible
 with the slide's ``preprocess()`` on the robot: resize 224x224, to_tensor,
 RGB -> BGR channel flip (the JetBot camera delivers BGR), ImageNet normalise.
 """
+import datetime
 import glob
+import json
 import os
 
 import numpy as np
@@ -26,7 +28,8 @@ from augmentation import Augmenter
 from preprocessing import Preprocessor
 
 __all__ = ["DEFAULT_DATA_DIR", "XYDataset", "parse_xy", "image_to_tensor",
-           "split_indices", "make_loaders", "IMAGENET_MEAN", "IMAGENET_STD"]
+           "split_indices", "split_by_session", "default_metadata_dir", "make_loaders",
+           "IMAGENET_MEAN", "IMAGENET_STD"]
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_DIR = os.path.join(_HERE, "data", "dataset_xy_2026-10-21", "dataset_xy")
@@ -110,20 +113,120 @@ def split_indices(n, val_ratio=0.1, seed=0):
     return sorted(order[n_val:]), sorted(order[:n_val])
 
 
+def default_metadata_dir(directory):
+    """``<parent>/metadata`` next to ``<parent>/dataset_xy`` (collection notebook layout)."""
+    return os.path.join(os.path.dirname(os.path.normpath(directory)), "metadata")
+
+
+def _parse_time(text):
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def split_by_session(paths, metadata_dir, val_ratio=0.1, seed=0, segment_gap=60.0):
+    """Split by shooting segment instead of by image.
+
+    A segment = consecutive captures of one ``session_id`` (one notebook run)
+    with less than ``segment_gap`` seconds between them. Whole segments go to
+    the validation split until it holds about ``val_ratio`` of the images, so
+    near-identical neighbouring shots never end up on both sides.
+
+    Images without a metadata JSON become segments of their own.
+    Returns (train_idx, val_idx, info).
+    """
+    records = []
+    missing = 0
+    for i, p in enumerate(paths):
+        stem = os.path.splitext(os.path.basename(p))[0]
+        meta_path = os.path.join(metadata_dir, stem + ".json")
+        session, t = None, None
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            session = meta.get("session_id")
+            t = _parse_time(meta.get("captured_at") or meta.get("saved_at"))
+        if session is None or t is None:
+            missing += 1
+            records.append((i, "single-%d" % i, None))
+        else:
+            records.append((i, session, t))
+
+    groups = []
+    by_session = {}
+    for i, session, t in records:
+        if t is None:
+            groups.append([i])
+        else:
+            by_session.setdefault(session, []).append((t, i))
+    for session in sorted(by_session):
+        items = sorted(by_session[session])
+        current = [items[0][1]]
+        for (t0, _), (t1, i1) in zip(items, items[1:]):
+            if (t1 - t0).total_seconds() > segment_gap:
+                groups.append(current)
+                current = []
+            current.append(i1)
+        groups.append(current)
+
+    if len(groups) < 2:
+        raise ValueError("only %d shooting segment(s): cannot split by session; use split='random' "
+                         "or a smaller segment_gap" % len(groups))
+    rng = np.random.RandomState(seed)
+    order = rng.permutation(len(groups)).tolist()
+    target = max(1, int(round(len(paths) * val_ratio)))
+    val = []
+    for g in order:
+        if len(val) >= target:
+            break
+        if len(val) + len(groups[g]) >= len(paths):
+            continue  # always leave something for training
+        val.extend(groups[g])
+    if not val:
+        raise ValueError("every segment is too large for the validation split; use split='random' "
+                         "or a smaller segment_gap")
+    val_set = set(val)
+    train = [i for i in range(len(paths)) if i not in val_set]
+    info = {"split": "session", "segments": len(groups), "sessions": len(by_session),
+            "images_without_metadata": missing, "segment_gap": segment_gap,
+            "metadata_dir": os.path.abspath(metadata_dir)}
+    return sorted(train), sorted(val), info
+
+
 def make_loaders(directory=None, general=False, perlin=False, compression=False,
                  val_ratio=0.1, batch_size=8, num_workers=4, seed=0, augmenter=None,
-                 preprocessor=None):
+                 preprocessor=None, split="random", metadata_dir=None, segment_gap=60.0):
     """Train/val DataLoaders.
 
     Preprocessing is applied to both splits; augmentation to the training split
     only. Pass the three augmentation switches, or a pre-configured
-    ``augmenter`` (overrides them). Returns (train_loader, val_loader, augmenter).
+    ``augmenter`` (overrides them).
+
+    ``split='random'`` (default) splits images at random; ``split='session'``
+    keeps shooting segments together (needs the collection ``metadata`` folder,
+    default ``default_metadata_dir(directory)``).
+
+    Returns (train_loader, val_loader, augmenter); the split details are in
+    ``train_loader.split_info``.
     """
     directory = directory or DEFAULT_DATA_DIR
     if augmenter is None:
         augmenter = Augmenter(general=general, perlin=perlin, compression=compression)
-    n = len(XYDataset(directory))
-    train_idx, val_idx = split_indices(n, val_ratio, seed)
+    all_paths = XYDataset(directory).all_paths
+    n = len(all_paths)
+    if split == "session":
+        metadata_dir = metadata_dir or default_metadata_dir(directory)
+        if not os.path.isdir(metadata_dir):
+            raise FileNotFoundError("split='session' needs the metadata folder: %s" % metadata_dir)
+        train_idx, val_idx, split_info = split_by_session(all_paths, metadata_dir, val_ratio, seed, segment_gap)
+    elif split == "random":
+        train_idx, val_idx = split_indices(n, val_ratio, seed)
+        split_info = {"split": "random"}
+    else:
+        raise ValueError("split must be 'random' or 'session'")
     train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx, preprocessor=preprocessor)
     val_ds = XYDataset(directory, augmenter=None, indices=val_idx, preprocessor=preprocessor)
     g = torch.Generator()
@@ -132,4 +235,5 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
         train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=g)
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    train_loader.split_info = split_info
     return train_loader, val_loader, augmenter

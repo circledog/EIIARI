@@ -15,6 +15,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 |---|---|
 | `data_loader.py` | `XYDataset`，路徑參數，預設 `data/dataset_xy_2026-10-21/dataset_xy` |
 | `preprocessing.py` | ROI 裁切、固定 y、排除清單；設定存進模型 .json，車上也套用；`review` 標籤檢視工具 |
+| `lane_label.py` | 資料收集用的車道線偵測／自動標記（從收集 notebook 搬出）；`eval` 對既有資料集評估 |
 | `augmentation.py` | 三組開關：一般（幾何＋色彩）、柏林噪聲、壓縮失真（JPEG / 144p）。全關＝原樣輸出 |
 | `model.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)`；依 state_dict 重建剪枝後網路；TRT 載入 |
 | `compression.py` | DepGraph 剪枝（torch-pruning `MetaPruner` + `GroupMagnitudeImportance(p=2)`）、MACs/params、ONNX 匯出、engine 包裝 |
@@ -133,6 +134,39 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
   - `train.py --roi-top 0.3 --fixed-y 0.65 --exclude … --general --prune 0.3 --onnx` 3 epochs：val 0.0275 ✅；`--base` 沿用前處理和排除清單 ✅
   - `preprocessing.py review --model …` 產生依誤差排序的總覽圖 ✅
   - notebook（folder 相機）：新模型 roi 0.3 / fixed_y 0.65 有套用、畫面上方有變暗；換回舊模型時 roi 0 ✅；vermin 3.6 ✅
+
+## 第六階段（資料收集檢查與修正，2026-11-02）
+
+檢查 `project4_data_collection_gamepad.ipynb` 的發現：
+- 200 張中只有 2 張 y=145（自動標記），**198 張是手動點的**，y 從 72 到 212，沒有統一規則。
+- 自動標記（`detect_indoor` + 65% 高度取中點）在舊資料上只有 74/200 有效，跟手動標籤 x 的差距中位數 14 px。
+- 只能直線前進，偏離／回正的畫面要手動擺；搬資料時 `metadata/` 沒有一起複製；只擋同一幀，不擋近似重複；手動點選用 widget 設定寬度換算座標（瀏覽器縮圖時會偏）；相機還沒出影格時直接報錯。
+
+做了什麼：
+- `lane_label.py`：把偵測程式從 notebook 搬出來，演算法**維持原樣**；`compute_midpoint()` 取代 `draw_lane_midpoint` 的計算部分；新增 `draw_guides()`；`python lane_label.py eval [--sheet]` 離線評估。
+  - **試過但沒採用**：(a) 從畫面底部往上追蹤膠帶，取代用畫面中線分左右 → 72 vs 74，沒有改善；(b) 只有一條線時用「半個車道寬」推估 → 彎道會指錯方向，誤差中位數 60 px。原因是彎道前方膠帶接近水平、內側膠帶在畫面外，在固定高度上本來就沒有中點。結論：彎道要靠手動點選加上固定規則。
+- 收集 notebook（「Provided setup cell. Do not modify.」那兩格沒有動）：
+  - 手動點選**鎖定 y 在 far_y=0.65**（`MANUAL_LOCK_Y`，介面有勾選框），`label_source='manual_click_y_locked'`，metadata 多記 `y_locked`。
+  - 左圖顯示 65% 參考線，只畫在顯示圖上；存檔用的 `raw_jpeg` 不變（已測：等於原 frame 的 JPEG）。
+  - 點選座標用 click event 的 `width`/`height`（widget JS 會送出實際顯示大小）換算，沒有的話退回 widget 寬度。
+  - 「標籤 x 分布」HTML 長條圖（`X_BINS=8`），存檔後更新並標出剛存的那一格。
+  - 近似重複：32×32 灰階平均差小於 `NEAR_DUP_THRESHOLD=3.0` 時先擋，同一幀再按一次才存；重開 kernel 會讀最新一張存檔來比較。
+  - 相機沒有影格時等待，最多 10 秒。
+  - markdown 說明、拍攝建議、搬資料要連 metadata 一起，都更新了。
+- `data_loader.split_by_session()` / `make_loaders(split='session')` / `train.py --split session --metadata --segment-gap`：照 session 和時間間隔分段，整段放進 val；一定會留資料給 train；只有一段時報錯。切分資訊寫進模型 .json 的 `split`。
+- README（新增「資料收集」小節、`--split`）、`使用說明.txt`（開頭新增「〇、這次更新」）。
+
+已測：
+- `lane_label.py eval`：74/200、差距中位數 14 px，和原 notebook 的程式結果完全相同 ✅
+- 收集 notebook 用假的 jetbot / ClickableImageWidget 透過 nbclient 執行（測試腳本 `collect_test.py`，假模組在 scratchpad 的 `fakecollect/`）：
+  - 等待相機 → 恢復 ✅；顯示圖 ≠ 存檔圖、存檔圖＝原 frame ✅；自動存檔 ✅
+  - 近似重複第一次擋、第二次存，換場景直接存 ✅
+  - 顯示為 112 px 時點 (30,20) → x=60、y 鎖在 145 ✅；舊版 widget 沒有 width → 用 224 換算 ✅
+  - metadata 欄位正確、`_thumb` 不會寫進 JSON、x 分布會更新 ✅
+- session 切分：200 張模擬 33 段 / 3 個 session / 5 張沒有 metadata → 179/21，沒有任何一段跨兩邊 ✅；notebook 格式的 metadata 讀得懂；只有一段時給出清楚的錯誤 ✅；`train.py --split session` ✅；預設 random 沒有改壞 ✅
+- vermin：收集 notebook 的程式碼 3.5、其他模組 3.x ✅（板子是 Python 3.6.9，見 notebook metadata）
+
+沒有實機驗證：收集 notebook 在 Nano 上的實際操作（手把、ClickableImageWidget 的版本是否會送 width）。
 
 ## 未完成 / 未驗證
 
