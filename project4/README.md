@@ -72,7 +72,10 @@ Jetson Nano  Camera Input → Model inferencing (PyTorch 或 TensorRT) → Motor
 
 ### `camera.py`
 
-- `open_camera(source)`：`'jetbot'`（CSI 相機）、`'opencv'`（USB）、`'folder'`（輪播資料集圖片）、`'dummy'`（假畫面）。後兩種沒有車也能測。
+- `open_camera(source)`：`'jetbot'`（CSI 相機）、`'csi'`（同一顆相機，但只保留最新畫面）、`'opencv'`（USB）、`'folder'`（輪播資料集圖片）、`'dummy'`（假畫面）。後兩種沒有車也能測。
+- `flush()`：丟掉迴圈卡住期間堆積的舊畫面。換模型後會自動呼叫。
+  - 原因：jetbot 的 GStreamer `appsink` 不會丟舊畫面。換模型時 TRT engine 反序列化會卡住 GIL，相機讀取執行緒跟著停，畫面就堆起來；之後讀取速度和相機速度一樣，堆積永遠消化不掉，畫面會一直延遲。
+  - `'jetbot'` 來源的 flush 是重啟相機管線（約 1~2 秒）；`'csi'` 來源設了 `drop=true max-buffers=1`，本來就不會堆積。
 - `preprocess(frame, device, dtype)`：投影片 P.59 的前處理，dtype 依模型決定，不再寫死 `.half()`。
 - `degrade()`：在即時畫面上加柏林噪聲 / 壓縮失真，給介面的「輸入干擾」用。
 - `draw_overlay()`、`to_jpeg()`：畫預測點和轉向條，供畫面顯示。
@@ -90,6 +93,13 @@ right = clip(speed − steering, 0, 1)
 ```
 
 同一個 steering 一邊加、一邊減，兩輪互相拮抗產生轉向：steering > 0 右轉，< 0 左轉。用法是 `PDController(speed, kp, kd, bias).update(x, y) -> (left, right)`，各項中間值放在 `.last`。
+
+髮夾彎用的兩個擴充（投影片沒有，**預設關閉**；關閉時和上面的公式完全一樣）：
+
+| 參數 | 作用 |
+|---|---|
+| `turn_slowdown` k（0~1） | 轉向越大越慢：`speed_eff = speed × max(0, 1 − k·|angle|)`，直線維持原速 |
+| `allow_reverse` | 馬達下限從 0 改成 −1，內側輪可以反轉，車子能原地轉 |
 
 ### `train.py`
 
@@ -117,7 +127,8 @@ python train.py --help
 | 變因 | 模型下拉選單（augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
 | 畫面 | 即時影像、綠色預測點、上方橘色轉向條 |
 | 控制參數 | speed gain、steering gain (Kp)、steering kd、steering bias（投影片 P.71 的範圍） |
-| 即時讀數 | x、y、angle、steering、左右馬達、P / D 項、FPS、推論延遲 |
+| 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
+| 即時讀數 | x、y、angle、steering、實際 speed、左右馬達（−1~1）、P / D 項、FPS、推論延遲 |
 | 運轉 | 開始推論、**停止**、**允許移動**（預設關閉）、錄製 CSV |
 
 ---
@@ -192,10 +203,16 @@ engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO �
 4. 擺動還是明顯時，**再加 kd**，從 0.01~0.05 慢慢加。太大會放大預測雜訊，反而抖。
 5. 直線上一直往同一邊偏，就調 **bias**（-0.3~0.3），補償左右馬達的差異。
 6. 穩定之後再慢慢提高 speed gain。速度變快通常要重新微調 Kp / Kd。
+7. **壓到彎道內側**：通常是目標點太遠、切彎。先把 Kp 調小一點（例如 0.2 → 0.15）。
+8. **髮夾彎轉不過去**：
+   - 先開 **轉彎減速 k**，從 0.3 開始，逐步加到 0.6。轉彎時會自動變慢，直線不受影響。
+   - 還是轉不過去，再勾 **內側輪可反轉**，讓車子可以原地轉。
+   - 根本的解法是補拍髮夾彎的資料（入彎、彎中、出彎各角度 30~50 張，目標點放近），再重新訓練。
 
 ### 5. 比較不同變因
 
 - 從下拉選單換模型時，車子會**自動停下並取消「允許移動」**。
+  - 換完會自動清掉相機堆積的舊畫面（畫面會停 1~2 秒），之後畫面就是即時的。
   - 換完先看綠點正不正常，再手動勾回「允許移動」。
 - 勾「輸入干擾」可以現場示範：有柏林噪聲 / 壓縮 augmentation 的模型在干擾下比較穩。
 - 勾 **錄製 CSV**，每一幀的模型、x、y、steering、左右馬達、延遲、Kp / Kd / bias 都會寫進 `runs/drive_*.csv`，報告可以用來畫圖。
@@ -219,6 +236,7 @@ engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO �
 
 | 狀況 | 處理 |
 |---|---|
+| 換模型之後畫面一直延遲 | 確認第 1 節 `FLUSH_ON_SWITCH = True`。還是延遲的話，改用 `CAMERA_SOURCE = 'csi'`（Restart Kernel 後重跑） |
 | 按了開始推論，畫面卻沒更新 | **先看模型選單下方有沒有紅字**。推論迴圈出錯時會停下，並把錯誤和 traceback 顯示在那裡 |
 | 相機開不起來 | 其他 notebook 還佔著相機：關掉所有 kernel 再試，還不行就 `sudo systemctl restart nvargus-daemon` |
 | 綠點亂跳或完全不對 | 是模型或資料的問題，不是控制的問題（投影片 P.61）。換一個模型比較看看 |

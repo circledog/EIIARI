@@ -93,6 +93,25 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 - `camera.py` 維持原版（沒有 `start()`）。板子上曾經加過、後來又還原的 `start()` 和 preview 執行緒都不是原因，repo 裡沒有加。
 - 已測（nbclient，模擬 Run All，連結束按鈕的 cell 一起執行）：相機沒被關掉、推論正常；選壞掉的模型時紅字和 traceback 有顯示；換回正常模型後可以重新開始；按結束後再按開始會被拒絕 ✅
 
+## 第四階段（髮夾彎控制、換模型後畫面延遲，2026-11-02）
+
+- 使用者回報：車子會壓到彎道內側（Kp 0.2、Kd 0.01）；資料集只有直道和一般彎道，沒有髮夾彎。
+  - 抽樣檢查標籤：急彎 / 雙線轉角處，有些標籤點靠近粗線；x 分布兩端很少（`[3,23,24,50,48,28,20,4]`），缺少快壓線時往回拉的畫面；y 從 72 到 212 都有，標記遠近不一致。
+- `control.py` 新增兩個選項，預設關閉，關閉時和投影片公式一模一樣：
+  - `turn_slowdown`：`speed_eff = speed·max(0, 1 − k·|angle|)`。
+  - `allow_reverse`：馬達下限改成 −1。
+  - live_demo 加了「轉彎減速 k」滑桿、「內側輪可反轉」開關，左右馬達讀數改成 −1~1，另外顯示實際 speed。CSV 多了 `speed_eff`、`turn_slowdown`、`reverse` 三欄。
+- 換模型後畫面持續延遲：jetbot 的 `appsink` 沒有設 `drop`，載入模型時 GIL 被佔住，相機執行緒停下、畫面堆積，之後永遠消化不掉。修法：
+  - 每個相機來源都加了 `flush()`。jetbot 來源用 stop + start 重啟管線，並等到新畫面進來；opencv 來源設 `BUFFERSIZE=1`，再一直 grab 到真正需要等待為止。
+  - 換模型的順序改成：載入 → warmup 3 次 → flush → 開始使用。由 `FLUSH_ON_SWITCH` 控制。
+  - 新增 `'csi'` 來源：自己建 GStreamer 管線，`appsink drop=true max-buffers=1 sync=false`。**沒有在實機上測過**。
+  - 畫面和讀數最多每秒更新 `DISPLAY_FPS=15` 次（控制仍然每幀都做），避免 Wi-Fi 送不完、在瀏覽器端排隊。
+- 已測（假的 jetbot 模組，`fakejet/`：appsink 式的無上限佇列，讀取速度等於相機速度，載入時讓相機停 2 秒）：
+  - 不 flush：換模型前畫面落後 2.07 秒（第一次載入），換模型後 4.03 秒，而且會累加。
+  - flush：0.08 秒 → 0.09 秒 ✅
+  - 新的控制選項有正確傳到控制器；vermin 檢查 3.6 相容 ✅
+- 沒有實機驗證：jetbot `Camera.stop()` / `start()` 重啟在 Nano 上是否穩定、要多久；`'csi'` 管線字串（照 jetbot 0.4 的預設：3280×2464、sensor-mode 3）。
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。

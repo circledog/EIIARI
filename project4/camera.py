@@ -4,6 +4,10 @@
 frame, HxWx3) and ``stop()``:
 
 * ``'jetbot'``  -- ``jetbot.Camera`` (CSI camera on the robot, 224x224).
+* ``'csi'``     -- the same CSI camera through our own GStreamer pipeline with
+                   ``appsink drop=true max-buffers=1``: GStreamer keeps only the
+                   newest frame, so a stalled loop can never build a backlog.
+                   Do not open it while a ``jetbot.Camera`` is running.
 * ``'opencv'``  -- ``cv2.VideoCapture(index)`` (USB webcam / PC testing).
 * ``'folder'``  -- loops over jpgs in a folder (offline testing with the dataset).
 * ``'dummy'``   -- synthetic frames, no hardware needed.
@@ -11,6 +15,9 @@ frame, HxWx3) and ``stop()``:
 ``preprocess(frame)`` reproduces the slides' P.59 ``preprocess`` (BGR frame in,
 normalised NCHW tensor out), with the dtype chosen per model instead of a
 hard-coded ``.half()`` -- trtexec engines expect FP32 (handoff 4.2).
+
+Every source also has ``flush()``: drop frames that queued up while the loop
+was stalled (e.g. loading a model), so the next ``read()`` is live again.
 
 Python 3.6 compatible (runs on the Jetson Nano).
 """
@@ -45,13 +52,60 @@ class _JetbotSource(object):
     def read(self):
         return self.camera.value
 
+    def flush(self, timeout=3.0):
+        """Restart the GStreamer pipeline to drop queued frames.
+
+        jetbot's ``appsink`` has no ``drop=true``: if the capture thread is
+        starved (e.g. the GIL is held while a TensorRT engine deserialises),
+        frames pile up and are then delivered at the camera rate, so the
+        delay never goes away. Restarting the pipeline empties the queue.
+        Returns True once a fresh frame has arrived.
+        """
+        cam = self.camera
+        old = cam.value
+        cam.stop()
+        cam.start()
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if cam.value is not old:
+                return True
+            time.sleep(0.02)
+        return False
+
     def stop(self):
         self.camera.stop()
+
+
+class _CSISource(object):
+    """CSI camera via GStreamer, keeping only the newest frame (no backlog)."""
+
+    def __init__(self, width, height, fps, capture_width=3280, capture_height=2464):
+        gst = ("nvarguscamerasrc sensor-mode=3 ! "
+               "video/x-raw(memory:NVMM), width=%d, height=%d, format=(string)NV12, "
+               "framerate=(fraction)%d/1 ! nvvidconv ! "
+               "video/x-raw, width=(int)%d, height=(int)%d, format=(string)BGRx ! "
+               "videoconvert ! video/x-raw, format=(string)BGR ! "
+               "appsink drop=true max-buffers=1 sync=false"
+               % (capture_width, capture_height, fps, width, height))
+        self.cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        if not self.cap.isOpened():
+            raise RuntimeError("cannot open CSI camera; is another notebook / jetbot.Camera using it?")
+
+    def read(self):
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+    def flush(self):
+        return True  # appsink drop=true max-buffers=1 never queues
+
+    def stop(self):
+        self.cap.release()
 
 
 class _OpenCVSource(object):
     def __init__(self, index, width, height):
         self.cap = cv2.VideoCapture(index)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.size = (width, height)
 
     def read(self):
@@ -59,6 +113,15 @@ class _OpenCVSource(object):
         if not ok:
             return None
         return cv2.resize(frame, self.size)
+
+    def flush(self, max_frames=30):
+        """Grab until a grab actually waits for the camera (= queue is empty)."""
+        for _ in range(max_frames):
+            t0 = time.time()
+            self.cap.grab()
+            if time.time() - t0 > 0.015:
+                break
+        return True
 
     def stop(self):
         self.cap.release()
@@ -76,6 +139,9 @@ class _FolderSource(object):
     def read(self):
         i = int((time.time() - self.t0) / self.period) % len(self.paths)
         return cv2.resize(cv2.imread(self.paths[i]), self.size)
+
+    def flush(self):
+        return True
 
     def stop(self):
         pass
@@ -97,6 +163,9 @@ class _DummySource(object):
         cv2.line(img, (cx + w // 3, h - 1), (cx + w // 12, h // 3), (255, 255, 255), 3)
         return img
 
+    def flush(self):
+        return True
+
     def stop(self):
         pass
 
@@ -105,6 +174,8 @@ def open_camera(source="jetbot", width=224, height=224, fps=21, index=0, folder=
     """Open a frame source; see module docstring."""
     if source == "jetbot":
         return _JetbotSource(width, height, fps)
+    if source == "csi":
+        return _CSISource(width, height, fps)
     if source == "opencv":
         return _OpenCVSource(index, width, height)
     if source == "folder":
