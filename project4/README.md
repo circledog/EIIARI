@@ -14,7 +14,7 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 |---|---|---|
 | `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
-| `preprocessing.py` | PC + Nano | 固定的前處理（ROI 裁切、固定 y、排除壞標籤）與標籤檢視工具 |
+| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；附預覽工具 |
 | `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
 | `model.py` | PC + Nano | 模型定義、載入 |
 | `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
@@ -41,27 +41,28 @@ Jetson Nano  Camera Input → Preprocessing（同一套）→ Model inferencing 
 
 ### `preprocessing.py`
 
-位在 data loader 和 augmentation 之間。跟 augmentation 的差別是：**每次都做一樣的處理，而且車上推論時也要做**。所以設定會存進模型的 `.json`，`live_demo.ipynb` 載入模型時會自動套用同一套前處理，再把預測點換算回完整畫面給控制使用。三個開關預設都關閉，舊模型不受影響。`train.py` 用旗標開關，和 augmentation 一樣（見下方 `train.py`）。
+位在 data loader 和 augmentation 之間，**只做一件事：把車道線標出來**。跟 augmentation 的差別是：每次都做一樣的處理，而且車上推論時也要做。所以模型有沒有開前處理會存進 `.json`，`live_demo.ipynb` 載入模型時會自動套用同一套。開關是 `train.py --lanes`，不加就不做，舊模型不受影響。
 
-| 參數 | 作用 | 建議值 |
-|---|---|---|
-| `roi_top` | 裁掉畫面上方這個比例（牆、人、椅子），剩下的拉回原尺寸，標籤跟著移動 | 0.3（最高的標籤在 0.32，不會被切到） |
-| `fixed_y` | 所有標籤的 y 改成固定高度，模型只需要學 x。現在的 y 從 72 到 212 都有，不一致 | 0.65（資料的中位數是 0.63） |
-| `exclude` | 文字檔，一行一個檔名（`#` 後面是註解），列在裡面的圖不拿來訓練 | 用下面的檢視工具找 |
+- **做法**：把看起來像白膠帶的像素塗成純紅色 (BGR 0,0,255)。模型仍然看得到原本的畫面（3 通道，ResNet 不用改），只是車道線被明確標出來。標籤不變。
+- **能處理彎道**：逐像素判斷，不是用直線去套。彎道、髮夾彎、鏡頭前面很寬的膠帶都標得出來。
+  1. 地板亮度：取畫面下半部中間 LAB 亮度的第 40 百分位。
+  2. 膠帶：比地板亮 `delta`（70）以上；或是細的亮條紋（white top-hat 21 px 大於 35，而且比地板亮 40 以上），用來抓遠處比較細、比較暗的膠帶。
+  3. 去掉牆壁、場外木地板這類「又厚又在上面」的亮區（厚度超過 31 px，而且位在畫面上方 55% 或碰到上緣）。位置低的厚亮區是鏡頭前的膠帶，所以保留。
+  4. 去掉小雜點，以及畫面上方 1/4 的小塊。
+- 參數是用 224×224 的畫面調的，其他尺寸會等比例縮放 kernel。參數存在模型 `.json`，車上用同一組。
+- **在預計訓練的 198 張上測過**：每張都有標出膠帶；沒有任何一張的標籤點（綠點）落在被標成紅色的地方；PC CPU 每張約 6 ms。Nano 上會更慢，`live_demo` 顯示的延遲已經包含前處理時間。
+- 已知的不完美：畫面最上方的人、腳、椅子偶爾有小塊被標紅；場外木地板的紋路偶爾有雜點。
+- `Preprocessor(lanes)(image, x, y)` 訓練時用；`apply_frame(frame)` 車上用。兩邊走同一段程式，餵進模型的 tensor 完全相同（已驗證差 0）。
+- 順序是先標車道線、再做 augmentation，所以顏色擾動、柏林噪聲也會套到紅線上，模型會學到紅線不一定是完全一樣的紅色。
 
-- `Preprocessor(roi_top, fixed_y, exclude)(image, x, y)`：訓練時用。
-- `apply_frame(frame)`、`to_full(xy)`：車上用。和訓練走同一段 PIL 程式，輸入完全相同（已驗證差 0）。
-- train / val 的切分在「全部 200 張」上做，排除的圖再從兩邊拿掉。所以有沒有排除壞標籤，驗證集都是同一批圖，可以直接比較。
-
-**標籤檢視工具**（PC）：
+**預覽工具**（PC）：
 
 ```bash
-python preprocessing.py review                                  # 全部 200 張畫上標籤
-python preprocessing.py review --model models/X_base.pth        # 依模型誤差排序，最差的在前面
-python preprocessing.py review --model models/X_base.pth --exclude bad_labels.txt
+python preprocessing.py review --data <資料夾>                         # 全部畫上車道線標示和標籤
+python preprocessing.py review --data <資料夾> --model models/X.pth    # 用模型的前處理，依誤差排序，最差的在前面
 ```
 
-會產生 `label_review.jpg`：綠點是標籤，紅圈是模型的預測，紅色編號表示已經在排除清單裡。終端機也會依同樣的順序列出檔名。誤差最大的幾張常常就是標錯的，確認後把檔名貼進 `bad_labels.txt` 再重新訓練。
+會產生 `label_review.jpg`：紅色是標出的車道線，綠點是標籤，青色圈是模型的預測。終端機也會依同樣的順序列出檔名。
 
 ### `augmentation.py`
 
@@ -135,25 +136,24 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
-| `--roi-top` `--fixed-y` `--exclude bad_labels.txt` | 前處理開關，全不加 = 不做前處理。不給數值時用預設值（ROI 0.3、y 0.65），也可以指定，例如 `--roi-top 0.4` |
-| `--no-preprocess` | 強制關掉所有前處理，連 `--base` 沿用的設定也關掉 |
+| `--lanes` | 前處理開關：標示車道線。不加 = 不做前處理 |
 | `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
 | `--epochs 70` `--lr 1e-3` `--batch-size 8` | baseline 訓練（預設值同課程） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
 | `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
-| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json；要關前處理加 `--no-preprocess`） |
+| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（前處理和 augmentation 設定沿用它的 .json，剪枝後的模型輸入一定和 baseline 相同） |
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
 
-產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`；有開前處理時是 `resnet18_<pre>_<aug>_...`，例如 `resnet18_roi30+fy65+ex12_gen_base.pth`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
+產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`；有開前處理時是 `resnet18_lanes_<aug>_...`，例如 `resnet18_lanes_gen_base.pth`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
 
 ### `live_demo.ipynb`
 
 | 區塊 | 內容 |
 |---|---|
 | 變因 | 模型下拉選單（augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
-| 畫面 | 即時影像、綠色預測點、上方橘色轉向條；模型有 ROI 裁切時，看不到的部分變暗，並用青色線標出 |
+| 畫面 | 模型實際看到的影像（用 `--lanes` 訓練的模型會看到紅色車道線）、綠色預測點、上方橘色轉向條 |
 | 控制參數 | speed gain、steering gain (Kp)、steering kd、steering bias（投影片 P.71 的範圍） |
 | 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
 | 即時讀數 | x、y、angle、steering、實際 speed、左右馬達（−1~1）、P / D 項、FPS、推論延遲 |
@@ -173,19 +173,15 @@ python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓
 
 看 log 裡的 val loss：如果剪枝 50% 的 finetune 後明顯比 baseline 差，DEMO 就用 30% 的版本。
 
-加上前處理的流程：
+加上前處理（標示車道線）的流程：
 
 ```bash
-# 1. 先訓練一個沒有前處理的模型，用它找出標錯的圖
-python train.py --general
-python preprocessing.py review --model models/resnet18_gen_base.pth
-#    看 label_review.jpg，把確定標錯的檔名寫進 bad_labels.txt
-
-# 2. 開前處理重新訓練，跟步驟 1 的模型比 val loss 和行駛結果
-python train.py --roi-top --fixed-y --exclude bad_labels.txt --general --prune 0.3 0.5 --onnx
+# 1. 先看車道線標得對不對
+python preprocessing.py review --data <資料夾>
+# 2. 有開、沒開各訓練一組，比 val loss 和行駛結果
+python train.py --data <資料夾> --general --prune 0.3 0.5 --onnx
+python train.py --data <資料夾> --lanes --general --prune 0.3 0.5 --onnx
 ```
-
-注意：開了 `--fixed-y` 的模型 y 是固定的，val loss 只剩 x 的誤差，數字會比較小。跟沒開的模型比較時，請以行駛結果為主。
 
 ## DEMO 前一天（Nano）：建 TensorRT engine
 

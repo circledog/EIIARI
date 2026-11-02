@@ -1,216 +1,207 @@
-"""Deterministic preprocessing, between the data loader and augmentation.
+"""Deterministic preprocessing, between the data loader and augmentation:
+mark the lane lines (white tape) on the image.
 
     Data Loader -> Preprocessing -> Data Augmentation -> Model training
 
 Unlike augmentation (random, training only), preprocessing is applied the same
-way every time -- in training *and* on the robot. Its settings are saved in
-each model's ``.json`` and ``live_demo.ipynb`` rebuilds the same
-``Preprocessor`` when it loads the model.
+way every time -- in training *and* on the robot. Whether a model was trained
+with it is saved in the model's ``.json``; ``live_demo.ipynb`` rebuilds the
+same ``Preprocessor`` when it loads the model.
 
-Three switches, all off by default (= identity, so old models are unaffected).
-In ``train.py`` they are flags like the augmentation switches: ``--roi-top`` /
-``--fixed-y`` without a value use the defaults below, ``--no-preprocess``
-turns everything off.
+What it does (``lanes=True``; ``lanes=False`` = identity, old models unaffected)
+------------------------------------------------------------------------------
+Every pixel that looks like lane tape is painted pure red, so the model gets
+the lane lines handed to it while still seeing the rest of the picture (3
+colour channels, ResNet unchanged). The labels are not touched.
 
-* ``roi_top``  (0~0.9)  Crop away the top fraction of the image (walls, people,
-                        chairs) and stretch the rest back to the original size,
-                        so the model only sees the floor. Labels move with it.
-* ``fixed_y``  (0~1)    Replace every label's y by a constant (fraction of the
-                        height). The data's y is inconsistent (72~212 px); with
-                        y fixed the model only has to learn x. 0.65 is close to the
-                        median label height of the data (0.63).
-* ``exclude``  (file)   Text file with one image file name per line (``#`` for
-                        comments); those images are dropped from training.
-                        Use ``python preprocessing.py review`` to find them.
+The detector works per pixel instead of fitting straight lines, so curves,
+hairpins and the wide tape right in front of the camera are all marked:
+
+1. ``L`` = LAB lightness. The floor level is the 40th percentile of the lower
+   middle of the image.
+2. Tape = ``L > floor + delta`` (bright tape, any width), or a thin bright
+   stripe: white top-hat (``tophat`` px) ``> th_top`` and ``L > floor +
+   delta_top`` (far, thin, slightly dimmer tape).
+3. Large bright areas high up in the image (walls, wooden floor next to the
+   track) are removed: anything thicker than ``thick`` px whose bottom is in
+   the upper 55 % or that touches the top edge. Thick areas lower down are
+   kept -- that is tape close to the camera.
+4. Small specks (< ``min_area`` px) and small blobs in the top quarter are
+   dropped.
+
+Parameters are tuned on 224x224 frames; other sizes scale the kernels. On the
+198-image training set every image gets tape marked, no label point ends up on
+marked pixels, and it takes ~6 ms per frame on a PC CPU.
 
 On the robot:
     prep = Preprocessor.from_config(model.meta.get("preprocessing"))
     frame_in = prep.apply_frame(frame)          # BGR uint8 in, BGR uint8 out
-    xy_full = prep.to_full(xy_model)            # model output -> full-frame coords
 
-Python 3.6 compatible (``apply_frame`` / ``to_full`` run on the Jetson Nano).
+Python 3.6 compatible (runs on the Jetson Nano).
 """
 import os
 
+import cv2
 import numpy as np
 import PIL.Image
 
-__all__ = ["Preprocessor", "read_exclude", "ROI_TOP_DEFAULT", "FIXED_Y_DEFAULT"]
+__all__ = ["Preprocessor", "lane_mask", "mark_lanes", "LANE_COLOR_BGR", "DEFAULT_PARAMS"]
 
-ROI_TOP_DEFAULT = 0.3    # value used by ``train.py --roi-top`` with no number
-FIXED_Y_DEFAULT = 0.65   # value used by ``train.py --fixed-y`` with no number
+LANE_COLOR_BGR = (0, 0, 255)   # pure red: does not occur on the track
+DEFAULT_PARAMS = {"delta": 70, "th_top": 35, "delta_top": 40, "tophat": 21,
+                  "thick": 31, "min_area": 40}
 
 
-def read_exclude(path):
-    """Set of file names listed in an exclude file (empty set if None)."""
-    if not path:
-        return set()
-    names = set()
-    with open(path) as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if line:
-                names.add(os.path.basename(line))
-    return names
+def _ellipse(k):
+    k = max(3, int(round(k)) | 1)   # odd, >= 3
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+
+def lane_mask(bgr, delta=70, th_top=35, delta_top=40, tophat=21, thick=31, min_area=40):
+    """uint8 mask (255 = lane tape) of a BGR uint8 image."""
+    h, w = bgr.shape[:2]
+    s = w / 224.0
+    L = cv2.cvtColor(np.ascontiguousarray(bgr), cv2.COLOR_BGR2LAB)[..., 0]
+    floor = float(np.percentile(L[h // 2:, w // 4:3 * w // 4], 40))
+
+    bright = (L > floor + delta).astype(np.uint8)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, _ellipse(3))
+    stripe = cv2.morphologyEx(L, cv2.MORPH_TOPHAT, _ellipse(tophat * s))
+    thin = ((stripe > th_top) & (L > floor + delta_top)).astype(np.uint8)
+    m = bright | thin
+
+    # thick bright areas high up = walls / floor outside the track
+    thick_m = cv2.morphologyEx(m, cv2.MORPH_OPEN, _ellipse(thick * s))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(thick_m, 8)
+    for k in range(1, n):
+        y, hh = st[k, cv2.CC_STAT_TOP], st[k, cv2.CC_STAT_HEIGHT]
+        if not (y + hh < 0.55 * h or y == 0):
+            thick_m[lab == k] = 0          # thick but low: wide tape near the camera
+    m[cv2.dilate(thick_m, _ellipse(5)) > 0] = 0
+
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    area = st[:, cv2.CC_STAT_AREA]
+    bottom = st[:, cv2.CC_STAT_TOP] + st[:, cv2.CC_STAT_HEIGHT]
+    keep = (area >= min_area * s * s) & ~((bottom < 0.25 * h) & (area < 150 * s * s))
+    keep[0] = False
+    return keep[lab].astype(np.uint8) * 255
+
+
+def mark_lanes(bgr, params=None):
+    """Copy of a BGR uint8 image with the lane tape painted ``LANE_COLOR_BGR``."""
+    out = np.array(bgr, dtype=np.uint8, copy=True)
+    out[lane_mask(out, **(params or DEFAULT_PARAMS)) > 0] = LANE_COLOR_BGR
+    return out
 
 
 class Preprocessor(object):
     """Callable ``(PIL image, x_px, y_px) -> (PIL image, x_px, y_px)``."""
 
-    def __init__(self, roi_top=0.0, fixed_y=None, exclude=None):
-        if not 0.0 <= roi_top < 0.9:
-            raise ValueError("roi_top must be in [0, 0.9)")
-        if fixed_y is not None and not 0.0 <= fixed_y <= 1.0:
-            raise ValueError("fixed_y must be in [0, 1]")
-        self.roi_top = float(roi_top)
-        self.fixed_y = None if fixed_y is None else float(fixed_y)
-        self.exclude = exclude
-        self.excluded = read_exclude(exclude)
+    def __init__(self, lanes=False, params=None):
+        self.lanes = bool(lanes)
+        self.params = dict(DEFAULT_PARAMS)
+        self.params.update(params or {})
 
     # ---- config (saved in the model .json) ------------------------------- #
     def config(self):
-        return {"roi_top": self.roi_top, "fixed_y": self.fixed_y,
-                "exclude": os.path.basename(self.exclude) if self.exclude else None,
-                "exclude_path": os.path.abspath(self.exclude) if self.exclude else None,
-                "n_excluded": len(self.excluded)}
+        return {"lanes": self.lanes, "params": dict(self.params) if self.lanes else None}
 
     @classmethod
     def from_config(cls, cfg):
-        """Rebuild from a model's ``meta['preprocessing']`` (None -> identity).
-
-        The exclude list only matters for training, so it is not reloaded.
-        """
+        """Rebuild from a model's ``meta['preprocessing']`` (None -> identity)."""
         cfg = cfg or {}
-        return cls(roi_top=cfg.get("roi_top") or 0.0, fixed_y=cfg.get("fixed_y"))
+        if cfg.get("roi_top") or cfg.get("fixed_y") is not None:
+            print("warning: this model was trained with ROI crop / fixed y, which no longer "
+                  "exist; retrain it")
+        return cls(lanes=cfg.get("lanes", False), params=cfg.get("params"))
 
     @property
     def enabled(self):
-        return self.roi_top > 0 or self.fixed_y is not None or bool(self.excluded)
+        return self.lanes
 
     def tag(self):
-        """Short name for file names, e.g. 'roi30+fy65+ex12' ('' when off)."""
-        parts = []
-        if self.roi_top > 0:
-            parts.append("roi%02d" % round(self.roi_top * 100))
-        if self.fixed_y is not None:
-            parts.append("fy%02d" % round(self.fixed_y * 100))
-        if self.excluded:
-            parts.append("ex%d" % len(self.excluded))
-        return "+".join(parts)
+        """Short name for file names ('' when off)."""
+        return "lanes" if self.lanes else ""
 
     def __repr__(self):
-        return "Preprocessor(roi_top=%s, fixed_y=%s, excluded=%d)" % (
-            self.roi_top, self.fixed_y, len(self.excluded))
-
-    # ---- dataset level ---------------------------------------------------- #
-    def keep(self, path):
-        return os.path.basename(path) not in self.excluded
+        return "Preprocessor(lanes=%s)" % self.lanes
 
     # ---- sample level (training) ----------------------------------------- #
     def __call__(self, image, x, y):
-        w, h = image.size
-        if self.fixed_y is not None:
-            y = self.fixed_y * h
-        if self.roi_top > 0:
-            image = self._crop(image)
-            top = self.roi_top * h
-            y = max(0.0, (y - top) * h / (h - top))
+        if self.lanes:
+            bgr = np.asarray(image.convert("RGB"))[..., ::-1]
+            image = PIL.Image.fromarray(np.ascontiguousarray(mark_lanes(bgr, self.params)[..., ::-1]))
         return image, x, y
-
-    def _crop(self, image):
-        w, h = image.size
-        top = self.roi_top * h
-        return image.resize((w, h), PIL.Image.BILINEAR, box=(0, top, w, h))
 
     # ---- robot side ------------------------------------------------------- #
     def apply_frame(self, frame):
-        """Same image transform for a camera frame (HxWx3 uint8, any channel order).
-
-        Uses the exact PIL code path as training so both sides match bit for bit.
-        """
-        if self.roi_top <= 0:
-            return frame
-        return np.asarray(self._crop(PIL.Image.fromarray(frame)))
-
-    def to_full(self, xy):
-        """Model output (normalised, in the cropped image) -> normalised full frame."""
-        x, y = float(xy[0]), float(xy[1])
-        if self.roi_top > 0:
-            # normalised -> fraction of crop height -> fraction of full height -> normalised
-            frac = (y + 1.0) / 2.0
-            y = (self.roi_top + frac * (1.0 - self.roi_top)) * 2.0 - 1.0
-        return np.array([x, y], dtype=np.float32)
+        """Same transform for a camera frame (HxWx3 BGR uint8)."""
+        return mark_lanes(frame, self.params) if self.lanes else frame
 
 
 # --------------------------------------------------------------------------- #
-# Label review tool (PC)
+# Preview / review tool (PC)
 # --------------------------------------------------------------------------- #
 def _review(args):
-    """Contact sheet of every image with its label (and the model's prediction).
+    """Contact sheet of every image with the lane marking and its label.
 
-    With --model the sheet is sorted by error, worst first -- mislabelled
-    images usually show up at the top. Copy their file names into an exclude
-    file and retrain with ``--exclude``.
+    With --model the model's own preprocessing is used and the sheet is sorted
+    by the model's error, worst first.
     """
     import glob
-    import cv2
     from data_loader import DEFAULT_DATA_DIR, parse_xy
 
     paths = sorted(glob.glob(os.path.join(args.data or DEFAULT_DATA_DIR, "xy_*.jpg")))
-    excluded = read_exclude(args.exclude)
-    rows = []
-    model = prep = None
+    model = None
+    prep = Preprocessor(lanes=not args.no_lanes)
     if args.model:
-        import torch
         import camera as cam_mod
         from model import load_model
         model = load_model(args.model, "cpu")
         prep = Preprocessor.from_config(model.meta.get("preprocessing"))
+    rows = []
     for p in paths:
         img = cv2.imread(p)
         h, w = img.shape[:2]
         x, y = parse_xy(p)
+        shown = prep.apply_frame(img)
         err, pred = 0.0, None
         if model is not None:
-            out = model(cam_mod.preprocess(prep.apply_frame(img), "cpu", model.dtype))
-            pred = prep.to_full(out.float().numpy().flatten())
-            px, py = (pred[0] + 1) * w / 2.0, (pred[1] + 1) * h / 2.0
-            err = abs(px - x) if prep.fixed_y is not None else float(np.hypot(px - x, py - y))
+            out = model(cam_mod.preprocess(shown, "cpu", model.dtype)).float().numpy().flatten()
+            px, py = (out[0] + 1) * w / 2.0, (out[1] + 1) * h / 2.0
+            err = float(np.hypot(px - x, py - y))
             pred = (int(px), int(py))
-        rows.append((err, p, img, (int(x), int(y)), pred))
+        rows.append((err, p, shown, (int(min(x, w - 1)), int(min(y, h - 1))), pred))
     if model is not None:
         rows.sort(key=lambda r: -r[0])
 
     tiles = []
     for i, (err, p, img, lab, pred) in enumerate(rows):
         t = img.copy()
-        cv2.line(t, (t.shape[1] // 2, t.shape[0] - 1), lab, (0, 255, 0), 2)
         cv2.circle(t, lab, 5, (0, 255, 0), -1)
         if pred is not None:
-            cv2.circle(t, pred, 5, (0, 0, 255), 2)
-        color = (0, 0, 255) if os.path.basename(p) in excluded else (255, 255, 255)
-        cv2.putText(t, "#%d" % i, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.circle(t, pred, 5, (255, 255, 0), 2)
+        cv2.putText(t, "#%d" % i, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         if model is not None:
-            cv2.putText(t, "%.0fpx" % err, (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            cv2.putText(t, "%.0fpx" % err, (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         tiles.append(cv2.resize(t, (args.tile, args.tile)))
-        print("#%-4d %6.1f  %s%s" % (i, err, os.path.basename(p),
-                                       "  (excluded)" if os.path.basename(p) in excluded else ""))
+        print("#%-4d %6.1f  %s" % (i, err, os.path.basename(p)))
     cols = args.cols
     while len(tiles) % cols:
         tiles.append(np.zeros_like(tiles[0]))
     sheet = np.vstack([np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)])
     cv2.imwrite(args.out, sheet)
-    print("wrote %s  (green = label, red circle = prediction, red number = excluded)" % args.out)
+    print("wrote %s  (red = marked lane, green = label, cyan circle = prediction)" % args.out)
 
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Preprocessing tools")
     sub = ap.add_subparsers(dest="cmd")
-    r = sub.add_parser("review", help="contact sheet of labels (sorted by error with --model)")
+    r = sub.add_parser("review", help="contact sheet: lane marking + labels (sorted by error with --model)")
     r.add_argument("--data", default=None)
-    r.add_argument("--model", default=None, help="a .pth from train.py: sort by its error")
-    r.add_argument("--exclude", default=None, help="mark images already in this exclude file")
+    r.add_argument("--model", default=None, help="a .pth from train.py: its preprocessing, sorted by error")
+    r.add_argument("--no-lanes", action="store_true", help="show the images without lane marking")
     r.add_argument("--out", default="label_review.jpg")
     r.add_argument("--cols", type=int, default=10)
     r.add_argument("--tile", type=int, default=160)

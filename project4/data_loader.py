@@ -1,7 +1,7 @@
 """Dataset / DataLoader for the road-following (x, y) data.
 
 Per-sample pipeline:
-    load jpg + label  ->  Preprocessor (deterministic, also used on the robot)
+    load jpg + label  ->  Preprocessor (lane marking, also used on the robot)
                       ->  Augmenter (random, training split only)  ->  tensor
 
 File name convention (from the data-collection notebook):
@@ -61,13 +61,11 @@ class XYDataset(torch.utils.data.Dataset):
     directory : str
         Folder with ``xy_*.jpg``. Defaults to ``DEFAULT_DATA_DIR``.
     preprocessor : Preprocessor or None
-        Deterministic transform applied first (ROI crop, fixed y); images in
-        its exclude list are dropped. None -> no preprocessing.
+        Deterministic transform applied first (lane marking). None -> none.
     augmenter : Augmenter or None
         Applied to (image, x, y) after preprocessing. None -> no augmentation.
     indices : list[int] or None
-        Use only these files (indices into the sorted list of *all* files, so
-        the split does not change when the exclude list does).
+        Use only these files (indices into the sorted list of all files).
     """
 
     def __init__(self, directory=None, augmenter=None, indices=None, preprocessor=None):
@@ -78,8 +76,6 @@ class XYDataset(torch.utils.data.Dataset):
         self.all_paths = paths
         chosen = paths if indices is None else [paths[i] for i in indices]
         self.preprocessor = preprocessor
-        if preprocessor is not None:
-            chosen = [p for p in chosen if preprocessor.keep(p)]
         self.image_paths = chosen
         self.augmenter = augmenter
 
@@ -87,7 +83,7 @@ class XYDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
 
     def load(self, idx):
-        """Raw sample: (PIL image, x_px, y_px) after augmentation, before tensor."""
+        """Raw sample: (PIL image, x_px, y_px) after preprocessing + augmentation, before tensor."""
         path = self.image_paths[idx]
         image = PIL.Image.open(path).convert("RGB")
         x, y = parse_xy(path)
