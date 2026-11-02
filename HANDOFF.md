@@ -306,6 +306,35 @@ python train.py --split session --general ...                           # 需要
 - 順手修正：`compression.wrap_trt_engine` 的 docstring 原本寫 `model.load_model`，改成 `loader.load_model`。
 - vermin 對 `train.py` 回報「`compression` 需要 3.14」，這是誤判：Python 3.14 新增了標準庫 `compression`，和本專案的 `compression.py` 同名。腳本所在的資料夾優先，所以實際 import 的是專案的版本；註解前就是這樣。
 
+## 第十三階段（照隊友切好的 train / validation / test 資料夾訓練，2026-11-02）
+
+使用者給了隊友切好的資料 `splits.rar`，內容是 `train/` 277 張、`validation/` 60 張、`test/` 61 張，合計 398 張：原本的 200 張加上新拍的 200 張，比例約 70/15/15。使用者確認的決定：
+- 偵測到子資料夾就**自動**照資料夾用，不另外加旗標。
+- `test` 只在最後評一次，寫進 `.json`。
+- 壞檔跳過並警告。壓縮檔裡有 17 張解不開（train 14、validation 3），看起來是上傳不完整，解出來都是 0 byte。
+
+改動：
+- `data_loader.py`
+  - 新增 `has_split_folders(dir)`：判斷是否同時有 `train/` 和 `validation/`。
+  - `make_loaders` 改成回傳 `(train, val, test, augmenter)`。有子資料夾時照資料夾用（`split_info = {"split": "folders", 各資料夾張數, "skipped_unreadable"}`）；只有單一資料夾時和以前一樣用 random 或 session 切，test 是 `None`。
+  - `XYDataset` 先完整解碼每張圖，讀不了的跳過，每個檔案只警告一次（`n_skipped`）。
+- `train.py`
+  - 新增 `report_test()`：base 和每個剪枝模型在 finetune 完、存檔前各評一次 test loss，印出來並寫進 `.json` 的 `test_loss`（沒有 test 時是 `null`）。用 `--base` 時也會印出 baseline 的 test loss。
+  - 新增 `n_test`。有子資料夾又指定了 `--split` 或 `--val-ratio` 時，會印出提示說這兩個旗標被忽略。
+- `live_demo.ipynb`：模型資訊列多顯示 `test loss`。
+- README 已更新。
+
+注意：新拍的那批是連拍，有 14 組相鄰的連續畫面（前後不到 2 秒）被分到不同資料夾，val 和 test 會稍微偏樂觀。使用者同意照隊友的分法用，不重切。
+
+已測（sandbox，CPU）：
+- `train.py --data splits --arch mobilenet_v2 --epochs 1 --prune 0.3 --finetune-epochs 1 --no-pretrained --workers 0`
+  - 結果：263 train / 57 val / 61 test，跳過 17 張壞檔，有印出警告。
+  - base 和 pruned30 都有印出 test loss，`.json` 裡有 `split`、`n_test`、`test_loss`。✅
+- 指定 `--val-ratio 0.2` 時會印出被忽略的提示。✅
+- 舊的單一資料夾：照常隨機切，`n_test` 是 0。✅
+- 註解規則檢查（data_loader、train、live_demo）：0 個問題。✅
+- sandbox 的共享記憶體太小，batch 32 加上多個 worker 會出現 `No space left on device (shm)`；這是 sandbox 的限制，PC 不受影響，改用 `--workers 0` 測。
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
@@ -349,7 +378,7 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 ## 下一步
 
 1. 補拍彎道、髮夾彎、偏離回正的畫面（收集工具不在這個分支）；有 `metadata/` 的話一起搬到 PC。
-2. PC 上用新的 198 張資料（`--data`）訓練，比較各種 augmentation 的結果（val loss 和實際行駛）。
+2. 補齊那 17 張壞檔（請隊友重傳），解壓到 `project4/data/splits/`；PC 上用 `--data data/splits` 訓練，用 **test loss** 和實際行駛比較各種 augmentation 和模型。
 3. 板子上跑 trtexec → wrap → live_demo，驗證 TRT 載入（風險最高）；驗證換模型的 flush。
 4. 調 PD 參數；髮夾彎再試轉彎減速／內側輪反轉。
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（PC CPU 上差異不大，要看 GPU／TensorRT）。

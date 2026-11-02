@@ -7,6 +7,13 @@ Per-sample pipeline:
 Lane marking comes after augmentation so that Perlin / compression noise
 affects the detection exactly as the "input disturbance" does on the robot.
 
+Folder layouts (``make_loaders`` picks automatically):
+    <dir>/xy_*.jpg                       one folder, split here (random / session)
+    <dir>/train/  <dir>/validation/  [<dir>/test/]
+                                         already split by the team: used as is
+
+Empty or broken image files are skipped with a warning.
+
 File name convention (from the data-collection notebook):
     xy_<x>_<y>_<uuid>.jpg      x, y = pixel coordinates in that image
 
@@ -34,7 +41,7 @@ from preprocessing import mark_lanes_pil
 
 # Public names of this module
 __all__ = ["DEFAULT_DATA_DIR", "XYDataset", "parse_xy", "image_to_tensor",
-           "split_indices", "split_by_session", "default_metadata_dir", "make_loaders",
+           "has_split_folders", "split_indices", "split_by_session", "default_metadata_dir", "make_loaders",
            "IMAGENET_MEAN", "IMAGENET_STD"]
 
 # Folder this file lives in (project4/)
@@ -48,6 +55,11 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 # Network input size (height, width)
 INPUT_SIZE = (224, 224)
+# Sub-folder names of a dataset that is already split
+SPLIT_FOLDERS = ("train", "validation", "test")
+
+# Broken files already reported, so each warning is printed only once
+_warned = set()
 
 
 # Read the pixel label stored in a file name
@@ -57,6 +69,33 @@ def parse_xy(path):
     parts = os.path.basename(path).split("_")
     # x and y as floats
     return float(int(parts[1])), float(int(parts[2]))
+
+
+# Drop image files that cannot be decoded (empty or truncated)
+def _readable(paths):
+    """The paths whose images decode completely; the others are reported once."""
+    # Paths that passed the check
+    good = []
+    # Check every file
+    for p in paths:
+        # Try a full decode, not just the header, so truncated files are caught
+        try:
+            # Open the file and close it again after decoding
+            with PIL.Image.open(p) as im:
+                # Decode every pixel
+                im.load()
+            # Decoded fine
+            good.append(p)
+        # Any decoding error means the file is unusable
+        except Exception as e:
+            # Report each broken file only once per process
+            if p not in _warned:
+                # Remember that it was reported
+                _warned.add(p)
+                # Warn with the reason
+                print("warning: skipping unreadable image %s (%s)" % (p, e))
+    # Usable files in the original order
+    return good
 
 
 # Convert an image into the network input tensor, exactly as the course does
@@ -91,11 +130,15 @@ class XYDataset(torch.utils.data.Dataset):
         # Folder with the images
         self.directory = directory or DEFAULT_DATA_DIR
         # All labelled images in a stable order
-        paths = sorted(glob.glob(os.path.join(self.directory, "xy_*.jpg")))
+        found = sorted(glob.glob(os.path.join(self.directory, "xy_*.jpg")))
+        # Only the files that can actually be decoded
+        paths = _readable(found)
+        # Number of files dropped as unreadable
+        self.n_skipped = len(found) - len(paths)
         # An empty folder is almost certainly a wrong path
         if not paths:
             # Report the folder that was searched
-            raise FileNotFoundError("no xy_*.jpg found in %s" % self.directory)
+            raise FileNotFoundError("no readable xy_*.jpg found in %s" % self.directory)
         # Every image in the folder (used for splitting)
         self.all_paths = paths
         # Only the images of this split, or all of them
@@ -138,6 +181,13 @@ class XYDataset(torch.utils.data.Dataset):
         yn = (y - h / 2.0) / (h / 2.0)
         # Network input tensor and target tensor
         return image_to_tensor(image), torch.tensor([xn, yn], dtype=torch.float32)
+
+
+# Whether a dataset folder is already split into sub-folders
+def has_split_folders(directory):
+    """True if ``directory`` holds ``train/`` and ``validation/`` sub-folders."""
+    # Both required sub-folders must exist (test/ is optional)
+    return all(os.path.isdir(os.path.join(directory, d)) for d in SPLIT_FOLDERS[:2])
 
 
 # Random train / validation split that is the same every run
@@ -296,21 +346,25 @@ def split_by_session(paths, metadata_dir, val_ratio=0.1, seed=0, segment_gap=60.
     return sorted(train), sorted(val), info
 
 
-# Build the training and validation DataLoaders
+# Build the training, validation and test DataLoaders
 def make_loaders(directory=None, general=False, perlin=False, compression=False,
                  val_ratio=0.1, batch_size=8, num_workers=4, seed=0, augmenter=None,
                  split="random", metadata_dir=None, segment_gap=60.0):
-    """Train/val DataLoaders.
+    """Train/val/test DataLoaders.
 
-    Augmentation is applied to the training split only; lane marking to both.
+    Augmentation is applied to the training split only; lane marking to all.
     Pass the three augmentation switches, or a pre-configured ``augmenter``
     (overrides them).
 
-    ``split='random'`` (default) splits images at random; ``split='session'``
-    keeps shooting segments together (needs the collection ``metadata`` folder,
-    default ``default_metadata_dir(directory)``).
+    If ``directory`` has ``train/`` and ``validation/`` sub-folders (and
+    optionally ``test/``) they are used as they are and ``split`` /
+    ``val_ratio`` are ignored. Otherwise the single folder is split here:
+    ``split='random'`` (default) at random, ``split='session'`` keeping
+    shooting segments together (needs the collection ``metadata`` folder,
+    default ``default_metadata_dir(directory)``); there is no test split then.
 
-    Returns (train_loader, val_loader, augmenter); the split details are in
+    Returns (train_loader, val_loader, test_loader, augmenter); test_loader is
+    None without a ``test/`` folder. The split details are in
     ``train_loader.split_info``.
     """
     # Fall back to the default dataset
@@ -319,34 +373,59 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
     if augmenter is None:
         # Augmenter with the requested groups
         augmenter = Augmenter(general=general, perlin=perlin, compression=compression)
-    # Every image in the folder
-    all_paths = XYDataset(directory).all_paths
-    # Number of images
-    n = len(all_paths)
-    # Split by shooting segment
-    if split == "session":
-        # Metadata folder next to the data unless given
-        metadata_dir = metadata_dir or default_metadata_dir(directory)
-        # Session split is impossible without metadata
-        if not os.path.isdir(metadata_dir):
-            # Report the missing folder
-            raise FileNotFoundError("split='session' needs the metadata folder: %s" % metadata_dir)
-        # Segment-based split
-        train_idx, val_idx, split_info = split_by_session(all_paths, metadata_dir, val_ratio, seed, segment_gap)
-    # Split images at random
-    elif split == "random":
-        # Seeded random split
-        train_idx, val_idx = split_indices(n, val_ratio, seed)
-        # Description of the split
-        split_info = {"split": "random"}
-    # Anything else is a typo
+    # No test split unless a test/ folder exists
+    test_ds = None
+    # Dataset already split into sub-folders by the team
+    if has_split_folders(directory):
+        # Training folder, with augmentation
+        train_ds = XYDataset(os.path.join(directory, "train"), augmenter=augmenter)
+        # Validation folder, never augmented
+        val_ds = XYDataset(os.path.join(directory, "validation"), augmenter=None)
+        # Test folder, if present
+        test_dir = os.path.join(directory, "test")
+        # Load it only when it exists
+        if os.path.isdir(test_dir):
+            # Test folder, never augmented
+            test_ds = XYDataset(test_dir, augmenter=None)
+        # Every dataset that was loaded
+        parts = [d for d in (train_ds, val_ds, test_ds) if d is not None]
+        # Description of the split, saved in the model's .json
+        split_info = {"split": "folders", "train": len(train_ds), "validation": len(val_ds),
+                      "test": len(test_ds) if test_ds is not None else 0,
+                      "skipped_unreadable": sum(d.n_skipped for d in parts)}
+    # Single folder: split it here
     else:
-        # Report the valid choices
-        raise ValueError("split must be 'random' or 'session'")
-    # Training split, with augmentation
-    train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx)
-    # Validation split, never augmented
-    val_ds = XYDataset(directory, augmenter=None, indices=val_idx)
+        # Every readable image in the folder
+        full = XYDataset(directory)
+        # Number of images
+        n = len(full.all_paths)
+        # Split by shooting segment
+        if split == "session":
+            # Metadata folder next to the data unless given
+            metadata_dir = metadata_dir or default_metadata_dir(directory)
+            # Session split is impossible without metadata
+            if not os.path.isdir(metadata_dir):
+                # Report the missing folder
+                raise FileNotFoundError("split='session' needs the metadata folder: %s" % metadata_dir)
+            # Segment-based split
+            train_idx, val_idx, split_info = split_by_session(full.all_paths, metadata_dir, val_ratio, seed,
+                                                              segment_gap)
+        # Split images at random
+        elif split == "random":
+            # Seeded random split
+            train_idx, val_idx = split_indices(n, val_ratio, seed)
+            # Description of the split
+            split_info = {"split": "random"}
+        # Anything else is a typo
+        else:
+            # Report the valid choices
+            raise ValueError("split must be 'random' or 'session'")
+        # Record how many broken files were left out
+        split_info["skipped_unreadable"] = full.n_skipped
+        # Training split, with augmentation
+        train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx)
+        # Validation split, never augmented
+        val_ds = XYDataset(directory, augmenter=None, indices=val_idx)
     # Seeded generator so the shuffling order is reproducible
     g = torch.Generator()
     # Seed it
@@ -357,7 +436,10 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
     # Validation batches in a fixed order
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    # Test batches in a fixed order, if there is a test split
+    test_loader = None if test_ds is None else torch.utils.data.DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     # Attach the split description for train.py to save
     train_loader.split_info = split_info
-    # Both loaders and the augmenter that was used
-    return train_loader, val_loader, augmenter
+    # The loaders and the augmenter that was used
+    return train_loader, val_loader, test_loader, augmenter

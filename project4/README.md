@@ -36,10 +36,13 @@ Jetson Nano  Camera Input →（輸入干擾）→ Preprocessing（同一個函�
 
 - `XYDataset(directory=None, augmenter=None)`：讀取 `xy_<x>_<y>_<uuid>.jpg`，從檔名取出像素座標，再正規化到 [-1, 1]。
   - `directory` 預設是 `data/dataset_xy_2026-10-21/dataset_xy`。
-- `make_loaders(directory, general, perlin, compression, ..., split='random')`：回傳 train / val 的 DataLoader。
-  - `split='random'`：用固定 seed 隨機切 9:1。
-  - `split='session'`：讀資料集旁邊的 `metadata/`（每張圖一個同名 JSON，含 `session_id`、`captured_at`），**照拍攝段落切**。同一個 `session_id`（一次收集）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
-  - **只有訓練集做 augmentation**，驗證集一律用原圖。
+- `make_loaders(directory, general, perlin, compression, ..., split='random')`：回傳 `(train, val, test, augmenter)`。
+  - **資料夾已經分好時**（`directory` 底下有 `train/`、`validation/`，`test/` 可有可無）：直接照資料夾用，`split` 和 `val_ratio` 不起作用。`validation` 用來挑最好的 epoch；`test` 訓練中完全不看，只在每個模型存檔前評一次。沒有 `test/` 時 test 是 `None`。
+  - 只有一個資料夾時照下面兩種方式切，沒有 test：
+    - `split='random'`：用固定 seed 隨機切 9:1。
+    - `split='session'`：讀資料集旁邊的 `metadata/`（每張圖一個同名 JSON，含 `session_id`、`captured_at`），**照拍攝段落切**。同一個 `session_id`（一次收集）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
+  - **只有訓練集做 augmentation**，驗證集和測試集一律用原圖（都會標車道線）。
+  - 讀不了的圖（空檔、檔案不完整）會跳過，並印出 `warning: skipping unreadable image ...`；跳過的張數記在模型 `.json` 的 `split.skipped_unreadable`。
 - 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
 - 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
 
@@ -193,6 +196,8 @@ python train.py --arch mobilenet_v2 --general --perlin --prune 0.3 0.5 --onnx
 ```
 
 資料不在預設的 `data/dataset_xy_2026-10-21/dataset_xy` 時，每行加上 `--data <資料夾>`。
+
+用隊友分好的資料（`data/splits/{train,validation,test}/`）時，每行加上 `--data data/splits`。每個模型存檔前會印出 `test loss`，並寫進 `.json` 的 `test_loss`；`live_demo` 的模型資訊列也會顯示。比較不同模型時請看 test loss，因為 val loss 已經被用來挑 epoch，會偏樂觀。
 
 看 log 裡的 val loss：如果剪枝 50% 的 finetune 後明顯比 baseline 差，DEMO 就用 30% 的版本。
 

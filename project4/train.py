@@ -15,6 +15,10 @@ Examples
     # the same with MobileNetV2
     python train.py --arch mobilenet_v2 --general --perlin --prune 0.3 0.5 --onnx
 
+    # use the team's fixed split: data/splits/{train,validation,test}/
+    # (validation picks the best epoch, test is scored once per saved model)
+    python train.py --data data/splits --general --perlin --prune 0.3
+
     # prune an existing baseline without retraining it
     # (augmentation switches and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
@@ -38,7 +42,7 @@ import torch.nn.functional as F
 # Pruning, size counting and ONNX export
 from compression import count_macs_params, export_onnx, prune_model
 # Dataset folder default and DataLoader construction (incl. lane marking)
-from data_loader import DEFAULT_DATA_DIR, make_loaders
+from data_loader import DEFAULT_DATA_DIR, has_split_folders, make_loaders
 # Network registry, building, rebuilding from weights and .json handling
 from loader import ARCHS, build_model, detect_arch, read_meta, rebuild_from_state_dict, write_meta
 # Description of the lane-marking preprocessing, saved in every .json
@@ -137,12 +141,29 @@ def save(model, path, meta, onnx):
     print("saved %s" % path)
 
 
+# Loss on the held-out test split, evaluated once per finished model
+def report_test(model, test_loader, device, tag):
+    """Test loss of the final (best-validation) weights, or None without a test split."""
+    # Nothing to evaluate without a test/ folder
+    if test_loader is None:
+        # Stored as null in the .json
+        return None
+    # Average loss over the test images
+    loss = evaluate(model, test_loader, device)
+    # Show it next to the training log
+    print("[%s] test loss %.5f  (%d images, never used for training or model selection)"
+          % (tag, loss, len(test_loader.dataset)))
+    # Value for the .json
+    return loss
+
+
 # Command-line training pipeline
 def main():
     # Parser that shows the module docstring as help text
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     # Dataset folder
-    ap.add_argument("--data", default=DEFAULT_DATA_DIR, help="folder with xy_*.jpg")
+    ap.add_argument("--data", default=DEFAULT_DATA_DIR,
+                    help="folder with xy_*.jpg, or with train/ validation/ [test/] sub-folders (used as is)")
     # Network to train
     ap.add_argument("--arch", choices=sorted(ARCHS), default="resnet18",
                     help="network (ignored with --base: taken from the baseline)")
@@ -226,8 +247,12 @@ def main():
             # Strip the "_base" suffix
             args.name = stem[:-len("_base")]
 
-    # Training / validation loaders (lane marking happens inside)
-    train_loader, val_loader, aug = make_loaders(
+    # The team's sub-folders decide the split; --split / --val-ratio do not apply
+    if has_split_folders(args.data) and (args.split != "random" or args.val_ratio != 0.1):
+        # Tell the user their split options are ignored
+        print("note: %s has train/validation sub-folders: --split / --val-ratio are ignored" % args.data)
+    # Training / validation / test loaders (lane marking happens inside)
+    train_loader, val_loader, test_loader, aug = make_loaders(
         args.data, general=args.general, perlin=args.perlin, compression=args.compression,
         val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.seed,
         split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap)
@@ -243,12 +268,13 @@ def main():
                          "compression": aug.compression, "tag": aug.tag()},
         "data": os.path.abspath(args.data),
         "n_train": len(train_loader.dataset), "n_val": len(val_loader.dataset),
+        "n_test": len(test_loader.dataset) if test_loader is not None else 0,
         "val_ratio": args.val_ratio, "seed": args.seed, "batch_size": args.batch_size,
         "split": train_loader.split_info,
     }
     # Summary of the setup
-    print("data: %d train / %d val, %s, %r, lane marking on, device %s"
-          % (common["n_train"], common["n_val"], arch.LABEL, aug, device))
+    print("data: %d train / %d val / %d test, %s, %r, lane marking on, device %s"
+          % (common["n_train"], common["n_val"], common["n_test"], arch.LABEL, aug, device))
     # How the data was split
     print("split: %s" % train_loader.split_info)
 
@@ -263,6 +289,8 @@ def main():
         base_path = args.base
         # Show its validation loss on the current split
         print("loaded baseline %s (val %.5f)" % (args.base, evaluate(model, val_loader, device)))
+        # Also show its test loss when there is a test split
+        report_test(model, test_loader, device, "base")
     # Train a new baseline
     else:
         # Fresh network (ImageNet weights unless --no-pretrained)
@@ -274,7 +302,8 @@ def main():
         # Metadata of the baseline
         base_meta = dict(common, label="%s | %s | no compression" % (arch.LABEL, _variant_label(aug)),
                          compression=None, epochs=args.epochs, lr=args.lr,
-                         best_val_loss=best, macs=macs, params=params, history=history)
+                         best_val_loss=best, test_loss=report_test(model, test_loader, device, "base"),
+                         macs=macs, params=params, history=history)
         # File of the baseline
         base_path = os.path.join(args.out, name + "_base.pth")
         # Save it
@@ -303,7 +332,8 @@ def main():
                     compression=dict(info, method="DepGraph", importance="GroupMagnitude(p=2)"),
                     base=os.path.basename(base_path), base_val_loss=base_meta.get("best_val_loss"),
                     val_loss_before_finetune=before, epochs=args.finetune_epochs, lr=args.finetune_lr,
-                    best_val_loss=best, macs=info["macs_after"], params=info["params_after"],
+                    best_val_loss=best, test_loss=report_test(pruned, test_loader, device, tag),
+                    macs=info["macs_after"], params=info["params_after"],
                     history=history)
         # Save it
         save(pruned, os.path.join(args.out, "%s_%s.pth" % (name, tag)), meta, args.onnx)
