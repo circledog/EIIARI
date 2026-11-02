@@ -27,7 +27,9 @@ def _resnet18(pretrained):
     try:
         weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         return torchvision.models.resnet18(weights=weights)
-    except AttributeError:
+    except (AttributeError, TypeError):
+        # torchvision < 0.13 (Nano): no ResNet18_Weights (AttributeError) when
+        # pretrained=True, or resnet18() rejects weights=None (TypeError) when False.
         return torchvision.models.resnet18(pretrained=pretrained)
 
 

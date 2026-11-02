@@ -82,6 +82,17 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 - live_demo：切換模型時自動取消「允許移動」，避免新模型一載入完車子就自己開走。nbclient 測過：切換前左馬達 0.546 → 切換後 0 / 0、`allow_move=False` ✅
 - notebook 由 scratchpad 裡的 `make_nb.py` 產生（沒有進 repo）；之後改 notebook 可以直接在 Jupyter 裡改。
 
+## 第三階段（板子實測回報的修正，2026-11-02）
+
+使用者在 Nano 上實測時遇到的問題與修正：
+
+- `TypeError: unexpected keyword argument 'weights'`：Nano 上是舊版 torchvision（< 0.13），`_resnet18(False)` 呼叫 `resnet18(weights=None)` 時丟出 `TypeError`，原本只接 `AttributeError`。已改成 `except (AttributeError, TypeError)`。`_trt_input_dtype` 不動。
+  - 已測：模擬舊版的兩種失敗情況（拒絕 `weights=`、沒有 `ResNet18_Weights`），都能退回用 `pretrained=` ✅
+- 畫面沒更新：真正原因是上面的 `TypeError` 讓推論迴圈在載入模型時就結束了。現在迴圈出錯時，會把錯誤和完整 traceback 顯示在模型選單下方，並把 `state['model']` 清空，修好後可以直接重按開始。
+- Run All 會跑到「6. 結束」並關掉相機：改成按鈕（照使用者提供的程式碼），另外加上 `state['closed']`，按過結束之後再按開始會提示要 Restart Kernel。
+- `camera.py` 維持原版（沒有 `start()`）。板子上曾經加過、後來又還原的 `start()` 和 preview 執行緒都不是原因，repo 裡沒有加。
+- 已測（nbclient，模擬 Run All，連結束按鈕的 cell 一起執行）：相機沒被關掉、推論正常；選壞掉的模型時紅字和 traceback 有顯示；換回正常模型後可以重新開始；按結束後再按開始會被拒絕 ✅
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
