@@ -3,9 +3,9 @@
 JetBot 道路跟隨：模型從相機畫面預測「要前往的目標點 (x, y)」，再用 PD + bias 控制左右輪。
 
 ```
-PC / Colab   Preprocessing → Data Loader → Data Augmentation → Model training → Model compression (DepGraph)
-             │ 原圖資料夾 → <資料夾>_lanes/（標好車道線的 PNG，留在硬碟）              │ .pth / .onnx
-Jetson Nano  Camera Input → Preprocessing（同一個函式）→ Model inferencing (PyTorch / TensorRT) → Motor controlling (PD + bias)
+PC / Colab   Data Loader → Data Augmentation → Preprocessing（即時標車道線）→ Model training → Model compression (DepGraph)
+                                                                                                   │ .pth / .onnx
+Jetson Nano  Camera Input →（輸入干擾）→ Preprocessing（同一個函式）→ Model inferencing (PyTorch / TensorRT) → Motor controlling (PD + bias)
 ```
 
 ## 檔案一覽
@@ -14,9 +14,11 @@ Jetson Nano  Camera Input → Preprocessing（同一個函式）→ Model infere
 |---|---|---|
 | `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
-| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；固定開啟，輸出存在 `<資料夾>_lanes/` |
+| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；固定開啟，即時做、不存檔 |
 | `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
-| `model.py` | PC + Nano | 模型定義、載入 |
+| `resnet18.py` | PC + Nano | ResNet-18 網路定義 |
+| `mobilenet_v2.py` | PC + Nano | MobileNetV2 網路定義（比較用的 other model） |
+| `loader.py` | PC + Nano | 兩種網路共用：建立、剪枝後重建、載入（PyTorch / TensorRT）、`.json` |
 | `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
 | `camera.py` | Nano | 相機輸入與前處理 |
 | `control.py` | Nano | PD + bias 差速控制 |
@@ -43,25 +45,20 @@ Jetson Nano  Camera Input → Preprocessing（同一個函式）→ Model infere
 
 **只做一件事：把車道線標出來**，而且**固定開啟、沒有開關**。
 
-- `preprocess_dataset(src_dir)`：`train.py` 一開始就會呼叫。把 `src_dir` 裡每張 `xy_*.jpg` 標好車道線，存成同名的 `xy_*.png`，放在旁邊的 **`<src_dir>_lanes/`**，例如 `data/new/dataset_xy` → `data/new/dataset_xy_lanes`。訓練讀的是這個資料夾。
-  - 檔案會留在硬碟上，可以直接打開檢查。資料夾裡另有 `preprocessing.json`，記錄參數、來源和張數。
-  - 用 PNG 是因為無損，訓練看到的像素和車上即時標出來的完全相同。
-  - 再跑一次只處理新增的圖；原圖刪掉的會跟著刪；參數改了會全部重做。
-  - 想換輸出位置：`train.py --preprocessed <資料夾>`。
-- `apply_frame(frame)`：車上用。`live_demo.ipynb` 對每一幀都會呼叫。
-- 只想產生資料夾、不訓練：`python preprocessing.py run --data <資料夾>`。
+- **即時做、不存檔**：訓練時在 DataLoader 裡對每張圖做（`mark_lanes_pil`），車上 `live_demo.ipynb` 對每一幀做（`apply_frame`）。
+- **順序在 augmentation 之後**：訓練是「讀圖 → augmentation → 標車道線」，車上是「相機 → 輸入干擾（柏林噪聲／壓縮失真）→ 標車道線」。噪聲對偵測的影響兩邊相同，DEMO 切換「輸入干擾」時，模型遇到的情況和訓練時一致。驗證集一樣會標車道線，只是不做 augmentation。
 
-- **做法**：把看起來像白膠帶的像素塗成純紅色 (BGR 0,0,255)。模型仍然看得到原本的畫面（3 通道，ResNet 不用改），只是車道線被明確標出來。標籤不變。
+- **做法**：把看起來像白膠帶的像素塗成純紅色 (BGR 0,0,255)。模型仍然看得到原本的畫面（3 通道，網路不用改），只是車道線被明確標出來。標籤不變。
 - **能處理彎道**：逐像素判斷，不是用直線去套。彎道、髮夾彎、鏡頭前面很寬的膠帶都標得出來。
   1. 地板亮度：取畫面下半部中間 LAB 亮度的第 40 百分位。
   2. 膠帶：比地板亮 `delta`（70）以上；或是細的亮條紋（white top-hat 21 px 大於 35，而且比地板亮 40 以上），用來抓遠處比較細、比較暗的膠帶。
   3. 去掉牆壁、場外木地板這類「又厚又在上面」的亮區（厚度超過 31 px，而且位在畫面上方 55% 或碰到上緣）。位置低的厚亮區是鏡頭前的膠帶，所以保留。
   4. 去掉小雜點，以及畫面上方 1/4 的小塊。
-- 參數是用 224×224 的畫面調的，其他尺寸會等比例縮放 kernel。參數存在模型 `.json`，車上用同一組。
+- 參數是用 224×224 的畫面調的，其他尺寸會等比例縮放 kernel。參數寫在程式裡，訓練和車上用同一組，也會記進模型 `.json` 備查。
 - **在預計訓練的 198 張上測過**：每張都有標出膠帶；沒有任何一張的標籤點（綠點）落在被標成紅色的地方；PC CPU 每張約 6 ms。Nano 上會更慢，`live_demo` 顯示的延遲已經包含前處理時間。
 - 已知的不完美：畫面最上方的人、腳、椅子偶爾有小塊被標紅；場外木地板的紋路偶爾有雜點。
-- 訓練（讀 `_lanes/` 的 PNG）和車上（`apply_frame` 即時標）餵進模型的 tensor 完全相同（已驗證差 0）。
-- 順序是先標車道線、再做 augmentation。顏色擾動、柏林噪聲也會套到紅線上，所以模型會學到紅線不一定是完全一樣的紅色。
+- 同一張圖，訓練路徑和車上路徑餵進模型的 tensor 完全相同（已驗證差 0）。
+- 想看標出來的結果，用下面的預覽工具。
 
 **預覽工具**（PC）：
 
@@ -82,19 +79,30 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 | `perlin` | 柏林噪聲做出大片明暗不均，模擬光線和陰影 |
 | `compression` | JPEG 低品質（q 5~35）重壓，或像 YouTube 144p 那樣縮小、重壓再放大 |
 
-### `model.py`
+### `resnet18.py`、`mobilenet_v2.py`、`loader.py`
 
-- `build_model()`：ImageNet 預訓練的 ResNet-18，`fc = Linear(512, 2)`（投影片 P.39、P.45）。
-  - `arch` 參數是給之後換別的模型用的，目前只支援 `resnet18`。
-- `rebuild_resnet18_from_state_dict(sd)`：依權重的形狀重建網路。剪枝後 channel 數變少，直接 `load_state_dict` 會 size mismatch。
-- `load_model(path)`：自動判斷 `.pth` 是 PyTorch 權重還是 TensorRT 包裝。TRT 的輸入 dtype 從 engine 讀，所以 trtexec 建的 FP32 輸入不會被誤餵 half。
-- `list_models(dir)`：給介面下拉選單用，顯示名稱來自同名的 `.json`。
+每個網路一個檔，只負責「建立網路」；共用的載入功能放在 `loader.py`。
+
+| 檔案 | 網路 | 預設輸出層 | MACs / params（未剪枝） |
+|---|---|---|---|
+| `resnet18.py` | ImageNet 預訓練 ResNet-18（投影片 P.39、P.45） | `fc = Linear(512, 2)` | 1.82 G / 11.18 M |
+| `mobilenet_v2.py` | ImageNet 預訓練 MobileNetV2 | `classifier[1] = Linear(1280, 2)` | 0.32 G / 2.23 M |
+
+- MobileNetV2 是給報告比較用的 other model：運算量約 ResNet-18 的 1/6，本來就是為行動裝置設計的。剪枝 30% 後是 0.15 G / 1.08 M。
+  - 注意：PC CPU 上兩者未剪枝的延遲差不多（depthwise convolution 在 CPU 上效率不好），差距要在 Nano 的 GPU / TensorRT 上才看得出來，請以板子上的 benchmark 為準。
+- `loader.py`：
+  - `build_model(arch)`：`arch` 是 `resnet18` 或 `mobilenet_v2`。
+  - `detect_arch(sd)`：從權重的輸出層名稱判斷是哪個網路，所以 `--base` 和載入模型都不用另外指定。
+  - `rebuild_from_state_dict(sd)`：依權重的形狀重建網路（兩種都適用，depthwise 卷積會保持 depthwise）。剪枝後 channel 數變少，直接 `load_state_dict` 會 size mismatch。
+  - `load_model(path)`：自動判斷 `.pth` 是 PyTorch 權重還是 TensorRT 包裝。TRT 的輸入 dtype 從 engine 讀，所以 trtexec 建的 FP32 輸入不會被誤餵 half。
+  - `list_models(dir)`：給介面下拉選單用，顯示名稱來自同名的 `.json`。
+- 要再加網路：新增一個 `<名稱>.py`（`NAME`、`FILE_TAG`、`LABEL`、`HEAD_KEY`、`build()`），再加進 `loader.ARCHS`。
 
 ### `compression.py`
 
 - `prune_model(model, ratio)`：DepGraph 結構化剪枝。
   - 用 torch-pruning 的 `MetaPruner` + `GroupMagnitudeImportance(p=2)`，`fc` 不剪，`round_to=8`。
-  - 有殘差連接的層會一起剪，剪完仍是合法的 ResNet-18，只是 channel 變少。
+  - 有殘差連接的層會一起剪，剪完仍是合法的網路（ResNet-18 的殘差、MobileNetV2 的 depthwise 都一樣處理），只是 channel 變少。
 - `count_macs_params()`、`export_onnx()`：ONNX 用 opset 11，輸入輸出名稱是 `input_0` / `output_0`。
 - `wrap_trt_engine(engine, out)`：把 `trtexec` 建好的 engine 包成 `TRTModule` 能讀的 `.pth`，並自動產生 label 加上「| TensorRT」的 `.json`。
 
@@ -144,23 +152,23 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
-| `--preprocessed DIR` | 前處理輸出的資料夾（預設 `<--data>_lanes`）。前處理固定會做 |
+| `--arch resnet18` / `--arch mobilenet_v2` | 網路（預設 resnet18）。前處理（標車道線）固定會做，沒有開關 |
 | `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
 | `--epochs 70` `--lr 1e-3` `--batch-size 8` | baseline 訓練（預設值同課程） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs 15` `--finetune-lr 1e-4` | 剪枝後的 finetune（必做） |
 | `--onnx` | 同時匯出 ONNX，給板子建 TensorRT engine |
-| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（augmentation 設定沿用它的 .json） |
+| `--base X_base.pth` | 跳過 baseline 訓練，直接剪既有模型（網路從權重判斷，augmentation 設定沿用它的 .json） |
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑、輸出資料夾（預設 `models/`） |
 
-產出：`models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
+產出：`models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}`，網路是 `resnet18` 或 `mobilenetv2`，例如 `mobilenetv2_gen_pruned30.pth`。`.json` 裡有 loss 曲線、MACs / params、資料切分，寫報告時用得到。
 
 ### `live_demo.ipynb`
 
 | 區塊 | 內容 |
 |---|---|
-| 變因 | 模型下拉選單（augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
+| 變因 | 模型下拉選單（網路 × augmentation × 剪枝 × PyTorch / TRT），以及「輸入干擾」：柏林噪聲、壓縮失真 |
 | 畫面 | 模型實際看到的影像（紅色車道線）、綠色預測點、上方橘色轉向條。舊模型（不是用車道線資料訓練的）會在資訊列顯示紅字警告 |
 | 控制參數 | speed gain、steering gain (Kp)、steering kd、steering bias（投影片 P.71 的範圍） |
 | 髮夾彎（預設關閉） | 轉彎減速 k、內側輪可反轉 |
@@ -177,16 +185,19 @@ python train.py --prune 0.3 0.5 --onnx                                   # 無 a
 python train.py --general --prune 0.3 0.5 --onnx                         # 一般做法
 python train.py --general --perlin --prune 0.3 0.5 --onnx                # + 柏林噪聲
 python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓縮失真
+
+# MobileNetV2：同樣的指令加 --arch mobilenet_v2
+python train.py --arch mobilenet_v2 --general --perlin --prune 0.3 0.5 --onnx
 ```
 
-資料不在預設的 `data/dataset_xy_2026-10-21/dataset_xy` 時，每行加上 `--data <資料夾>`。第一次跑會先產生 `<資料夾>_lanes/`，之後直接沿用。
+資料不在預設的 `data/dataset_xy_2026-10-21/dataset_xy` 時，每行加上 `--data <資料夾>`。
 
 看 log 裡的 val loss：如果剪枝 50% 的 finetune 後明顯比 baseline 差，DEMO 就用 30% 的版本。
 
 前處理固定會做，訓練前可以先檢查車道線標得對不對：
 
 ```bash
-python preprocessing.py review --data <資料夾>     # 看 label_review.jpg，或直接打開 <資料夾>_lanes/ 裡的 PNG
+python preprocessing.py review --data <資料夾>     # 看 label_review.jpg
 ```
 
 ## DEMO 前一天（Nano）：建 TensorRT engine
@@ -293,7 +304,7 @@ engine 必須在板子上建，每個模型要幾分鐘，**不要留到 DEMO �
 
 - **TensorRT**：舊版 torch2trt 的 `TRTModule` 用 implicit batch 的 `execute_async`，碰到 trtexec 建的 explicit batch engine 可能報錯。
   - 備案是用 PyTorch `.pth` DEMO（CUDA 上自動 FP16）。
-  - 或照投影片 P.55 用 `torch2trt` 轉：模型改用 `rebuild_resnet18_from_state_dict()` 建立。
+  - 或照投影片 P.55 用 `torch2trt` 轉：模型改用 `loader.rebuild_from_state_dict()` 建立。
 - Nano 上的 Python 3.6 / 舊版 ipywidgets 只做過靜態語法檢查，介面排版可能和 PC 上不同。
 - 換模型時的 flush（重啟 jetbot 相機管線）和 `CAMERA_SOURCE = 'csi'` 都還沒在板子上試過。flush 有問題就把 `FLUSH_ON_SWITCH` 改成 `False`。
 - 和投影片流程不同的地方，報告要寫清楚，DEMO 前建議先問助教：

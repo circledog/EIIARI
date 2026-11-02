@@ -1,8 +1,8 @@
-"""PC training entry point: preprocessing -> baseline -> DepGraph pruning -> finetune -> export.
+"""PC training entry point: baseline -> DepGraph pruning -> finetune -> export.
 
-Preprocessing (lane marking, ``preprocessing.preprocess_dataset``) always runs
-first. It writes the marked images to ``<data>_lanes/`` (kept on disk; only new
-images are processed on later runs) and training reads that folder.
+Preprocessing (lane marking) always runs, live inside the DataLoader after
+augmentation; nothing is written to disk. ``--arch`` picks the network
+(``resnet18.py`` / ``mobilenet_v2.py``).
 
 Examples
 --------
@@ -12,11 +12,15 @@ Examples
     # general + Perlin augmentation, then prune 30 % and 50 %, export ONNX
     python train.py --general --perlin --prune 0.3 0.5 --onnx
 
+    # the same with MobileNetV2
+    python train.py --arch mobilenet_v2 --general --perlin --prune 0.3 0.5 --onnx
+
     # prune an existing baseline without retraining it
     # (augmentation switches and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
+    # (the architecture is detected from the file)
 
-Outputs in ``--out`` (default ``models/``), per run name ``resnet18_<aug>``:
+Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``resnet18_gen``, ``mobilenetv2_gen``, ...):
     <name>_base.pth / .json          baseline state_dict + metadata
     <name>_pruned30.pth / .json      pruned + finetuned state_dict + metadata
     <name>_*.onnx                    with --onnx (for trtexec on the Nano)
@@ -32,9 +36,9 @@ import torch
 import torch.nn.functional as F
 
 from compression import count_macs_params, export_onnx, prune_model
-from data_loader import DEFAULT_DATA_DIR, default_metadata_dir, make_loaders
-from model import build_model, read_meta, rebuild_resnet18_from_state_dict, write_meta
-from preprocessing import CONFIG as PREPROCESSING, preprocess_dataset
+from data_loader import DEFAULT_DATA_DIR, make_loaders
+from loader import ARCHS, build_model, detect_arch, read_meta, rebuild_from_state_dict, write_meta
+from preprocessing import CONFIG as PREPROCESSING
 
 
 def evaluate(model, loader, device):
@@ -90,11 +94,11 @@ def save(model, path, meta, onnx):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default=DEFAULT_DATA_DIR, help="folder with xy_*.jpg (raw images)")
-    ap.add_argument("--preprocessed", default=None,
-                    help="where the lane-marked images go (default: <data>_lanes)")
+    ap.add_argument("--data", default=DEFAULT_DATA_DIR, help="folder with xy_*.jpg")
+    ap.add_argument("--arch", choices=sorted(ARCHS), default="resnet18",
+                    help="network (ignored with --base: taken from the baseline)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
-    ap.add_argument("--name", default=None, help="run name (default resnet18_<aug>)")
+    ap.add_argument("--name", default=None, help="run name (default <arch>_<aug>)")
     g = ap.add_argument_group("augmentation switches (all off = none)")
     g.add_argument("--general", action="store_true", help="flip / rotate / crop / colour jitter")
     g.add_argument("--perlin", action="store_true", help="Perlin-noise lighting")
@@ -125,6 +129,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     if args.base:
+        args.arch = detect_arch(torch.load(args.base, map_location="cpu"))
         # Reuse the baseline's augmentation switches and run name
         # unless overridden, so pruned files stay grouped with their baseline.
         base_aug = read_meta(args.base).get("augmentation", {})
@@ -136,15 +141,15 @@ def main():
         if args.name is None and stem.endswith("_base"):
             args.name = stem[:-len("_base")]
 
-    data_dir = preprocess_dataset(args.data, args.preprocessed)
     train_loader, val_loader, aug = make_loaders(
-        data_dir, general=args.general, perlin=args.perlin, compression=args.compression,
+        args.data, general=args.general, perlin=args.perlin, compression=args.compression,
         val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.seed,
-        split=args.split, metadata_dir=args.metadata or default_metadata_dir(args.data), segment_gap=args.segment_gap)
-    name = args.name or "resnet18_%s" % aug.tag()
+        split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap)
+    arch = ARCHS[args.arch]
+    name = args.name or "%s_%s" % (arch.FILE_TAG, aug.tag())
     common = {
-        "arch": "resnet18",
-        "preprocessing": dict(PREPROCESSING, dir=data_dir),
+        "arch": args.arch,
+        "preprocessing": PREPROCESSING,
         "augmentation": {"general": aug.general, "perlin": aug.perlin,
                          "compression": aug.compression, "tag": aug.tag()},
         "data": os.path.abspath(args.data),
@@ -152,21 +157,21 @@ def main():
         "val_ratio": args.val_ratio, "seed": args.seed, "batch_size": args.batch_size,
         "split": train_loader.split_info,
     }
-    print("data: %d train / %d val (%s), %r, device %s"
-          % (common["n_train"], common["n_val"], data_dir, aug, device))
+    print("data: %d train / %d val, %s, %r, lane marking on, device %s"
+          % (common["n_train"], common["n_val"], arch.LABEL, aug, device))
     print("split: %s" % train_loader.split_info)
 
     # ---- baseline --------------------------------------------------------- #
     if args.base:
-        model = rebuild_resnet18_from_state_dict(torch.load(args.base, map_location="cpu")).to(device)
+        model = rebuild_from_state_dict(torch.load(args.base, map_location="cpu")).to(device)
         base_meta = read_meta(args.base)
         base_path = args.base
         print("loaded baseline %s (val %.5f)" % (args.base, evaluate(model, val_loader, device)))
     else:
-        model = build_model(pretrained=not args.no_pretrained).to(device)
+        model = build_model(args.arch, pretrained=not args.no_pretrained).to(device)
         best, history = fit(model, train_loader, val_loader, device, args.epochs, args.lr, "base")
         macs, params = count_macs_params(model)
-        base_meta = dict(common, label="ResNet18 | %s | no compression" % _variant_label(aug),
+        base_meta = dict(common, label="%s | %s | no compression" % (arch.LABEL, _variant_label(aug)),
                          compression=None, epochs=args.epochs, lr=args.lr,
                          best_val_loss=best, macs=macs, params=params, history=history)
         base_path = os.path.join(args.out, name + "_base.pth")
@@ -183,7 +188,7 @@ def main():
         tag = "pruned%02d" % round(ratio * 100)
         best, history = fit(pruned, train_loader, val_loader, device,
                             args.finetune_epochs, args.finetune_lr, tag)
-        meta = dict(common, label="ResNet18 | %s | DepGraph %d%%" % (_variant_label(aug), round(ratio * 100)),
+        meta = dict(common, label="%s | %s | DepGraph %d%%" % (arch.LABEL, _variant_label(aug), round(ratio * 100)),
                     compression=dict(info, method="DepGraph", importance="GroupMagnitude(p=2)"),
                     base=os.path.basename(base_path), base_val_loss=base_meta.get("best_val_loss"),
                     val_loss_before_finetune=before, epochs=args.finetune_epochs, lr=args.finetune_lr,

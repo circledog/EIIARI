@@ -14,9 +14,11 @@ Camera Input → Model inferencing → Motor controlling                       (
 | 檔案 | 內容 |
 |---|---|
 | `data_loader.py` | `XYDataset`，路徑參數，預設 `data/dataset_xy_2026-10-21/dataset_xy` |
-| `preprocessing.py` | 只做車道線標示：白膠帶塗成紅色，彎道也適用；固定開啟。`preprocess_dataset()` 由 train 呼叫，輸出留在 `<data>_lanes/`；車上用 `apply_frame()` |
+| `preprocessing.py` | 只做車道線標示：白膠帶塗成紅色，彎道也適用；固定開啟、即時做、不存檔。訓練在 DataLoader 裡（augmentation 之後）呼叫 `mark_lanes_pil()`，車上用 `apply_frame()` |
 | `augmentation.py` | 三組開關：一般（幾何＋色彩）、柏林噪聲、壓縮失真（JPEG / 144p）。全關＝原樣輸出 |
-| `model.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)`；依 state_dict 重建剪枝後網路；TRT 載入 |
+| `resnet18.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)` |
+| `mobilenet_v2.py` | MobileNetV2（ImageNet pretrained）+ `classifier[1]=Linear(1280,2)` |
+| `loader.py` | 共用：`build_model(arch)`、`detect_arch`、依 state_dict 重建剪枝後網路、PyTorch／TRT 載入、`.json` |
 | `compression.py` | DepGraph 剪枝（torch-pruning `MetaPruner` + `GroupMagnitudeImportance(p=2)`）、MACs/params、ONNX 匯出、engine 包裝 |
 | `camera.py` | 相機輸入（jetbot.Camera / OpenCV / 假畫面）與前處理 |
 | `control.py` | 投影片 P.69–75 的 PD + bias 差速（拮抗）控制 |
@@ -26,13 +28,13 @@ Camera Input → Model inferencing → Motor controlling                       (
 ## 重要決策
 
 - 「DCP」依使用者提供的前次交接文件解讀為 **DepGraph 結構化剪枝**（torch-pruning），不是 Discrimination-aware Channel Pruning。
-- 模型先用投影片的 ResNet-18；「other model」尚未決定。`model.py` 用 `build_model(arch=...)` 預留擴充點。
+- 網路：投影片的 ResNet-18，加上 other model 的 MobileNetV2（第十一階段）。每個網路一個檔，共用功能在 `loader.py`；不再用 `model.py` 這個名稱，避免和 `models/` 資料夾搞混。
 - augmentation 是訓練期變因 → live demo 的「切換變因」＝切換不同條件訓練出的 checkpoint。
 - 前處理沿用課程慣例：相機給 BGR，訓練時 `[::-1]` 把 RGB 轉 BGR，兩邊都是 BGR 進網路。
 - 修正課程 `XYDataset` 不看 `random_hflips` 的 bug；驗證集不做任何 augmentation。
 - 現有資料集只有 jpg、沒有 metadata → 預設 train/val 隨機 9:1（固定 seed）。之後新拍的資料連 `metadata/` 一起複製，就可以用 `--split session` 照拍攝段落切（第六階段）。
 - Nano 是 **Python 3.6.9**（原本收集 notebook 的 metadata 寫的），板子會 import 的模組保持 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別、`datetime.fromisoformat`。
-- 前處理固定開啟、沒有開關；訓練前先把整個資料夾處理成 `<data>_lanes/*.png` 留在硬碟，訓練讀這個資料夾；live_demo 每幀都套用（第十階段）。
+- 前處理固定開啟、沒有開關、不存檔。訓練順序是「讀圖 → augmentation → 標車道線」，車上是「相機 → 輸入干擾 → 標車道線」，噪聲對偵測的影響兩邊一致（第十一階段）。
 - 控制的髮夾彎擴充（轉彎減速、內側輪反轉）預設關閉，關閉時和投影片公式完全一樣（第四階段）。
 - 換模型後清空相機佇列：jetbot 來源用重啟管線，另外提供 `'csi'`（`drop=true`）來源（第四階段）。
 - 資料收集不在這個分支的範圍：收集 notebook（隊友版與課程原始版）、`lane_label.py`、`使用說明.txt` 都已刪除（第八階段）。第六、七階段的紀錄保留作歷史，內容要看 git 歷史（`14f384d` 之前）。
@@ -87,10 +89,10 @@ python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','m
 前處理（標示車道線）與照段落切分（PC）：
 
 ```bash
-python preprocessing.py run --data <資料夾>                             # 只產生 <資料夾>_lanes/（train.py 也會自己做）
 python preprocessing.py review --data <資料夾>                          # 前處理後的圖 + 標籤總覽
 python preprocessing.py review --data <資料夾> --model models/X.pth     # 依模型誤差排序
 python train.py --data <資料夾> --general --prune 0.3 0.5 --onnx
+python train.py --data <資料夾> --arch mobilenet_v2 --general --prune 0.3 0.5 --onnx
 python train.py --split session --general ...                           # 需要 dataset_xy 旁邊的 metadata/
 ```
 
@@ -225,7 +227,7 @@ python train.py --split session --general ...                           # 需要
   - `preprocessing.py review`（有無 `--model`）✅；vermin `preprocessing.py camera.py data_loader.py` → 3.3 ✅
 - 沒有實機驗證：Nano 上的前處理速度（OpenCV morphology 大約多 10~30 ms，推估）、實際相機畫面（未經 JPEG 壓縮）和訓練圖的差異。
 
-## 第十階段（前處理固定開啟、輸出存成資料夾，2026-11-02）
+## 第十階段（前處理固定開啟、輸出存成資料夾，2026-11-02；存檔與 `--preprocessed` 已被第十一階段取消）
 
 使用者要求：「Preprocessing 的輸出在哪個資料夾？取消開關，但還是要留前處理過後的檔案。前處理做成函式給 train 叫，直接寫死在裡面，不用開關。」（第九階段的前處理是在 DataLoader 裡即時做的，沒有輸出檔案。）
 
@@ -244,6 +246,44 @@ python train.py --split session --general ...                           # 需要
   - PNG（訓練）和 `apply_frame`（車上）餵進模型的 tensor 最大差 0 ✅
   - `live_demo` 用 nbclient 跑：可以切換模型、畫面有紅色車道線、benchmark 正常 ✅；`review --model` ✅；vermin 3.3 ✅
 
+## 第十一階段（前處理改回即時、新增 MobileNetV2、拆分模型檔，2026-11-02）
+
+使用者要求：
+- 前處理不另存，改成即時標車道線。順序確認：先 augmentation 再標線，和車上一致。
+- 測試腳本不保留，會在車上實測。
+- 新增 other model；檔案名稱要區分，不要再用 `model`。確認：每個模型一個檔。
+
+改動：
+- `preprocessing.py`
+  - 拿掉 `preprocess_dataset`、`default_output_dir` 和 `run` 子命令。
+  - 新增 `mark_lanes_pil()`，給 DataLoader 用。
+  - `CONFIG` 多一欄 `order: after_augmentation`。
+  - `review` 直接讀原圖、即時標線。
+- `data_loader.py`：`XYDataset.load()` 的順序是「讀圖 → augmenter → `mark_lanes_pil`」。驗證集也會標線，但不做 augmentation。只讀 `xy_*.jpg`。
+- `model.py` 刪除，拆成三個檔：
+  - `resnet18.py`、`mobilenet_v2.py`：各自只有 `NAME`、`FILE_TAG`、`LABEL`、`HEAD_KEY`、`build()`。
+  - `loader.py`：`ARCHS`、`build_model`、`detect_arch`、通用的 `rebuild_from_state_dict`（depthwise conv 剪枝後 `groups` 跟著 channel 數）、`load_model`、`list_models`、`read_meta` / `write_meta`。
+  - `compression.py` 改成 import `loader`。
+- `train.py`
+  - 新增 `--arch resnet18|mobilenet_v2`；`--base` 用 `detect_arch` 判斷網路。
+  - 拿掉 `--preprocessed`。
+  - 輸出檔名改成 `<FILE_TAG>_<aug>_*`（`resnet18_…`、`mobilenetv2_…`），label 改成 `<LABEL> | aug=… | …`。
+- `live_demo.ipynb`（直接修改）：import 改成 `from loader import …`，流程說明同步更新。原本的順序已經是「`degrade` → `mark_lanes` → 推論」，不用改。
+
+已測：
+- 兩種網路都做了：建立 → 剪枝 30% → 從 state_dict 重建（差 0）→ 匯出 ONNX，和 onnxruntime 比對差 ≤1.2e-7 ✅。`detect_arch` 判斷正確 ✅。
+  - ResNet-18：1.82G / 11.18M → 0.84G / 5.27M。
+  - MobileNetV2：0.32G / 2.23M → 0.15G / 1.08M。
+- `train.py` 加 `--general --perlin --epochs 2 --prune 0.3 --onnx --no-pretrained`，兩種網路都跑完 ✅。另外用 `--base mobilenetv2_..._base.pth --prune 0.5` 剪枝（0.09G / 0.58M）✅。
+  - sandbox 連不到 download.pytorch.org，所以沒有測 MobileNetV2 下載預訓練權重。
+- 訓練路徑（PIL → mark_lanes_pil → image_to_tensor）和車上路徑（BGR → apply_frame → camera.preprocess）餵進模型的 tensor 最大差 0 ✅。
+- `live_demo` 用 nbclient 跑：5 個模型都能載入和切換，畫面有紅線，benchmark 正常 ✅。PC CPU 延遲：MobileNetV2 未剪枝 21.4 ms、剪枝 30% 13.7 ms；ResNet-18 未剪枝 21.4 ms、剪枝 30% 15.9 ms。
+- `review --model` ✅；vermin 檢查 loader / resnet18 / mobilenet_v2 / preprocessing / data_loader / camera / compression → 3.3 ✅。
+
+沒有實機驗證：
+- MobileNetV2 在 Nano 上走 TensorRT。ReLU6 會匯出成 Clip，TensorRT 有支援。
+- 板子上舊版 torchvision 有沒有 `mobilenet_v2`（0.3 版以後才有，JetPack 的版本應該有）。
+
 ## 未完成 / 未驗證
 
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
@@ -252,9 +292,8 @@ python train.py --split session --general ...                           # 需要
   - 髮夾彎擴充（轉彎減速、內側輪反轉）的實際行駛效果。
   - 前處理在板子上的速度（每幀都做）與效果。
 - 正式訓練（70 epochs、各種 augmentation／前處理組合）的結果還沒回報；sandbox 只跑過 1~3 epochs 的 smoke test。
-- 「other model」尚未決定。
 - 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
-- **測試腳本不在 repo 裡**：各階段寫的測試（`fakejet/`、notebook 產生器 `make_nb.py`；收集相關的 `collect_test.py`、`gamepad_test.py`、`eval_old.py`、`fakecollect/` 已隨收集 notebook 失去用途）都放在 sandbox 的 scratchpad，sandbox 刪除後就不見了。需要的話要搬進 repo（例如 `project4/tests/`）。
+- 測試腳本（假 jetbot、nbclient 模擬）和 notebook 產生器 `make_nb.py` 都沒有進 repo，使用者決定不保留（會在車上實測）。從第十一階段起 `live_demo.ipynb` 直接修改，不再用產生器重新產生。
 
 ## 測試指令與結果
 
@@ -291,5 +330,5 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 2. PC 上用新的 198 張資料（`--data`）訓練，比較各種 augmentation 的結果（val loss 和實際行駛）。
 3. 板子上跑 trtexec → wrap → live_demo，驗證 TRT 載入（風險最高）；驗證換模型的 flush。
 4. 調 PD 參數；髮夾彎再試轉彎減速／內側輪反轉。
-5. 決定 other model 後在 `model.build_model(arch=...)` 和 `rebuild_*` 加上對應的分支。
-6. 視需要把 scratchpad 的測試腳本搬進 repo。
+5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（PC CPU 上差異不大，要看 GPU／TensorRT）。
+

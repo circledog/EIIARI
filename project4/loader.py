@@ -1,12 +1,16 @@
-"""Model definition and loading.
+"""Shared model loading for every network (``resnet18.py``, ``mobilenet_v2.py``).
 
-* ``build_model``  -- ImageNet-pretrained ResNet-18 with ``fc = Linear(512, 2)``
-  (slides P.39 / P.45). ``arch`` is the hook for trying other models later.
-* ``rebuild_resnet18_from_state_dict`` -- recreate a (DepGraph-pruned) ResNet-18
-  whose channel counts differ from the stock one, using the tensor shapes in
-  the state_dict (slides P.55's plain ``load_state_dict`` fails after pruning).
+* ``build_model(arch)``         -- network for training (``ARCHS`` lists them).
+* ``detect_arch(state_dict)``   -- which network a state_dict belongs to.
+* ``rebuild_from_state_dict``   -- recreate a (DepGraph-pruned) network whose
+  channel counts differ from the stock one, using the tensor shapes in the
+  state_dict (slides P.55's plain ``load_state_dict`` fails after pruning).
 * ``load_model`` -- load either a PyTorch state_dict ``.pth`` or a TensorRT
   ``TRTModule`` ``.pth`` (dict with an ``engine`` key) for inference.
+* ``list_models`` / ``read_meta`` / ``write_meta`` -- checkpoint + ``.json``.
+
+To add a network: write ``<name>.py`` with ``NAME``, ``FILE_TAG``, ``LABEL``,
+``HEAD_KEY`` and ``build(pretrained, num_outputs)``, then add it to ``ARCHS``.
 
 Kept Python 3.6 / old-torchvision compatible because it runs on the Jetson Nano.
 """
@@ -16,41 +20,42 @@ import os
 
 import torch
 import torch.nn as nn
-import torchvision
 
-__all__ = ["build_model", "rebuild_resnet18_from_state_dict", "load_model",
+import mobilenet_v2
+import resnet18
+
+__all__ = ["ARCHS", "build_model", "detect_arch", "rebuild_from_state_dict", "load_model",
            "LoadedModel", "list_models", "read_meta", "write_meta"]
 
-
-def _resnet18(pretrained):
-    """torchvision resnet18 for both the old (pretrained=) and new (weights=) API."""
-    try:
-        weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        return torchvision.models.resnet18(weights=weights)
-    except (AttributeError, TypeError):
-        # torchvision < 0.13 (Nano): no ResNet18_Weights (AttributeError) when
-        # pretrained=True, or resnet18() rejects weights=None (TypeError) when False.
-        return torchvision.models.resnet18(pretrained=pretrained)
+ARCHS = {resnet18.NAME: resnet18, mobilenet_v2.NAME: mobilenet_v2}
 
 
 def build_model(arch="resnet18", pretrained=True, num_outputs=2):
-    """Network used for training. Only ResNet-18 for now (as in the slides)."""
-    if arch != "resnet18":
-        raise ValueError("unsupported arch %r (only 'resnet18' so far)" % arch)
-    model = _resnet18(pretrained)
-    model.fc = nn.Linear(model.fc.in_features, num_outputs)
-    return model
+    """Network used for training."""
+    if arch not in ARCHS:
+        raise ValueError("unknown arch %r (choose from %s)" % (arch, ", ".join(sorted(ARCHS))))
+    return ARCHS[arch].build(pretrained=pretrained, num_outputs=num_outputs)
 
 
-def rebuild_resnet18_from_state_dict(state_dict, num_outputs=2):
-    """ResNet-18 whose conv / bn / fc sizes match ``state_dict``, weights loaded.
+def detect_arch(state_dict):
+    """Name of the network a state_dict belongs to (from its head layer key)."""
+    for name, mod in ARCHS.items():
+        if mod.HEAD_KEY in state_dict:
+            return name
+    raise ValueError("unknown network: none of %s in the state_dict"
+                     % ", ".join(m.HEAD_KEY for m in ARCHS.values()))
 
-    Works for both an unpruned and a structurally pruned ResNet-18: every
-    Conv2d / BatchNorm2d / Linear whose shape differs is replaced by a module of
-    the stored shape (stride / padding / kernel are kept from the stock layer).
+
+def rebuild_from_state_dict(state_dict, arch=None, num_outputs=2):
+    """Network whose conv / bn / linear sizes match ``state_dict``, weights loaded.
+
+    Works for unpruned and structurally pruned networks: every Conv2d /
+    BatchNorm2d / Linear whose shape differs is replaced by a module of the
+    stored shape (stride / padding / kernel are kept from the stock layer;
+    depthwise convolutions stay depthwise).
     """
-    model = _resnet18(False)
-    model.fc = nn.Linear(model.fc.in_features, num_outputs)
+    arch = arch or detect_arch(state_dict)
+    model = ARCHS[arch].build(pretrained=False, num_outputs=num_outputs)
     modules = dict(model.named_modules())
     for name, mod in list(modules.items()):
         wkey = name + ".weight"
@@ -58,9 +63,11 @@ def rebuild_resnet18_from_state_dict(state_dict, num_outputs=2):
             continue
         shape = tuple(state_dict[wkey].shape)
         if isinstance(mod, nn.Conv2d) and tuple(mod.weight.shape) != shape:
-            new = nn.Conv2d(shape[1] * mod.groups, shape[0], kernel_size=mod.kernel_size,
+            depthwise = mod.groups > 1 and mod.groups == mod.in_channels
+            groups = shape[0] if depthwise else mod.groups
+            new = nn.Conv2d(shape[1] * groups, shape[0], kernel_size=mod.kernel_size,
                             stride=mod.stride, padding=mod.padding, dilation=mod.dilation,
-                            groups=mod.groups, bias=(name + ".bias") in state_dict)
+                            groups=groups, bias=(name + ".bias") in state_dict)
         elif isinstance(mod, nn.BatchNorm2d) and mod.num_features != shape[0]:
             new = nn.BatchNorm2d(shape[0], eps=mod.eps, momentum=mod.momentum)
         elif isinstance(mod, nn.Linear) and tuple(mod.weight.shape) != shape:
@@ -151,7 +158,8 @@ def load_model(path, device=None, half=None):
 
     * dict with ``'engine'`` -> TensorRT via ``torch2trt.TRTModule``; input dtype
       is read from the engine (trtexec engines take FP32, torch2trt fp16 ones FP16).
-    * otherwise a state_dict -> ResNet-18 rebuilt from shapes (pruned or not).
+    * otherwise a state_dict -> network detected from its keys and rebuilt
+      from the tensor shapes (pruned or not).
       ``half`` defaults to True on CUDA (like slides P.55), False on CPU.
     """
     if device is None:
@@ -171,7 +179,7 @@ def load_model(path, device=None, half=None):
 
     if isinstance(obj, dict) and "state_dict" in obj:
         obj = obj["state_dict"]
-    module = rebuild_resnet18_from_state_dict(obj)
+    module = rebuild_from_state_dict(obj)
     if half is None:
         half = device.type == "cuda"
     dtype = torch.float16 if half else torch.float32

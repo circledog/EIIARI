@@ -1,7 +1,7 @@
 """Model compression: DepGraph structured channel pruning (torch-pruning).
 
 PC side:
-    prune_model()      -- MetaPruner + GroupMagnitudeImportance(p=2), fc ignored,
+    prune_model()      -- MetaPruner + GroupMagnitudeImportance(p=2), output Linear ignored,
                           round_to=8. Returns the physically smaller model.
     count_macs_params()
     export_onnx()      -- opset 11, input_0 / output_0, legacy exporter.
@@ -39,8 +39,8 @@ def prune_model(model, ratio, round_to=8, inplace=False):
     """DepGraph structured pruning of ``model`` to ``ratio`` channel sparsity.
 
     Coupled layers (residual adds, BN after conv, ...) are pruned together
-    through the dependency graph, so the result is a valid, smaller ResNet-18.
-    The output head ``fc`` is never pruned. Fine-tune afterwards (required).
+    through the dependency graph, so the result is a valid, smaller network.
+    The output Linear layer (``fc`` / ``classifier[1]``) is never pruned. Fine-tune afterwards (required).
 
     Returns (pruned_model, info) where info has MACs / params before & after.
     """
@@ -100,7 +100,7 @@ def wrap_trt_engine(engine_path, out_path, input_names=("input_0",), output_name
 
     # Carry over the PyTorch model's metadata (X.json next to X.engine) so the
     # live-demo dropdown shows e.g. "ResNet18 | aug=none | DepGraph 30% | TensorRT".
-    from model import read_meta, write_meta
+    from loader import read_meta, write_meta
     meta = read_meta(engine_path)
     if meta:
         meta = dict(meta, label=meta.get("label", "") + " | TensorRT", runtime="tensorrt",

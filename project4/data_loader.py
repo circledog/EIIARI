@@ -1,8 +1,11 @@
 """Dataset / DataLoader for the road-following (x, y) data.
 
-Pipeline:
-    preprocessing.preprocess_dataset()  (lane marking, written to <data>_lanes/, called by train.py)
-    -> load image + label  ->  Augmenter (random, training split only)  ->  tensor
+Per-sample pipeline:
+    load jpg + label  ->  Augmenter (random, training split only)
+                      ->  preprocessing.mark_lanes_pil (lane marking, always, live)  ->  tensor
+
+Lane marking comes after augmentation so that Perlin / compression noise
+affects the detection exactly as the "input disturbance" does on the robot.
 
 File name convention (from the data-collection notebook):
     xy_<x>_<y>_<uuid>.jpg      x, y = pixel coordinates in that image
@@ -25,6 +28,7 @@ import torch
 import torchvision.transforms.functional as TF
 
 from augmentation import Augmenter
+from preprocessing import mark_lanes_pil
 
 __all__ = ["DEFAULT_DATA_DIR", "XYDataset", "parse_xy", "image_to_tensor",
            "split_indices", "split_by_session", "default_metadata_dir", "make_loaders",
@@ -58,20 +62,18 @@ class XYDataset(torch.utils.data.Dataset):
     Parameters
     ----------
     directory : str
-        Folder with ``xy_*.jpg`` / ``xy_*.png`` (the preprocessed folder when
-        training). Defaults to ``DEFAULT_DATA_DIR``.
+        Folder with ``xy_*.jpg``. Defaults to ``DEFAULT_DATA_DIR``.
     augmenter : Augmenter or None
-        Applied to (image, x, y). None -> no augmentation.
+        Applied to (image, x, y) before lane marking. None -> no augmentation.
     indices : list[int] or None
         Use only these files (indices into the sorted list of all files).
     """
 
     def __init__(self, directory=None, augmenter=None, indices=None):
         self.directory = directory or DEFAULT_DATA_DIR
-        paths = sorted(glob.glob(os.path.join(self.directory, "xy_*.jpg"))
-                       + glob.glob(os.path.join(self.directory, "xy_*.png")))
+        paths = sorted(glob.glob(os.path.join(self.directory, "xy_*.jpg")))
         if not paths:
-            raise FileNotFoundError("no xy_*.jpg / xy_*.png found in %s" % self.directory)
+            raise FileNotFoundError("no xy_*.jpg found in %s" % self.directory)
         self.all_paths = paths
         chosen = paths if indices is None else [paths[i] for i in indices]
         self.image_paths = chosen
@@ -81,13 +83,13 @@ class XYDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
 
     def load(self, idx):
-        """Raw sample: (PIL image, x_px, y_px) after augmentation, before tensor."""
+        """Raw sample: (PIL image, x_px, y_px) after augmentation + lane marking, before tensor."""
         path = self.image_paths[idx]
         image = PIL.Image.open(path).convert("RGB")
         x, y = parse_xy(path)
         if self.augmenter is not None:
             image, x, y = self.augmenter(image, x, y)
-        return image, x, y
+        return mark_lanes_pil(image), x, y
 
     def __getitem__(self, idx):
         image, x, y = self.load(idx)
@@ -193,10 +195,9 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
                  split="random", metadata_dir=None, segment_gap=60.0):
     """Train/val DataLoaders.
 
-    Augmentation is applied to the training split only. Pass the preprocessed
-    folder (``preprocessing.preprocess_dataset``) as ``directory``. Pass the
-    three augmentation switches, or a pre-configured ``augmenter`` (overrides
-    them).
+    Augmentation is applied to the training split only; lane marking to both.
+    Pass the three augmentation switches, or a pre-configured ``augmenter``
+    (overrides them).
 
     ``split='random'`` (default) splits images at random; ``split='session'``
     keeps shooting segments together (needs the collection ``metadata`` folder,
