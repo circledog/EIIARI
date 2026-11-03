@@ -19,11 +19,16 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
 | `resnet18.py` | PC + Nano | ResNet-18：網路定義＋它自己的訓練函式 `train()` 與預設參數 |
 | `mobilenet_v2.py` | PC + Nano | MobileNetV2：網路定義＋它自己的訓練函式（比較用的 other model） |
+| `resnet18_coord.py` | PC + Nano | ResNet-18 + CoordConv：模型裡自己加 x / y 座標通道（隊友的 `course_coordconv`） |
+| `resnet18_dsnt.py` | PC + Nano | ResNet-18 + DSNT：熱圖 + 期望值輸出，訓練多一項熱圖損失（隊友的 `dsnt`） |
+| `resnet18_coord_dsnt.py` | PC + Nano | CoordConv + DSNT（隊友的 `coordconv_dsnt`） |
 | `metrics.py` | PC | 評估指標：MSE 和像素誤差（平均、x / y、p95） |
 | `sanity.py` | PC + Nano | 權重 SHA256、sanity 比對畫面（訓練時存、車上比對） |
-| `loader.py` | PC + Nano | 兩種網路共用：建立、剪枝後重建、載入（PyTorch / TensorRT）、`.json` |
+| `loader.py` | PC + Nano | 所有網路共用：建立、剪枝後重建、載入（PyTorch / TensorRT）、`.json` |
 | `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
 | `convert_trt.py` | Nano | 把上傳到 `models/` 的模型轉成 TensorRT，放到 `models_trt/`，並做比對和計時 |
+| `check_trt_coord.py` | Nano | 用隨機權重測每個網路能不能正確轉 TRT（torch2trt 和 trtexec 兩條路） |
+| `check_trt_offline.py` + `fake_tensorrt/` | PC | 沒有 GPU 時的 TRT 轉換檢查：真的 torch2trt 原始碼 + 模擬的 TensorRT，逐層算出結果比對 |
 | `camera.py` | Nano | 相機輸入與前處理 |
 | `control.py` | Nano | 轉向角（隊友公式／投影片公式）＋ PID ＋ 差速控制，含平滑和安全檢查 |
 | `train.py` | PC | 依任務呼叫各網路的 `train()`：訓練 → 剪枝 → finetune → 匯出，可多 seed |
@@ -95,7 +100,7 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 | `perlin` | 柏林噪聲做出大片明暗不均，模擬光線和陰影 |
 | `compression` | JPEG 低品質（q 5~35）重壓，或像 YouTube 144p 那樣縮小、重壓再放大 |
 
-### `resnet18.py`、`mobilenet_v2.py`、`loader.py`
+### 網路檔（`resnet18.py`、`mobilenet_v2.py`、`resnet18_coord.py`、`resnet18_dsnt.py`、`resnet18_coord_dsnt.py`）與 `loader.py`
 
 每個網路一個檔，裡面有**網路定義和它自己的訓練函式**；`train.py` 只負責依任務（baseline、剪枝後 finetune、多 seed）呼叫對應網路的函式。共用的載入功能放在 `loader.py`。
 
@@ -103,6 +108,19 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 |---|---|---|---|
 | `resnet18.py` | ImageNet 預訓練 ResNet-18（投影片 P.39、P.45） | `fc = Linear(512, 2)` | 1.82 G / 11.18 M |
 | `mobilenet_v2.py` | ImageNet 預訓練 MobileNetV2 | `classifier[1] = Linear(1280, 2)` | 0.32 G / 2.23 M |
+| `resnet18_coord.py` | ResNet-18，`conv1` 改 5 通道（RGB + x + y 座標圖） | `fc = Linear(512, 2)` | 1.90 G / 11.19 M |
+| `resnet18_dsnt.py` | ResNet-18（layer4 stride 1）+ 熱圖頭 | 28×28 熱圖的期望座標 | 3.06 G |
+| `resnet18_coord_dsnt.py` | 上面兩個合起來 | 同 DSNT | 3.14 G |
+
+隊友的三個變體（來自 `model_training_methods.zip`）：
+- **CoordConv**：座標通道在**模型裡面**加（隊友是在前處理加），所以相機、前處理、sanity、轉 TRT 的輸入都還是 3 通道，不用改。
+  - 座標圖存在權重檔裡（buffer `coords`），PC 和車上一定一樣；數值和隊友的 meshgrid 相同。
+  - 多出來兩個通道的權重從 0 開始，所以剛載入 ImageNet 權重時輸出和普通 ResNet-18 完全一樣。
+  - batch 1（推論、轉 TRT）用 `view` 接上座標圖；訓練時 batch > 1 才 `expand`。這是離線檢查後選的寫法：`view` 在 torch2trt 2019–2022 每一版都能轉，直接接 (1,2,H,W) 常數在 2020-09 前的版本會失敗，`expand` 在 2021-01 後的版本會失敗。
+- **DSNT**：layer4 不降解析度（14×14），1×1 卷積產生熱圖，放大到 28×28、softmax，輸出熱圖的期望座標。訓練損失 = MSE + 0.1 × 熱圖和高斯分布的 JS 散度。
+  - 為了能轉 TRT，放大（bilinear）和期望值都改成**固定不訓練的 Linear 層**，數學上和隊友的寫法一樣（實測差 < 3e-7）。避開了舊版 torch2trt 的 `interpolate`（TensorRT 7 的 resize 沒有 half-pixel 模式，值可能不同）和 `torch.softmax`（沒有轉換器，會被偷偷凍成常數）。
+  - 運算量約 ResNet-18 的 1.7 倍，Nano 上會比較慢；剪枝 30% 後 1.43 G。
+- 選模型、`.json`、剪枝、sanity、live_demo 都跟其他網路一樣，用 `--arch` 選即可。隊友的權重不能直接拿來用（他沒有車道線前處理），要用我們的流程重新訓練。
 
 - 每個網路檔都有：
   - `build(pretrained, num_outputs)`：建立網路。
@@ -111,12 +129,13 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 - MobileNetV2 是給報告比較用的 other model：運算量約 ResNet-18 的 1/6，本來就是為行動裝置設計的。剪枝 30% 後是 0.15 G / 1.08 M。
   - 注意：PC CPU 上兩者未剪枝的延遲差不多（depthwise convolution 在 CPU 上效率不好），差距要在 Nano 的 GPU / TensorRT 上才看得出來，請以板子上的 benchmark 為準。
 - `loader.py`：
-  - `build_model(arch)`：`arch` 是 `resnet18` 或 `mobilenet_v2`。
-  - `detect_arch(sd)`：從權重的輸出層名稱判斷是哪個網路，所以 `--base` 和載入模型都不用另外指定。
+  - `build_model(arch)`：`arch` 是 `loader.ARCHS` 裡的名稱（`resnet18`、`mobilenet_v2`、`resnet18_coord`、`resnet18_dsnt`、`resnet18_coord_dsnt`）。
+  - `detect_arch(sd)`：從權重裡的特徵 key（每個網路檔的 `KEYS`）判斷是哪個網路，所以 `--base` 和載入模型都不用另外指定。變體會多幾個 key（例如 `coords`），符合最多 key 的勝出。
   - `rebuild_from_state_dict(sd)`：依權重的形狀重建網路（兩種都適用，depthwise 卷積會保持 depthwise）。剪枝後 channel 數變少，直接 `load_state_dict` 會 size mismatch。
   - `load_model(path)`：自動判斷 `.pth` 是 PyTorch 權重還是 TensorRT 包裝。TRT 的輸入 dtype 從 engine 讀。**`.json` 有記錄 SHA256 時會先比對，對不上就拒絕載入**（檔案沒傳完整，或 `.json` 配錯檔）。
   - `list_models(dir)`：給介面下拉選單用，顯示名稱來自同名的 `.json`。
-- 要再加網路：新增一個 `<名稱>.py`（`NAME`、`FILE_TAG`、`LABEL`、`HEAD_KEY`、`DEFAULTS`、`build()`、`train()`），再加進 `loader.ARCHS`。
+- 要再加網路：新增一個 `<名稱>.py`（`NAME`、`FILE_TAG`、`LABEL`、`KEYS`、`DEFAULTS`、`build()`、`train()`），再加進 `loader.ARCHS`。加完先跑 `check_trt_offline.py` 確認轉得了 TRT。
+- `resnet18.train()` 可以傳 `loss_fn(model, images, labels)` 換掉 MSE（DSNT 就是這樣用），選最佳 epoch 仍然看 validation MSE。
 
 ### `metrics.py`、`sanity.py`
 
@@ -193,7 +212,7 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
-| `--arch resnet18` / `--arch mobilenet_v2` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡。前處理（標車道線）固定會做 |
+| `--arch resnet18` / `mobilenet_v2` / `resnet18_coord` / `resnet18_dsnt` / `resnet18_coord_dsnt` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡。前處理（標車道線）固定會做 |
 | `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
 | `--epochs` `--lr` | baseline 訓練；不給就用該網路檔的 `DEFAULTS`（目前都是 70 / 1e-3） |
 | `--batch-size 8` | batch size |

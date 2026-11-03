@@ -1,27 +1,24 @@
-"""JetBot test: can TensorRT convert coordinate channels added *inside* a model?
+"""JetBot test: do the CoordConv / DSNT networks convert to TensorRT correctly?
 
 Run on the JetBot (inside project4/, no motors or camera used):
     python3 check_trt_coord.py
 
-A CoordConv-style model appends two fixed coordinate maps (x, y in [-1, 1])
-to the 3 colour channels inside ``forward``, so preprocessing and the camera
-input stay 3-channel. The maps are a stored buffer (a constant), and old
-torch2trt versions differ in how they handle constants, so this script tries
-the candidate implementations and reports which ones convert correctly:
-
-    A  cat_const      torch.cat([x, coords])                 coords is a (1, 2, H, W) buffer
-    B  cat_expand     torch.cat([x, coords.expand(B, ...)])  expand on a constant
-    C  resnet18_coord ResNet-18 whose forward uses A for batch 1, B for training batches
+Tests, with random weights (no download needed):
+    resnet18, resnet18_coord, resnet18_dsnt, resnet18_coord_dsnt  -- the
+        pipeline's own networks from loader.ARCHS (CoordConv adds the two
+        coordinate channels inside the network; DSNT uses a heatmap head)
+    cat_const / cat_expand -- the two simplest ways of adding a stored
+        constant, for diagnosis
 
 Each is converted with torch2trt (FP16, as convert_trt.py does) and, if
-trtexec exists, through ONNX -> trtexec. The TensorRT output is compared with
-PyTorch FP32; differences below 2 px (0.018 in normalised units) count as OK.
-Random weights are used (no download), which is enough to test conversion.
+trtexec exists, through ONNX -> trtexec. Conversion uses input A; the
+TensorRT result for a *different* input B is compared with PyTorch FP32 on B
+(differences below 2 px count as OK), so values frozen into constants show
+up as a failure.
 
-Expected from reading the torch2trt source: A converts on torch2trt versions
-from 2019-09-30 on (constants are added automatically in torch.cat); B fails
-on every version (the expand converter needs a non-constant input). So the
-real model should use A at batch 1 -- which is what C does.
+Expected (checked offline with check_trt_offline.py on torch2trt
+2019-10 .. 2022-07): every pipeline network OK; cat_const fails on torch2trt
+before 2020-09; cat_expand fails from 2021-01 on.
 
 Python 3.6 compatible.
 """
@@ -35,6 +32,9 @@ import traceback
 import torch
 import torch.nn as nn
 import torchvision
+
+# Pipeline networks
+from loader import ARCHS
 
 # Input size of every model in this project
 SIZE = 224
@@ -84,41 +84,6 @@ class CatExpand(CatConst):
         return self.conv(torch.cat([x, grid], dim=1))
 
 
-# Variant C: ResNet-18 with coordinate channels inside, as a real model would be built
-class ResNet18Coord(nn.Module):
-    # ResNet-18 whose first conv takes 5 channels and whose head outputs (x, y)
-    def __init__(self):
-        # Initialise nn.Module
-        super(ResNet18Coord, self).__init__()
-        # Stored coordinate maps
-        self.register_buffer("coords", coordinate_maps())
-        # Stock ResNet-18 without pretrained weights (no download needed here)
-        try:
-            # New torchvision API
-            self.net = torchvision.models.resnet18(weights=None)
-        # Old torchvision on the JetBot
-        except TypeError:
-            # Old API
-            self.net = torchvision.models.resnet18(pretrained=False)
-        # First conv with 5 input channels
-        self.net.conv1 = nn.Conv2d(5, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        # Regression head for (x, y)
-        self.net.fc = nn.Linear(512, 2)
-
-    # Append the maps and run the network
-    def forward(self, x):
-        # Batch 1 (inference, TensorRT tracing): use the constant directly (variant A)
-        if x.shape[0] == 1:
-            # Stored maps as they are
-            grid = self.coords
-        # Training batches: repeat the maps for every image (PyTorch only)
-        else:
-            # Expanded maps
-            grid = self.coords.expand(x.shape[0], -1, -1, -1)
-        # 3 colour channels + 2 coordinate channels
-        return self.net(torch.cat([x, grid], dim=1))
-
-
 # Largest difference between two outputs
 def max_diff(a, b):
     # Compare as FP32 on the CPU
@@ -126,7 +91,7 @@ def max_diff(a, b):
 
 
 # Convert with torch2trt and compare
-def try_torch2trt(name, model, x, ref):
+def try_torch2trt(name, model, x, ref, x2):
     """'OK' / 'FAIL' line for one model converted with torch2trt."""
     # Converter from the course image
     from torch2trt import torch2trt
@@ -136,27 +101,27 @@ def try_torch2trt(name, model, x, ref):
         t0 = time.time()
         # FP16 inside, FP32 input, like convert_trt.py
         trt_model = torch2trt(model, [x], fp16_mode=True, max_workspace_size=1 << 25)
-        # TensorRT output
-        out = trt_model(x)
+        # TensorRT output for the second input
+        out = trt_model(x2)
         # Difference to PyTorch FP32
         d = max_diff(out, ref)
         # Verdict
         status = "OK  " if d <= TOLERANCE else "FAIL"
         # Report line
-        return "%s torch2trt  %-15s max diff %.5f (%.2f px)  %.0f s" % (status, name, d, d * 112, time.time() - t0)
+        return "%s torch2trt  %-19s max diff %.5f (%.2f px)  %.0f s" % (status, name, d, d * 112, time.time() - t0)
     # Unsupported operation or other conversion error
     except Exception as e:
         # Report the error, with the last frames of the traceback for debugging
-        return "FAIL torch2trt  %-15s %r\n%s" % (name, e, "".join(traceback.format_exc().splitlines(True)[-6:]))
+        return "FAIL torch2trt  %-19s %r\n%s" % (name, e, "".join(traceback.format_exc().splitlines(True)[-6:]))
 
 
 # Convert through ONNX and trtexec and compare
-def try_trtexec(name, model, x, ref, workdir):
+def try_trtexec(name, model, x, ref, x2, workdir):
     """'OK' / 'FAIL' / 'SKIP' line for one model built with trtexec."""
     # trtexec is part of JetPack; skip elsewhere
     if not os.path.exists(TRTEXEC):
         # Nothing to test
-        return "SKIP trtexec    %-15s (no %s)" % (name, TRTEXEC)
+        return "SKIP trtexec    %-19s (no %s)" % (name, TRTEXEC)
     # Engine packing and loading helpers of this project
     from compression import wrap_trt_engine
     # Loader that detects the engine's input dtype
@@ -174,18 +139,18 @@ def try_trtexec(name, model, x, ref, workdir):
         wrap_trt_engine(engine, wrapped)
         # Load it like live_demo does
         m = load_model(wrapped, "cuda")
-        # TensorRT output
-        out = m(x.to(m.dtype))
+        # TensorRT output for the second input
+        out = m(x2.to(m.dtype))
         # Difference to PyTorch FP32
         d = max_diff(out, ref)
         # Verdict
         status = "OK  " if d <= TOLERANCE else "FAIL"
         # Report line
-        return "%s trtexec    %-15s max diff %.5f (%.2f px)" % (status, name, d, d * 112)
+        return "%s trtexec    %-19s max diff %.5f (%.2f px)" % (status, name, d, d * 112)
     # Report the error
     except Exception as e:
         # Short error line
-        return "FAIL trtexec    %-15s %r" % (name, e)
+        return "FAIL trtexec    %-19s %r" % (name, e)
 
 
 # Run every test and print a summary
@@ -211,10 +176,11 @@ def main():
         print("torch2trt %s" % folder)
         # Source of the cat converter
         cat_src = open(os.path.join(folder, "converters", "cat.py")).read()
-        # Constants are handled by trt_ (2019-09 .. 2020-08) or add_missing_trt_tensors (2020-09 on)
-        handles = "add_missing_trt_tensors" in cat_src or "trt_(" in cat_src
-        # Static verdict
-        print("torch2trt cat converter adds constants: %s" % ("yes" if handles else "NO (old version)"))
+        # Era of the converter: add_missing_trt_tensors (2020-09 on) or trt_ (2019-09 .. 2020-08)
+        era = ("2020-09 or newer" if "add_missing_trt_tensors" in cat_src else
+               "2019-09 .. 2020-08 (cat_const expected to fail)" if "trt_(" in cat_src else "before 2019-09")
+        # Show it
+        print("torch2trt cat converter: %s" % era)
     # Not installed
     except ImportError:
         # Show that it is missing
@@ -223,52 +189,68 @@ def main():
     if not torch.cuda.is_available():
         # Explain where to run it
         print("CUDA not available: run this on the JetBot. Only the PyTorch / ONNX side was checked.")
-    # The three candidate models, on the GPU when there is one
+    # Run on the GPU when there is one
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Fixed random input so results are reproducible
+    # Fixed random inputs so results are reproducible
     torch.manual_seed(0)
-    # One camera-sized input (batch 1)
-    x = torch.randn(1, 3, SIZE, SIZE, device=device)
-    # Name and model of every variant
-    models = [("cat_const", CatConst()), ("cat_expand", CatExpand()), ("resnet18_coord", ResNet18Coord())]
+    # Conversion input and comparison input (batch 1, camera size)
+    x, x2 = torch.randn(1, 3, SIZE, SIZE, device=device), torch.randn(1, 3, SIZE, SIZE, device=device)
+    # Pipeline networks with random weights, then the two probes
+    models = [(n, ARCHS[n].build(pretrained=False)) for n in
+              ("resnet18", "resnet18_coord", "resnet18_dsnt", "resnet18_coord_dsnt")]
+    # Probes
+    models += [("cat_const", CatConst()), ("cat_expand", CatExpand())]
     # Result lines
     lines = []
     # Temporary folder for ONNX / engine files
     workdir = tempfile.mkdtemp(prefix="coordcheck_")
-    # Test each variant
+    # Test each model
     for name, model in models:
+        # Give zero-initialised weights (CoordConv's extra channels) values so they matter,
+        # and sharpen DSNT heatmaps so the output depends on the image
+        with torch.no_grad():
+            # Every parameter
+            for p in model.parameters():
+                # All-zero weight tensors only
+                if p.dim() > 1 and not p.any():
+                    # Small random values
+                    p.normal_(0, 0.05)
+            # DSNT head
+            if hasattr(model, "head"):
+                # Peaked heatmap
+                model.head[-1].weight.mul_(40)
         # Evaluation mode on the chosen device
         model = model.to(device).eval()
-        # PyTorch FP32 reference output
+        # PyTorch FP32 reference output for the comparison input
         with torch.no_grad():
             # Reference
-            ref = model(x)
-        # The real model must also train with batches > 1
-        if name == "resnet18_coord":
+            ref = model(x2)
+        # The CoordConv networks must also train with batches > 1
+        if name.startswith("resnet18_coord"):
             # A batch of 4 must run in PyTorch (expand path)
             with torch.no_grad():
                 # Training-sized batch
                 model(torch.randn(4, 3, SIZE, SIZE, device=device))
             # Record that the training path works
-            lines.append("OK   pytorch    resnet18_coord batch 4 (training path)")
+            lines.append("OK   pytorch    %-19s batch 4 (training path)" % name)
         # TensorRT tests need CUDA
         if device.type == "cuda":
             # torch2trt, if installed
             try:
                 import torch2trt
                 # Convert and compare
-                lines.append(try_torch2trt(name, model, x, ref))
+                lines.append(try_torch2trt(name, model, x, ref, x2))
             # Not installed
             except ImportError:
                 # Report the skip
-                lines.append("SKIP torch2trt  %-15s (not installed)" % name)
+                lines.append("SKIP torch2trt  %-19s (not installed)" % name)
             # ONNX -> trtexec
-            lines.append(try_trtexec(name, model, x, ref, workdir))
+            lines.append(try_trtexec(name, model, x, ref, x2, workdir))
     # Summary
     print("\n".join(lines))
     # Interpretation
-    print("\nThe real model uses the resnet18_coord pattern: it can run on TensorRT if resnet18_coord is OK "
-          "on at least one path (torch2trt or trtexec).")
+    print("\nA network can run on TensorRT if it is OK on at least one path (torch2trt or trtexec); "
+          "cat_const / cat_expand are only diagnostics.")
 
 
 # Run when executed as a script

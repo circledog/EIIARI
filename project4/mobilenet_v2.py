@@ -26,8 +26,8 @@ NAME = "mobilenet_v2"
 FILE_TAG = "mobilenetv2"
 # Name shown in the live demo dropdown
 LABEL = "MobileNetV2"
-# state_dict key that only this network has; used to detect the architecture
-HEAD_KEY = "classifier.1.weight"
+# state_dict keys this network has; used by loader.detect_arch
+KEYS = ("classifier.1.weight",)
 
 
 # Create the stock torchvision MobileNetV2, with or without ImageNet weights

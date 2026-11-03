@@ -1,4 +1,5 @@
-"""Shared model loading for every network (``resnet18.py``, ``mobilenet_v2.py``).
+"""Shared model loading for every network (``resnet18.py``, ``mobilenet_v2.py``,
+``resnet18_coord.py``, ``resnet18_dsnt.py``, ``resnet18_coord_dsnt.py``).
 
 * ``build_model(arch)``         -- network for training (``ARCHS`` lists them).
 * ``detect_arch(state_dict)``   -- which network a state_dict belongs to.
@@ -10,7 +11,7 @@
 * ``list_models`` / ``read_meta`` / ``write_meta`` -- checkpoint + ``.json``.
 
 To add a network: write ``<name>.py`` with ``NAME``, ``FILE_TAG``, ``LABEL``,
-``HEAD_KEY``, ``DEFAULTS``, ``build(pretrained, num_outputs)`` and
+``KEYS``, ``DEFAULTS``, ``build(pretrained, num_outputs)`` and
 ``train(model, train_loader, val_loader, device, epochs, lr, tag)``, then add
 it to ``ARCHS``.
 
@@ -27,6 +28,12 @@ import torch.nn as nn
 import mobilenet_v2
 # Network definition: ResNet-18
 import resnet18
+# Network definition: ResNet-18 with coordinate channels (CoordConv)
+import resnet18_coord
+# Network definition: ResNet-18 with a heatmap / soft-argmax head (DSNT)
+import resnet18_dsnt
+# Network definition: CoordConv + DSNT
+import resnet18_coord_dsnt
 # Weights fingerprint, checked before loading
 from sanity import file_sha256
 
@@ -35,7 +42,7 @@ __all__ = ["ARCHS", "build_model", "detect_arch", "rebuild_from_state_dict", "lo
            "LoadedModel", "list_models", "read_meta", "write_meta"]
 
 # Registry of the supported networks, keyed by their --arch name
-ARCHS = {resnet18.NAME: resnet18, mobilenet_v2.NAME: mobilenet_v2}
+ARCHS = {m.NAME: m for m in (resnet18, mobilenet_v2, resnet18_coord, resnet18_dsnt, resnet18_coord_dsnt)}
 
 
 # Create a fresh network for training
@@ -51,16 +58,21 @@ def build_model(arch="resnet18", pretrained=True, num_outputs=2):
 
 # Work out which network a saved state_dict belongs to
 def detect_arch(state_dict):
-    """Name of the network a state_dict belongs to (from its head layer key)."""
-    # Try every registered network
-    for name, mod in ARCHS.items():
-        # Its output layer key is unique, so finding it identifies the network
-        if mod.HEAD_KEY in state_dict:
-            # Found the matching network
-            return name
-    # No known output layer key: not one of our networks
-    raise ValueError("unknown network: none of %s in the state_dict"
-                     % ", ".join(m.HEAD_KEY for m in ARCHS.values()))
+    """Name of the network a state_dict belongs to (from its characteristic keys).
+
+    A network matches when all of its ``KEYS`` are present; the variants add
+    keys to their base network (``resnet18_coord`` = ``fc.weight`` + ``coords``),
+    so the match with the most keys wins.
+    """
+    # Networks whose keys are all present
+    matches = [(len(m.KEYS), name) for name, m in ARCHS.items() if all(k in state_dict for k in m.KEYS)]
+    # None: not one of our networks
+    if not matches:
+        # List what was looked for
+        raise ValueError("unknown network: none of %s in the state_dict"
+                         % ", ".join("+".join(m.KEYS) for m in ARCHS.values()))
+    # The most specific match
+    return max(matches)[1]
 
 
 # Recreate a (possibly pruned) network from nothing but its weights

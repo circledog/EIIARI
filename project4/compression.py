@@ -66,8 +66,13 @@ def prune_model(model, ratio, round_to=8, inplace=False):
     # Example input used to trace the network
     example = _example_input(device)
 
-    # Never prune the output Linear layer: it must keep its 2 outputs
+    # Never prune the output Linear layers (they must keep their 2 outputs; DSNT's fixed
+    # upsample / expectation layers too), nor a heatmap head's 1-channel output conv
     ignored = [m for m in model.modules() if isinstance(m, nn.Linear)]
+    # DSNT networks: the last conv of the heatmap head produces exactly one map
+    if hasattr(model, "head"):
+        # Keep its output channel
+        ignored.append(model.head[-1])
     # Size of the network before pruning
     macs0, params0 = tp.utils.count_ops_and_params(model, example)
     # DepGraph pruner: L2 magnitude of each coupled channel group decides what goes

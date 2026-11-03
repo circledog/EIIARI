@@ -382,9 +382,49 @@ torch2trt 原始碼分析（github NVIDIA-AI-IOT/torch2trt，看歷史版本）�
 - 測三種寫法：A `cat_const`、B `cat_expand`（預期失敗）、C `resnet18_coord`（真正模型會用的寫法），每種都用 torch2trt FP16 和 ONNX→trtexec 轉換，和 PyTorch FP32 比較（容許 2 px）。
 - sandbox 只能跑 PyTorch／ONNX 的部分，已確認可以執行；**TensorRT 部分要使用者在車上跑**。
 
+## 第十六階段（移植隊友的 CoordConv / DSNT，並在沒有 GPU 的情況下驗證 TRT 轉換，2026-11-03）
+
+來源：使用者上傳的 `model_training_methods.zip`（隊友的訓練原始碼）。比較結果已回覆使用者：
+- zip 裡有三套流程：① `train.py`（RGB、AdamW、部分凍結、BN 固定、cosine、Huber、用 px 選模型；它的 `experiments.json` 沒附）② `course_comparison.py`（課堂配方）③ `spatial_comparison.py`（課堂配方 + CoordConv / DSNT / 兩者，seed 17/29/43）。
+- 資料切分和我們拿到的 `splits` 逐檔相同（277 / 60）。
+- ①的訓練技巧**還沒移植**，等使用者決定。
+
+新增三個網路（都用 `--arch` 選，每個網路一個檔）：
+- `resnet18_coord.py`：座標通道在模型裡加（buffer `coords`，(2,H,W)），`conv1` 5 通道，多出的權重從 0 開始。batch 1 用 `view` 接上座標圖，訓練 batch > 1 才 `expand`。
+- `resnet18_dsnt.py`：layer4 stride 1、1×1 卷積熱圖頭、28×28 softmax、期望座標；損失 MSE + 0.1·JS（`resnet18.train` 新增 `loss_fn` 參數）。bilinear 放大和期望值改成**固定不訓練的 Linear（bias 為 0）**，避開 `interpolate` 和 `torch.softmax`。
+- `resnet18_coord_dsnt.py`：兩者合併。
+- `loader.detect_arch` 改用各網路檔的 `KEYS`（全部存在、key 最多者勝出），取代 `HEAD_KEY`。
+- `compression.prune_model`：DSNT 熱圖頭最後一層（1 通道）不剪。
+
+PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
+- 座標圖 = 隊友 meshgrid（差 6e-8）；預訓練剛載入時 coord 輸出 = 普通 ResNet-18（差 0）。
+- DSNT 和隊友原寫法（interpolate + flatten softmax）差 < 3e-7，熱圖也一樣。
+- batch 4 和 batch 1 結果一致；5 種網路都能正確判斷；訓練後固定層和座標圖不變。
+- 剪枝 30% → 存檔 → 依形狀重建：差 0。MACs：coord 1.90G→0.89G、dsnt 3.06G→1.43G、coord_dsnt 3.14G→1.48G。
+- ONNX（opset 11）+ onnxruntime 差 < 3e-7；op 只有 Add/Concat/Constant/Conv/Flatten/Gemm/GlobalAveragePool/Identity/MaxPool/Relu/Reshape/Softmax。
+
+**離線 TRT 驗證**（使用者要求「一定有辦法，去查」）：新增 `check_trt_offline.py` + `fake_tensorrt/`。
+- 做法：用**真的 torch2trt 原始碼**（git checkout 指定版本），接上模擬的 TensorRT API；torch2trt 照常建網路，模擬器依 TensorRT 語意（implicit / explicit batch）用 PyTorch 逐層算出結果。
+- 用輸入 A 轉換、輸入 B 比對，所以被偷偷凍成常數的值也抓得到；torch2trt 印出 unsupported method 也判 FAIL；輸出幾乎不隨輸入變化時標 WEAK（測試權重太弱）。
+- 抓不到：Nano 上建 engine 的限制、FP16 誤差 → 車上 `check_trt_coord.py` 仍是最後確認。
+- 執行 GitHub 下載的 torch2trt 原始碼，使用者已同意（2026-11-03）。
+- 結果（torch2trt 2019-10、2020-05、2020-09、v0.2.0、v0.3.0、v0.4.0 × TensorRT 7.1.3 / 8.0.1）：
+
+  | 模型 | 結果 |
+  |---|---|
+  | resnet18、mobilenet_v2、resnet18_coord、resnet18_dsnt、resnet18_coord_dsnt | 全部 OK（誤差 ≤ 0.001 px） |
+  | 對照：直接 cat (1,2,H,W) 常數 | 2020-09 前 FAIL（常數保留 batch 維度，已從原始碼確認），之後 OK |
+  | 對照：expand 常數 | 全部 FAIL |
+  | 對照：`torch.softmax` | 全部 FAIL（被凍成常數，差 2.8 px） |
+  | 隊友原本的 DSNT | 2019 版被凍成常數（差 56 px），之後用到 resize（模擬器沒做；TensorRT 7 的 resize 沒有 half-pixel 模式） |
+
+  第一版模型（buffer (1,2,H,W)、Linear 無 bias）在 2019 版失敗，所以改成 `view` 和 bias=0 的寫法。torch2trt v0.5（2024，動態形狀）用到模擬器沒做的層，不在範圍內（JetPack 4 也不用它）。
+- `check_trt_coord.py`（車上）改成直接測 pipeline 的 4 個 ResNet 網路 + 2 個對照，同樣用兩組輸入比對。
+
 ## 未完成 / 未驗證
 
-- **CoordConv**（隊友的 5 通道輸入）沒有移植，等使用者決定。
+- 隊友 ① 流程的訓練技巧（部分凍結、AdamW、cosine、Huber、提早停止、用 px 選模型）沒有移植，等使用者決定。
+- CoordConv / DSNT 還沒有用真實資料完整訓練過，也還沒在車上轉 TRT（離線模擬全部 OK）。
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
 - **Nano 實測進度**：使用者在板子上跑過 live_demo，修好舊版 torchvision 的 `TypeError` 後，模型能載入、畫面能更新（第三階段）。以下**還沒在板子上驗證**：
   - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
@@ -430,4 +470,6 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 3. 板子上跑 `python3 convert_trt.py`，驗證 torch2trt 轉換和 sanity 比對（風險最高）；失敗就試 `--method trtexec`。驗證換模型的 flush。
 4. 在跑道上調控制參數（隊友的起始值還沒調過）；比較隊友公式和投影片公式。
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
-6. 決定要不要加 CoordConv（影響說明已回覆使用者，等決定）。pure pursuit：使用者決定**不做**（2026-11-03）。
+6. 車上跑 `python3 check_trt_coord.py`，確認 4 個 ResNet 網路在真的 TensorRT 上 OK（離線模擬已全部 OK）；結果貼回來。
+7. 用 `--arch resnet18_coord / resnet18_dsnt / resnet18_coord_dsnt` 正式訓練，和 resnet18 比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
+8. 決定要不要移植隊友 ① 的訓練技巧。pure pursuit：使用者決定**不做**（2026-11-03）。

@@ -21,8 +21,9 @@ NAME = "resnet18"
 FILE_TAG = "resnet18"
 # Name shown in the live demo dropdown
 LABEL = "ResNet18"
-# state_dict key that only this network has; used to detect the architecture
-HEAD_KEY = "fc.weight"
+# state_dict keys this network has; loader.detect_arch picks the network whose keys
+# are all present, preferring the one with the most keys (the variants add keys)
+KEYS = ("fc.weight",)
 
 
 # Create the stock torchvision ResNet-18, with or without ImageNet weights
@@ -56,12 +57,15 @@ DEFAULTS = {"epochs": 70, "lr": 1e-3, "finetune_epochs": 15, "finetune_lr": 1e-4
 
 
 # Train ResNet-18 and keep its best weights
-def train(model, train_loader, val_loader, device, epochs, lr, tag="resnet18"):
+def train(model, train_loader, val_loader, device, epochs, lr, tag="resnet18", loss_fn=None):
     """ResNet-18 training: Adam + MSE, keep the epoch with the lowest validation MSE.
 
     Used for the baseline and for fine-tuning after pruning (train.py passes
     the matching epochs / lr). Change the optimiser, loss or schedule here to
     customise ResNet-18 without affecting the other networks.
+    ``loss_fn(model, images, labels) -> loss`` replaces the MSE loss (used by
+    the ResNet-18 variants, e.g. DSNT's heatmap loss); model selection stays
+    on validation MSE.
     Returns (best validation metrics, per-epoch history).
     """
     # Adam optimiser, as in the course
@@ -82,8 +86,8 @@ def train(model, train_loader, val_loader, device, epochs, lr, tag="resnet18"):
             images, labels = images.to(device), labels.to(device)
             # Clear the gradients of the previous step
             optimizer.zero_grad()
-            # Mean squared error between prediction and label
-            loss = F.mse_loss(model(images), labels)
+            # Mean squared error between prediction and label, unless a variant brings its own loss
+            loss = loss_fn(model, images, labels) if loss_fn else F.mse_loss(model(images), labels)
             # Back-propagate
             loss.backward()
             # Update the weights

@@ -21,6 +21,10 @@ Examples
     # (validation picks the best epoch, test is scored once per saved model)
     python train.py --data data/splits --general --perlin --prune 0.3
 
+    # the teammate's variants (CoordConv / DSNT / both), same options as any network
+    python train.py --arch resnet18_coord --data data/splits --general --seeds 17 29 43
+    python train.py --arch resnet18_dsnt --data data/splits --general --prune 0.3
+
     # three training seeds on the same split: mean +- std for the report
     python train.py --data data/splits --general --seeds 0 1 2 --prune 0.3
 
