@@ -415,4 +415,4 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 3. 板子上跑 `python3 convert_trt.py`，驗證 torch2trt 轉換和 sanity 比對（風險最高）；失敗就試 `--method trtexec`。驗證換模型的 flush。
 4. 在跑道上調控制參數（隊友的起始值還沒調過）；比較隊友公式和投影片公式。
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
-6. 決定要不要加 CoordConv，以及要不要做 pure pursuit（需要量一次相機和地面的對應）。
+6. 決定要不要加 CoordConv（影響說明已回覆使用者，等決定）。pure pursuit：使用者決定**不做**（2026-11-03）。
