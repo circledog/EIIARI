@@ -364,8 +364,8 @@ def draw_overlay(frame, xy=None, steering=None):
     out = frame.copy()
     # Frame height and width
     h, w = out.shape[:2]
-    # Draw the target point when there is a prediction
-    if xy is not None:
+    # Draw the target point when there is a usable prediction (NaN / inf cannot be drawn)
+    if xy is not None and np.all(np.isfinite(np.asarray(xy, dtype=np.float64)[:2])):
         # Normalised x -> pixel column
         px = int(round((float(xy[0]) + 1) * w / 2.0))
         # Normalised y -> pixel row
@@ -375,7 +375,7 @@ def draw_overlay(frame, xy=None, steering=None):
         # Green dot on the target
         cv2.circle(out, (px, py), 5, (0, 255, 0), -1)
     # Draw the steering bar when a steering value is given
-    if steering is not None:
+    if steering is not None and np.isfinite(steering):
         # Bar starts at the horizontal centre
         cx = w // 2
         # Bar length proportional to steering, clamped to [-1, 1]

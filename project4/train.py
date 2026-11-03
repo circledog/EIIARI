@@ -1,8 +1,10 @@
 """PC training entry point: baseline -> DepGraph pruning -> finetune -> export.
 
 Preprocessing (lane marking) always runs, live inside the DataLoader after
-augmentation; nothing is written to disk. ``--arch`` picks the network
-(``resnet18.py`` / ``mobilenet_v2.py``).
+augmentation; nothing is written to disk. ``--arch`` picks the network; the
+training routine itself lives in that network's file (``resnet18.train`` /
+``mobilenet_v2.train``), together with its default epochs and learning rates.
+This script only decides *what* to run (task) and calls the network's code.
 
 Examples
 --------
@@ -19,6 +21,9 @@ Examples
     # (validation picks the best epoch, test is scored once per saved model)
     python train.py --data data/splits --general --perlin --prune 0.3
 
+    # three training seeds on the same split: mean +- std for the report
+    python train.py --data data/splits --general --seeds 0 1 2 --prune 0.3
+
     # prune an existing baseline without retraining it
     # (augmentation switches and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
@@ -28,16 +33,18 @@ Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``res
     <name>_base.pth / .json          baseline state_dict + metadata
     <name>_pruned30.pth / .json      pruned + finetuned state_dict + metadata
     <name>_*.onnx                    with --onnx (for trtexec on the Nano)
-The .json holds the loss history, MACs/params and data split for the report.
+    <name>_seeds.json                with several --seeds: mean / std per model
+With several seeds every file name gets ``_s<seed>`` (``resnet18_gen_s1_base.pth``).
+The .json holds the loss history, MSE and pixel errors (validation and test),
+MACs/params, data split, the weights' SHA256 and the sanity frames that
+``live_demo`` uses to check the model on the robot.
 """
 import argparse
-import copy
 import json
 import os
-import time
 
+import numpy as np
 import torch
-import torch.nn.functional as F
 
 # Pruning, size counting and ONNX export
 from compression import count_macs_params, export_onnx, prune_model
@@ -45,80 +52,15 @@ from compression import count_macs_params, export_onnx, prune_model
 from data_loader import DEFAULT_DATA_DIR, has_split_folders, make_loaders
 # Network registry, building, rebuilding from weights and .json handling
 from loader import ARCHS, build_model, detect_arch, read_meta, rebuild_from_state_dict, write_meta
+# MSE and pixel-error metrics
+from metrics import evaluate
 # Description of the lane-marking preprocessing, saved in every .json
 from preprocessing import CONFIG as PREPROCESSING
+# Weights fingerprint and sanity frames for the robot-side check
+from sanity import file_sha256, make_sanity
 
-
-# Average validation loss of a model
-def evaluate(model, loader, device):
-    # Evaluation mode (BatchNorm uses running statistics, no dropout)
-    model.eval()
-    # Summed loss and number of images
-    total, n = 0.0, 0
-    # No gradients needed for evaluation
-    with torch.no_grad():
-        # Every validation batch
-        for images, labels in loader:
-            # Move the batch to the training device
-            images, labels = images.to(device), labels.to(device)
-            # Summed squared error, halved so it equals the per-image mean over (x, y)
-            total += F.mse_loss(model(images), labels, reduction="sum").item() / 2.0
-            # Count the images
-            n += images.size(0)
-    # Mean loss per image (guard against an empty loader)
-    return total / max(n, 1)
-
-
-# Train a model and keep its best weights
-def fit(model, train_loader, val_loader, device, epochs, lr, tag):
-    """Adam + MSE, keep the weights with the lowest validation loss."""
-    # Adam optimiser, as in the course
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    # Best validation loss so far, its weights, and the per-epoch log
-    best_loss, best_state, history = float("inf"), None, []
-    # One iteration per epoch
-    for epoch in range(1, epochs + 1):
-        # Start time of the epoch
-        t0 = time.time()
-        # Training mode
-        model.train()
-        # Summed training loss and number of images
-        total, n = 0.0, 0
-        # Every training batch
-        for images, labels in train_loader:
-            # Move the batch to the training device
-            images, labels = images.to(device), labels.to(device)
-            # Clear the gradients of the previous step
-            optimizer.zero_grad()
-            # Mean squared error between prediction and label
-            loss = F.mse_loss(model(images), labels)
-            # Back-propagate
-            loss.backward()
-            # Update the weights
-            optimizer.step()
-            # Accumulate the loss weighted by batch size
-            total += loss.item() * images.size(0)
-            # Count the images
-            n += images.size(0)
-        # Mean training loss of the epoch
-        train_loss = total / max(n, 1)
-        # Validation loss after the epoch
-        val_loss = evaluate(model, val_loader, device)
-        # Log both losses for the report
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        # Marker printed next to a new best epoch
-        mark = ""
-        # New best validation loss
-        if val_loss < best_loss:
-            # Remember the loss and a copy of the weights
-            best_loss, best_state, mark = val_loss, copy.deepcopy(model.state_dict()), " *"
-        # Progress line
-        print("[%s] epoch %3d/%d  train %.5f  val %.5f  (%.1fs)%s"
-              % (tag, epoch, epochs, train_loss, val_loss, time.time() - t0, mark))
-    # Restore the best weights
-    model.load_state_dict(best_state)
-    # Best validation loss and the full log
-    return best_loss, history
+# Metrics summarised across seeds
+SUMMARY_KEYS = ("mse", "mean_px", "mae_x_px", "mae_y_px", "p95_px")
 
 
 # Text describing the augmentation, used in the dropdown label
@@ -127,10 +69,20 @@ def _variant_label(aug):
     return "aug=%s" % aug.tag()
 
 
+# Short text of a metrics dict for the log
+def _fmt(m):
+    # MSE and mean / p95 pixel error
+    return "mse %.5f, %.1f px (p95 %.1f px)" % (m["mse"], m["mean_px"], m["p95_px"])
+
+
 # Write a checkpoint, optionally its ONNX file, and its .json
-def save(model, path, meta, onnx):
+def save(model, path, meta, onnx, sanity_paths):
+    # Reference frames + outputs for the robot-side check
+    meta["sanity"] = make_sanity(model, sanity_paths)
     # Save the weights (state_dict)
     torch.save(model.state_dict(), path)
+    # Fingerprint of the saved weights
+    meta["weights_sha256"] = file_sha256(path)
     # Also export ONNX if requested
     if onnx:
         # Export next to the .pth and record the file name in the metadata
@@ -141,20 +93,136 @@ def save(model, path, meta, onnx):
     print("saved %s" % path)
 
 
-# Loss on the held-out test split, evaluated once per finished model
+# Metrics on the held-out test split, evaluated once per finished model
 def report_test(model, test_loader, device, tag):
-    """Test loss of the final (best-validation) weights, or None without a test split."""
+    """Test metrics of the final (best-validation) weights, or None without a test split."""
     # Nothing to evaluate without a test/ folder
     if test_loader is None:
         # Stored as null in the .json
         return None
-    # Average loss over the test images
-    loss = evaluate(model, test_loader, device)
-    # Show it next to the training log
-    print("[%s] test loss %.5f  (%d images, never used for training or model selection)"
-          % (tag, loss, len(test_loader.dataset)))
-    # Value for the .json
-    return loss
+    # Metrics over the test images
+    m = evaluate(model, test_loader, device)
+    # Show them next to the training log
+    print("[%s] test %s  (%d images, never used for training or model selection)"
+          % (tag, _fmt(m), len(test_loader.dataset)))
+    # Values for the .json
+    return m
+
+
+# Train (or load) the baseline and prune it, for one seed
+def run_seed(args, arch, seed, name, loaders, common, aug):
+    """Baseline + pruned models for one seed. Returns {tag: {"val": .., "test": ..}}."""
+    # Unpack the loaders
+    train_loader, val_loader, test_loader = loaders
+    # Training device
+    device = torch.device(args.device)
+    # Seed the weight initialisation and the augmentation randomness
+    torch.manual_seed(seed)
+    # Seed the shuffling order (the split itself stays fixed by --split-seed)
+    train_loader.generator.manual_seed(seed)
+    # Validation images whose outputs are stored for the robot-side check
+    sanity_paths = val_loader.dataset.image_paths
+    # Metadata shared by this seed's models
+    common = dict(common, seed=seed)
+    # Results per model tag for the seed summary
+    results = {}
+
+    # ---- baseline --------------------------------------------------------- #
+    # Prune an existing baseline
+    if args.base:
+        # Rebuild the baseline network from its weights
+        model = rebuild_from_state_dict(torch.load(args.base, map_location="cpu")).to(device)
+        # Its metadata
+        base_meta = read_meta(args.base)
+        # Its file
+        base_path = args.base
+        # Show its validation metrics on the current split
+        print("loaded baseline %s (val %s)" % (args.base, _fmt(evaluate(model, val_loader, device))))
+        # Also show its test metrics when there is a test split
+        report_test(model, test_loader, device, "base")
+    # Train a new baseline
+    else:
+        # Fresh network (ImageNet weights unless --no-pretrained)
+        model = build_model(args.arch, pretrained=not args.no_pretrained).to(device)
+        # The network's own training routine
+        best, history = arch.train(model, train_loader, val_loader, device, args.epochs, args.lr, "base")
+        # Test metrics of the chosen weights
+        test = report_test(model, test_loader, device, "base")
+        # Its size
+        macs, params = count_macs_params(model)
+        # Metadata of the baseline
+        base_meta = dict(common, label="%s | %s | no compression" % (arch.LABEL, _variant_label(aug)),
+                         compression=None, epochs=args.epochs, lr=args.lr,
+                         best_val_loss=best["mse"], val_metrics=best,
+                         test_loss=test["mse"] if test else None, test_metrics=test,
+                         macs=macs, params=params, history=history)
+        # File of the baseline
+        base_path = os.path.join(args.out, name + "_base.pth")
+        # Save it
+        save(model, base_path, base_meta, args.onnx, sanity_paths)
+        # Remember the result for the seed summary
+        results["base"] = {"val": best, "test": test}
+
+    # ---- DepGraph pruning + finetune -------------------------------------- #
+    # One pruned model per ratio
+    for ratio in args.prune:
+        # Prune a copy of the baseline
+        pruned, info = prune_model(model, ratio, round_to=args.round_to)
+        # Make sure it is on the training device
+        pruned = pruned.to(device)
+        # Validation MSE right after pruning, before fine-tuning
+        before = evaluate(pruned, val_loader, device)["mse"]
+        # Report the size reduction
+        print("pruned %.0f%%: MACs %.2fG -> %.2fG, params %.2fM -> %.2fM, val before finetune %.5f"
+              % (ratio * 100, info["macs_before"] / 1e9, info["macs_after"] / 1e9,
+                 info["params_before"] / 1e6, info["params_after"] / 1e6, before))
+        # File suffix, e.g. "pruned30"
+        tag = "pruned%02d" % round(ratio * 100)
+        # Fine-tune with the network's own training routine
+        best, history = arch.train(pruned, train_loader, val_loader, device,
+                                   args.finetune_epochs, args.finetune_lr, tag)
+        # Test metrics of the chosen weights
+        test = report_test(pruned, test_loader, device, tag)
+        # Metadata of the pruned model
+        meta = dict(common, label="%s | %s | DepGraph %d%%" % (arch.LABEL, _variant_label(aug),
+                                                              round(ratio * 100)),
+                    compression=dict(info, method="DepGraph", importance="GroupMagnitude(p=2)"),
+                    base=os.path.basename(base_path), base_val_loss=base_meta.get("best_val_loss"),
+                    val_loss_before_finetune=before, epochs=args.finetune_epochs, lr=args.finetune_lr,
+                    best_val_loss=best["mse"], val_metrics=best,
+                    test_loss=test["mse"] if test else None, test_metrics=test,
+                    macs=info["macs_after"], params=info["params_after"], history=history)
+        # Save it
+        save(pruned, os.path.join(args.out, "%s_%s.pth" % (name, tag)), meta, args.onnx, sanity_paths)
+        # Remember the result for the seed summary
+        results[tag] = {"val": best, "test": test}
+    # Results of this seed
+    return results
+
+
+# Mean / std of every metric across seeds
+def summarise(per_seed):
+    """``{tag: {"val": {metric: {mean, std, values}}, "test": ...}}`` from per-seed results."""
+    # Summary per model tag
+    out = {}
+    # Every model tag (base, pruned30, ...) of the first seed
+    for tag in per_seed[0][1]:
+        # Summary of this tag
+        out[tag] = {}
+        # Validation and test separately
+        for split in ("val", "test"):
+            # Metrics of every seed that has them
+            runs = [r[tag][split] for _, r in per_seed if r.get(tag, {}).get(split)]
+            # Skip a split that was not evaluated (no test folder)
+            if not runs:
+                # Nothing to summarise
+                continue
+            # Mean, sample standard deviation and raw values per metric
+            out[tag][split] = {k: {"mean": float(np.mean([m[k] for m in runs])),
+                                   "std": float(np.std([m[k] for m in runs], ddof=1)) if len(runs) > 1 else 0.0,
+                                   "values": [m[k] for m in runs]} for k in SUMMARY_KEYS}
+    # Summary of all tags
+    return out
 
 
 # Command-line training pipeline
@@ -180,9 +248,9 @@ def main():
     # Switch: compression artefacts
     g.add_argument("--compression", action="store_true", help="JPEG / 144p artefacts")
     # Baseline training epochs
-    ap.add_argument("--epochs", type=int, default=70)
+    ap.add_argument("--epochs", type=int, default=None, help="default: the network's DEFAULTS")
     # Baseline learning rate
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=None, help="default: the network's DEFAULTS")
     # Batch size
     ap.add_argument("--batch-size", type=int, default=8)
     # Share of images used for validation
@@ -197,8 +265,11 @@ def main():
                     help="seconds between captures that start a new segment (--split session)")
     # DataLoader worker processes
     ap.add_argument("--workers", type=int, default=4)
-    # Random seed for split, shuffling and initialisation
-    ap.add_argument("--seed", type=int, default=0)
+    # Training seeds: one full run (baseline + pruning) per seed
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0],
+                    help="training seeds, e.g. 0 1 2: one run each + mean/std summary")
+    # Seed of the random / session split (kept fixed across --seeds)
+    ap.add_argument("--split-seed", type=int, default=0, help="seed of the train/val split")
     # Existing baseline to prune instead of training a new one
     ap.add_argument("--base", default=None, help="existing baseline .pth: skip baseline training")
     # Pruning ratios (one pruned model per ratio)
@@ -206,9 +277,9 @@ def main():
     # Channel counts after pruning are rounded to a multiple of this
     ap.add_argument("--round-to", type=int, default=8)
     # Fine-tuning epochs after pruning
-    ap.add_argument("--finetune-epochs", type=int, default=15)
+    ap.add_argument("--finetune-epochs", type=int, default=None, help="default: the network's DEFAULTS")
     # Fine-tuning learning rate
-    ap.add_argument("--finetune-lr", type=float, default=1e-4)
+    ap.add_argument("--finetune-lr", type=float, default=None, help="default: the network's DEFAULTS")
     # Also export ONNX files
     ap.add_argument("--onnx", action="store_true", help="also export ONNX (opset 11)")
     # Testing only: random initialisation instead of ImageNet weights
@@ -218,10 +289,10 @@ def main():
     # Parse the command line
     args = ap.parse_args()
 
-    # Seed torch for reproducible initialisation
-    torch.manual_seed(args.seed)
-    # Training device
-    device = torch.device(args.device)
+    # One existing baseline cannot stand for several seeds
+    if args.base and len(args.seeds) > 1:
+        # Explain the conflict
+        ap.error("--base uses one existing baseline; give a single --seeds value")
     # Create the output folder if needed
     os.makedirs(args.out, exist_ok=True)
 
@@ -247,6 +318,15 @@ def main():
             # Strip the "_base" suffix
             args.name = stem[:-len("_base")]
 
+    # Module of the chosen network (training routine, defaults, names)
+    arch = ARCHS[args.arch]
+    # Fill every training setting that was not given from the network's defaults
+    for key in ("epochs", "lr", "finetune_epochs", "finetune_lr"):
+        # Only settings left at None
+        if getattr(args, key) is None:
+            # Take the network's default
+            setattr(args, key, arch.DEFAULTS[key])
+
     # The team's sub-folders decide the split; --split / --val-ratio do not apply
     if has_split_folders(args.data) and (args.split != "random" or args.val_ratio != 0.1):
         # Tell the user their split options are ignored
@@ -254,13 +334,11 @@ def main():
     # Training / validation / test loaders (lane marking happens inside)
     train_loader, val_loader, test_loader, aug = make_loaders(
         args.data, general=args.general, perlin=args.perlin, compression=args.compression,
-        val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.seed,
+        val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.split_seed,
         split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap)
-    # Module of the chosen network (names and labels)
-    arch = ARCHS[args.arch]
     # Run name, e.g. "mobilenetv2_gen"
     name = args.name or "%s_%s" % (arch.FILE_TAG, aug.tag())
-    # Metadata shared by the baseline and the pruned models
+    # Metadata shared by every model of this run
     common = {
         "arch": args.arch,
         "preprocessing": PREPROCESSING,
@@ -269,74 +347,55 @@ def main():
         "data": os.path.abspath(args.data),
         "n_train": len(train_loader.dataset), "n_val": len(val_loader.dataset),
         "n_test": len(test_loader.dataset) if test_loader is not None else 0,
-        "val_ratio": args.val_ratio, "seed": args.seed, "batch_size": args.batch_size,
+        "val_ratio": args.val_ratio, "split_seed": args.split_seed, "batch_size": args.batch_size,
         "split": train_loader.split_info,
     }
     # Summary of the setup
     print("data: %d train / %d val / %d test, %s, %r, lane marking on, device %s"
-          % (common["n_train"], common["n_val"], common["n_test"], arch.LABEL, aug, device))
+          % (common["n_train"], common["n_val"], common["n_test"], arch.LABEL, aug, args.device))
     # How the data was split
     print("split: %s" % train_loader.split_info)
+    # Training settings in use
+    print("training: %d epochs lr %g, finetune %d epochs lr %g, seeds %s"
+          % (args.epochs, args.lr, args.finetune_epochs, args.finetune_lr, args.seeds))
+    # (seed, results) of every run
+    per_seed = []
+    # One full run per seed
+    for seed in args.seeds:
+        # Several seeds: separate file names per seed
+        run_name = name if len(args.seeds) == 1 else "%s_s%d" % (name, seed)
+        # Mark the start of the seed in the log
+        if len(args.seeds) > 1:
+            # Header line
+            print("==== seed %d (%s) ====" % (seed, run_name))
+        # Baseline + pruning for this seed
+        results = run_seed(args, arch, seed, run_name, (train_loader, val_loader, test_loader),
+                           common, aug)
+        # Keep the results
+        per_seed.append((seed, results))
 
-    # ---- baseline --------------------------------------------------------- #
-    # Prune an existing baseline
-    if args.base:
-        # Rebuild the baseline network from its weights
-        model = rebuild_from_state_dict(torch.load(args.base, map_location="cpu")).to(device)
-        # Its metadata
-        base_meta = read_meta(args.base)
-        # Its file
-        base_path = args.base
-        # Show its validation loss on the current split
-        print("loaded baseline %s (val %.5f)" % (args.base, evaluate(model, val_loader, device)))
-        # Also show its test loss when there is a test split
-        report_test(model, test_loader, device, "base")
-    # Train a new baseline
-    else:
-        # Fresh network (ImageNet weights unless --no-pretrained)
-        model = build_model(args.arch, pretrained=not args.no_pretrained).to(device)
-        # Train it
-        best, history = fit(model, train_loader, val_loader, device, args.epochs, args.lr, "base")
-        # Its size
-        macs, params = count_macs_params(model)
-        # Metadata of the baseline
-        base_meta = dict(common, label="%s | %s | no compression" % (arch.LABEL, _variant_label(aug)),
-                         compression=None, epochs=args.epochs, lr=args.lr,
-                         best_val_loss=best, test_loss=report_test(model, test_loader, device, "base"),
-                         macs=macs, params=params, history=history)
-        # File of the baseline
-        base_path = os.path.join(args.out, name + "_base.pth")
-        # Save it
-        save(model, base_path, base_meta, args.onnx)
-
-    # ---- DepGraph pruning + finetune -------------------------------------- #
-    # One pruned model per ratio
-    for ratio in args.prune:
-        # Prune a copy of the baseline
-        pruned, info = prune_model(model, ratio, round_to=args.round_to)
-        # Make sure it is on the training device
-        pruned = pruned.to(device)
-        # Validation loss right after pruning, before fine-tuning
-        before = evaluate(pruned, val_loader, device)
-        # Report the size reduction
-        print("pruned %.0f%%: MACs %.2fG -> %.2fG, params %.2fM -> %.2fM, val before finetune %.5f"
-              % (ratio * 100, info["macs_before"] / 1e9, info["macs_after"] / 1e9,
-                 info["params_before"] / 1e6, info["params_after"] / 1e6, before))
-        # File suffix, e.g. "pruned30"
-        tag = "pruned%02d" % round(ratio * 100)
-        # Fine-tune the pruned network
-        best, history = fit(pruned, train_loader, val_loader, device,
-                            args.finetune_epochs, args.finetune_lr, tag)
-        # Metadata of the pruned model
-        meta = dict(common, label="%s | %s | DepGraph %d%%" % (arch.LABEL, _variant_label(aug), round(ratio * 100)),
-                    compression=dict(info, method="DepGraph", importance="GroupMagnitude(p=2)"),
-                    base=os.path.basename(base_path), base_val_loss=base_meta.get("best_val_loss"),
-                    val_loss_before_finetune=before, epochs=args.finetune_epochs, lr=args.finetune_lr,
-                    best_val_loss=best, test_loss=report_test(pruned, test_loader, device, tag),
-                    macs=info["macs_after"], params=info["params_after"],
-                    history=history)
-        # Save it
-        save(pruned, os.path.join(args.out, "%s_%s.pth" % (name, tag)), meta, args.onnx)
+    # Mean / std across seeds when there are several
+    if len(args.seeds) > 1:
+        # Summary per model
+        summary = summarise(per_seed)
+        # Summary file next to the models
+        path = os.path.join(args.out, name + "_seeds.json")
+        # Write it with the run settings
+        with open(path, "w") as f:
+            # Seeds, shared metadata and the statistics
+            json.dump({"name": name, "seeds": args.seeds, "summary": summary,
+                       "settings": {k: v for k, v in common.items()}}, f, indent=2, ensure_ascii=False)
+        # Readable table: model, split, mean +- std of MSE and pixel error
+        for tag, splits in summary.items():
+            # Validation and test rows
+            for split, stats in splits.items():
+                # One row
+                print("%-10s %-4s mse %.5f +- %.5f | mean %.1f +- %.1f px | p95 %.1f +- %.1f px"
+                      % (tag, split, stats["mse"]["mean"], stats["mse"]["std"],
+                         stats["mean_px"]["mean"], stats["mean_px"]["std"],
+                         stats["p95_px"]["mean"], stats["p95_px"]["std"]))
+        # Where the summary went
+        print("seed summary -> %s" % path)
 
     # Machine-readable summary of where the files went
     print(json.dumps({"out": args.out, "name": name}, indent=None))

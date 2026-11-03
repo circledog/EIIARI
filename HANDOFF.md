@@ -16,14 +16,17 @@ Camera Input → Model inferencing → Motor controlling                       (
 | `data_loader.py` | `XYDataset`，路徑參數，預設 `data/dataset_xy_2026-10-21/dataset_xy` |
 | `preprocessing.py` | 只做車道線標示：白膠帶塗成紅色，彎道也適用；固定開啟、即時做、不存檔。訓練在 DataLoader 裡（augmentation 之後）呼叫 `mark_lanes_pil()`，車上用 `apply_frame()` |
 | `augmentation.py` | 三組開關：一般（幾何＋色彩）、柏林噪聲、壓縮失真（JPEG / 144p）。全關＝原樣輸出 |
-| `resnet18.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)` |
-| `mobilenet_v2.py` | MobileNetV2（ImageNet pretrained）+ `classifier[1]=Linear(1280,2)` |
+| `resnet18.py` | ResNet-18（ImageNet pretrained）+ `fc=Linear(512,2)`，加上它自己的 `train()` 和 `DEFAULTS` |
+| `mobilenet_v2.py` | MobileNetV2（ImageNet pretrained）+ `classifier[1]=Linear(1280,2)`，加上它自己的 `train()` 和 `DEFAULTS` |
+| `metrics.py` | MSE 和像素誤差（平均、x／y、p95） |
+| `sanity.py` | 權重 SHA256、訓練時存的比對畫面與車上比對 |
+| `convert_trt.py` | 車上把 `models/` 的模型轉成 TensorRT 放到 `models_trt/`，並比對、計時 |
 | `loader.py` | 共用：`build_model(arch)`、`detect_arch`、依 state_dict 重建剪枝後網路、PyTorch／TRT 載入、`.json` |
 | `compression.py` | DepGraph 剪枝（torch-pruning `MetaPruner` + `GroupMagnitudeImportance(p=2)`）、MACs/params、ONNX 匯出、engine 包裝 |
 | `camera.py` | 相機輸入（jetbot.Camera / OpenCV / 假畫面）與前處理 |
-| `control.py` | 投影片 P.69–75 的 PD + bias 差速（拮抗）控制 |
-| `train.py` | PC 訓練入口：訓練 baseline → 剪枝 → finetune → 匯出 |
-| `live_demo.ipynb` | Nano 上推論＋控制，UI 切換模型、即時畫面、馬達參數 |
+| `control.py` | 轉向角（預設隊友公式，可切投影片公式）＋ PID ＋ 平滑＋差速控制（第十四階段） |
+| `train.py` | PC 訓練入口：依任務呼叫各網路的 `train()`；baseline → 剪枝 → finetune → 匯出，可多 seed |
+| `live_demo.ipynb` | Nano 上推論＋控制，只列 TensorRT 模型，「開始行駛／停止」按鈕、安全機制 |
 
 ## 重要決策
 
@@ -35,7 +38,7 @@ Camera Input → Model inferencing → Motor controlling                       (
 - 現有資料集只有 jpg、沒有 metadata → 預設 train/val 隨機 9:1（固定 seed）。之後新拍的資料連 `metadata/` 一起複製，就可以用 `--split session` 照拍攝段落切（第六階段）。
 - Nano 是 **Python 3.6.9**（原本收集 notebook 的 metadata 寫的），板子會 import 的模組保持 3.6 相容：不用 dataclass、walrus、`from __future__ import annotations`、`list[int]` 型別、`datetime.fromisoformat`。
 - 前處理固定開啟、沒有開關、不存檔。訓練順序是「讀圖 → augmentation → 標車道線」，車上是「相機 → 輸入干擾 → 標車道線」，噪聲對偵測的影響兩邊一致（第十一階段）。
-- 控制的髮夾彎擴充（轉彎減速、內側輪反轉）預設關閉，關閉時和投影片公式完全一樣（第四階段）。
+- 控制改用隊友的公式和控制器（第十四階段，取代第四階段「預設和投影片完全一樣」）；投影片公式保留成介面上的切換按鈕。
 - 換模型後清空相機佇列：jetbot 來源用重啟管線，另外提供 `'csi'`（`drop=true`）來源（第四階段）。
 - 資料收集不在這個分支的範圍：收集 notebook（隊友版與課程原始版）、`lane_label.py`、`使用說明.txt` 都已刪除（第八階段）。第六、七階段的紀錄保留作歷史，內容要看 git 歷史（`14f384d` 之前）。
 - 前處理**只做車道線標示**（第九階段，取代第五、八階段的 ROI／固定 y／排除清單）：逐像素偵測白膠帶並塗成純紅色疊在原圖上，模型仍吃 3 通道彩色圖；不用直線擬合，所以彎道可以用。標籤（檔名的綠點）只用來檢查偵測結果，偵測本身不依賴它，因為車上推論時沒有標籤。
@@ -50,19 +53,15 @@ Camera Input → Model inferencing → Motor controlling                       (
 - augmentation 驗證：幾何變換後標籤誤差平均 0.65 px（最大 2.1 px，來自點的取樣）；全關時回傳同一個物件。
 - 之後的修改依序寫在下方「第二階段」到「第七階段」。
 
-## live_demo.ipynb 功能（目前版本）
+## live_demo.ipynb 功能（目前版本，第十四階段）
 
-- 下拉選單切換 `models/*.pth`（顯示 `.json` 裡的 label、params、MACs、val loss）；PyTorch 和 TRT `.pth` 自動判斷，TRT 的輸入 dtype 從 engine 讀。
-- 即時畫面＋預測點＋steering 條；x、y、angle、steering、左右馬達、P、D、FPS、推論延遲。
-- 投影片四個滑桿（speed gain、steering gain、kd、bias）。
-- 「允許移動」預設關閉；「停止」立刻停車並取消許可；切換模型時停車、**取消允許移動**、reset 控制器。
-- 「輸入干擾」：在即時畫面上加柏林噪聲／壓縮失真，測穩健性（額外加的功能）。
-- 「錄製 CSV」寫到 `runs/drive_*.csv`；第 5 節 `benchmark()` 在相同條件下量所有模型的延遲，供報告使用。
-- `CAMERA_SOURCE='dummy'` 或 `'folder'` 加上 `USE_ROBOT=False`，沒有 JetBot 也能跑。
-- 髮夾彎擴充：「轉彎減速 k」滑桿、「內側輪可反轉」勾選框（預設關閉）；左右馬達讀數 −1~1，另外顯示實際 speed。
-- 換模型：載入 → warmup → `camera.flush()`（`FLUSH_ON_SWITCH`）；畫面更新上限 `DISPLAY_FPS=15`。
-- 每幀固定套用前處理（標示車道線）；畫面顯示模型實際看到的影像；延遲數字包含前處理；舊模型的 `.json` 沒有 `lane_marking` 時在資訊列顯示紅字警告。
-- 推論迴圈出錯時，模型選單下方會顯示紅字和 traceback；第 6 節「結束」是按鈕（Run All 不會關掉相機），按過之後再按開始會提示要 Restart Kernel。
+- 下拉選單只列 `models_trt/` 的 TensorRT 模型，一開始「未載入模型」，選了才載入；載入完成就開始推論，停車時也繼續推論。
+- 載入時跑 sanity 比對（綠＝通過、紅＝沒通過→禁止開車、橘＝舊模型沒有比對資料）。`.json` 有 SHA256 時先比對，不對就拒絕載入。
+- 「開始行駛」單一按鈕：綠色「開始行駛」↔ 紅色「停止」；安全機制停車時自動變回綠色並顯示原因。「開始推論」按鈕已移除。
+- 安全機制（開車時）：輸出 NaN／超出畫面／目標太近、相機沒有新畫面、看門狗逾時（滑桿可調，預設 0.5 秒）、推論錯誤（停車並卸載模型）、切換模型。
+- 控制選項全部是按鈕或滑桿：轉向角公式、max／min speed、kp、ki、kd、bias、轉彎減速、角度平滑、馬達變化率、馬達上限、內側輪可反轉、安全逾時、輸入干擾、錄製 CSV。
+- 偵測不到 JetBot 就用假馬達；鏡頭打不開就顯示「未連接鏡頭」。沒有車也能看介面。
+- 第 5 節 `benchmark()` 會先停車、暫停迴圈，量完自動恢復。第 6 節「結束」按鈕釋放相機。
 
 ## 使用流程
 
@@ -70,32 +69,19 @@ PC / Colab（`pip install -r requirements-pc.txt`）：
 
 ```bash
 cd project4
-python train.py --prune 0.3 0.5 --onnx                                   # 無 augmentation
-python train.py --general --prune 0.3 0.5 --onnx                         # 一般做法
-python train.py --general --perlin --prune 0.3 0.5 --onnx                # + 柏林噪聲
-python train.py --general --perlin --compression --prune 0.3 0.5 --onnx  # + 壓縮失真
-# 產出 models/resnet18_<aug>_{base,pruned30,pruned50}.{pth,json,onnx}
+python train.py --data data/splits --general --perlin --prune 0.3 0.5           # 產出 models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json}
+python train.py --data data/splits --arch mobilenet_v2 --general --prune 0.3
+python train.py --data data/splits --general --seeds 0 1 2 --prune 0.3          # 多 seed：平均 ± 標準差
+python preprocessing.py review --data <資料夾>                                  # 前處理後的圖 + 標籤總覽
 ```
 
-Nano：把 `models/*.pth`、`*.json`、`*.onnx` 和 `project4/*.py`、`live_demo.ipynb` 同步到板子後：
+Nano：把 `project4/*.py`、`live_demo.ipynb` 同步到板子，PC 的 `models/*.pth` 和同名 `.json` 放到板子的 `models/`，然後：
 
 ```bash
-/usr/src/tensorrt/bin/trtexec --onnx=models/X.onnx --saveEngine=models/X.engine --fp16
-python3 -c "from compression import wrap_trt_engine as w; w('models/X.engine','models/X_trt.pth')"
-# wrap_trt_engine 會自動把 models/X.json 複製成 X_trt.json，label 加上 ' | TensorRT'
+python3 convert_trt.py          # 轉成 TensorRT 放到 models_trt/，每個模型顯示 PASSED / FAILED
 ```
 
-然後開 `live_demo.ipynb` 由上往下執行。`models/` 裡 PyTorch 和 TRT 的 `.pth` 會一起出現在下拉選單。
-
-前處理（標示車道線）與照段落切分（PC）：
-
-```bash
-python preprocessing.py review --data <資料夾>                          # 前處理後的圖 + 標籤總覽
-python preprocessing.py review --data <資料夾> --model models/X.pth     # 依模型誤差排序
-python train.py --data <資料夾> --general --prune 0.3 0.5 --onnx
-python train.py --data <資料夾> --arch mobilenet_v2 --general --prune 0.3 0.5 --onnx
-python train.py --split session --general ...                           # 需要 dataset_xy 旁邊的 metadata/
-```
+再開 `live_demo.ipynb` 由上往下執行。
 
 完整的車子操作步驟（DEMO 前一天建 engine、當天架高測試、調參順序、疑難排解）都寫在 `project4/README.md`。
 
@@ -335,8 +321,55 @@ python train.py --split session --general ...                           # 需要
 - 註解規則檢查（data_loader、train、live_demo）：0 個問題。✅
 - sandbox 的共享記憶體太小，batch 32 加上多個 worker 會出現 `No space left on device (shm)`；這是 sandbox 的限制，PC 不受影響，改用 `--workers 0` 測。
 
+## 第十四階段（移植隊友部署包的功能、重構訓練、新版 live_demo、TRT 轉換腳本，2026-11-03）
+
+使用者提供隊友的部署包 `jetbot_bundle_spatial_single.zip`（只有部署用程式，沒有訓練程式；壓縮檔裡少了權重檔 `best_steering_model_xy.pth`）。比較後使用者決定全部移植。使用者的要求和決定：
+- 每個網路的訓練流程寫在各自的檔案裡，成為一個函式；`train.py` 依任務呼叫不同網路。
+- 多 seed 訓練做成 parser 選項。
+- 控制選項一律是按鈕或滑桿。控制公式先用隊友的。
+- `live_demo`：「允許移動」改成單一按鈕（按一下開始、再按一下停止，顏色和文字跟著變）；載入模型就開始推論，停車不停推論；移除「開始推論」按鈕；沒有車也要能看介面；沒有鏡頭時顯示「未連接鏡頭」；一開始顯示「未載入模型」，等使用者選。
+- **下拉選單只列 TRT 模型**。新增車上轉換用的 `.py`；上傳的模型和轉換後的模型放在兩個資料夾（`models/`、`models_trt/`），都進 gitignore。
+- CoordConv 沒有移植（第一題使用者沒有回答，之後要的話再加）。
+
+改動：
+- `resnet18.py`、`mobilenet_v2.py`：新增 `DEFAULTS`（epochs 70、lr 1e-3、finetune 15 / 1e-4）和 `train()`（Adam + MSE，依 validation MSE 保留最好的 epoch，記錄 val 像素誤差）。
+- `metrics.py`（新）：`evaluate()` 回傳 mse、mae_x_px、mae_y_px、mean_px、p95_px（1 單位 = 112 px）。`mse` 和舊版 `evaluate` 的數值相同。
+- `sanity.py`（新）：`file_sha256`、`make_sanity`（8 張 validation 畫面，標完車道線後存 PNG base64，加上 CPU FP32 的輸出）、`check`（FP32 容許 1 px，FP16／TRT 容許 2 px；結果是 passed／failed／missing）。
+- `train.py`：
+  - 改成呼叫 `arch.train()`；`--epochs` 等參數不給時用網路的 `DEFAULTS`。
+  - `--seeds`（多 seed，檔名加 `_s<seed>`，輸出 `<name>_seeds.json` 平均 ± 標準差）。`--split-seed` 取代 `--seed`，切分保持固定。
+  - `.json` 新增 `val_metrics`、`test_metrics`、`weights_sha256`、`sanity`（約 0.9 MB）。`best_val_loss`、`test_loss` 保留（MSE）。
+  - `--base` 不能和多個 seed 一起用。
+- `loader.load_model`：`.json` 有 `weights_sha256` 時先比對。`compression.wrap_trt_engine` 會寫入新檔的 SHA256。
+- `control.py`：改寫成 `SteeringController.update(xy, now) -> (left, right, status)`。隊友公式（預設）／投影片公式、角度低通、PID（D 為每秒、I 限制 ±0.3）、速度介於 min／max、轉彎減速、slew、馬達上限 0.4、內側輪反轉；NaN／超出範圍／目標太近時回傳非 ok。`PDController` 和 `model_output_to_xy` 已移除。
+- `convert_trt.py`（新，車上用）：預設 torch2trt（FP16，從 `.pth` 重建）；`--method trtexec`（需要 `.onnx`）。先檢查來源 SHA256 → 轉換 → 寫 `.json`（label 加「| TensorRT」、新 SHA256）→ 從硬碟重新載入 → sanity 比對 → 量延遲 → 寫入 `trt_validation`。已轉過的會跳過（`--force` 重轉）；一個失敗不影響其他。
+- `live_demo.ipynb`：重寫，功能見上方「live_demo.ipynb 功能」。
+- `camera.draw_overlay`：預測是 NaN／inf 時不畫（見下方「已測」）。
+- `.gitignore` 加上 `/models_trt/`。README 全面更新。
+
+**更正**：上一輪我跟使用者說投影片公式在目標點偏低時「目標在右卻往左轉」，這是錯的。實際上分母變負時，角度會超過 ±90°（轉太多），只有 x 接近 0 時才會在 ±180° 之間跳。`control.py` 的 docstring 和 README 已經寫成正確的說法。
+
+**控制公式會不會影響訓練**：不會。模型學的是畫面到目標點，和控制無關，換公式不用重新訓練。
+
+已測（sandbox，CPU）：
+- `train.py --data splits --arch mobilenet_v2 --epochs 1 --prune 0.3 --finetune-epochs 1 --seeds 0 1 --onnx`：兩個 seed 都完成，印出 val／test 的平均 ± 標準差，`_seeds.json` 有寫出。seed 0 的 val MSE 和上一輪單 seed 相同（0.14252），可以重現。✅
+- sanity：同一個模型差 0.000 px（通過）；換成另一個 seed 的權重差 24.4 px（失敗）；`.pth` 換掉但 `.json` 沒換時，SHA256 拒絕載入。✅
+- 控制：目標在右邊時左輪比較快、在左邊時右輪比較快；NaN／超出範圍／目標太近時回傳 0 和原因；起步有 slew 漸增；max speed 0 → 不動。✅
+- `convert_trt.py` 用**假的 torch2trt**（輸出加 1e-3 雜訊模擬 FP16）測流程：兩個模型 PASSED（約 0.2 px）、壞檔回報 SHA256 錯誤且不影響其他、第二次執行會跳過、`list_models` 顯示「| TensorRT」。✅
+- `live_demo` 用 nbclient 跑兩種情境（假 TRT 模型）：
+  - 沒有鏡頭：顯示「未連接鏡頭」佔位圖；載入模型、比對通過；按開始行駛顯示「未連接鏡頭，無法開車」。✅
+  - 輪播資料夾：未選模型時無法開車 → 載入、比對通過 → 開始行駛（按鈕變紅色「停止」、馬達有值）→ 停止（變回綠色、馬達 0、推論繼續）→ NaN 輸出自動停車 → 推論卡 1.2 秒時看門狗停車 → sanity 失敗時無法開車 → benchmark 暫停並恢復迴圈 → 結束。✅
+  - **測試中找到並修正一個真的 bug**：模型輸出 NaN 時，`camera.draw_overlay` 把 NaN 轉整數出錯，推論迴圈執行緒就這樣死掉，而且沒有任何提示（車子已經先停了，但之後畫面不再更新、也不能再開車）。舊版 `live_demo` 也有同樣的問題。修正：
+    - `draw_overlay` 遇到 NaN／inf 就不畫點和轉向條。
+    - 迴圈每一輪都包 `try/except`：出錯時停車、在模型資訊列顯示 traceback，迴圈繼續跑。
+    - `benchmark()` 等迴圈暫停最多 10 秒，等不到就報錯，不會無限等待。
+    - 修正後連續跑 3 次完整測試都通過，迴圈沒有再出錯。
+- Notebook 用 Python 3.6 語法解析通過；Nano 端的模組通過 vermin 3.6 檢查（只有 `compression` 同名的已知誤判）；註解規則檢查 0 個問題。
+- **還沒測**：真的 torch2trt／TensorRT 轉換與載入、Nano 上的舊版 ipywidgets 介面（按鈕圖示、ToggleButtons）、實車控制效果。
+
 ## 未完成 / 未驗證
 
+- **CoordConv**（隊友的 5 通道輸入）沒有移植，等使用者決定。
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
 - **Nano 實測進度**：使用者在板子上跑過 live_demo，修好舊版 torchvision 的 `TypeError` 後，模型能載入、畫面能更新（第三階段）。以下**還沒在板子上驗證**：
   - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
@@ -377,9 +410,9 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 
 ## 下一步
 
-1. 補拍彎道、髮夾彎、偏離回正的畫面（收集工具不在這個分支）；有 `metadata/` 的話一起搬到 PC。
-2. 補齊那 17 張壞檔（請隊友重傳），解壓到 `project4/data/splits/`；PC 上用 `--data data/splits` 訓練，用 **test loss** 和實際行駛比較各種 augmentation 和模型。
-3. 板子上跑 trtexec → wrap → live_demo，驗證 TRT 載入（風險最高）；驗證換模型的 flush。
-4. 調 PD 參數；髮夾彎再試轉彎減速／內側輪反轉。
-5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（PC CPU 上差異不大，要看 GPU／TensorRT）。
-
+1. 使用者在本機開 `live_demo.ipynb` 看介面有沒有問題（PC 沒有 TRT，下拉選單會是空的；要看推論畫面可以暫時把 `MODELS_DIR` 改成 `models`，`CAMERA_SOURCE` 改成 `'opencv'` 或 `'folder'`）。
+2. 補齊那 17 張壞檔（請隊友重傳），解壓到 `project4/data/splits/`；PC 上用 `--data data/splits` 訓練，用 test 的像素誤差（可加 `--seeds 0 1 2`）比較各種 augmentation 和模型。
+3. 板子上跑 `python3 convert_trt.py`，驗證 torch2trt 轉換和 sanity 比對（風險最高）；失敗就試 `--method trtexec`。驗證換模型的 flush。
+4. 在跑道上調控制參數（隊友的起始值還沒調過）；比較隊友公式和投影片公式。
+5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
+6. 決定要不要加 CoordConv，以及要不要做 pure pursuit（需要量一次相機和地面的對應）。

@@ -120,6 +120,8 @@ def wrap_trt_engine(engine_path, out_path, input_names=("input_0",), output_name
 
     Run on the Nano after:
         /usr/src/tensorrt/bin/trtexec --onnx=X.onnx --saveEngine=X.engine --fp16
+    (``convert_trt.py --method trtexec`` does both steps and the checks.)
+    (``convert_trt.py --method trtexec`` does both steps and the checks.)
     The engine input stays FP32, so feed FP32 tensors (``loader.load_model``
     detects this automatically).
     """
@@ -142,6 +144,10 @@ def wrap_trt_engine(engine_path, out_path, input_names=("input_0",), output_name
         # Same metadata, labelled as the TensorRT version
         meta = dict(meta, label=meta.get("label", "") + " | TensorRT", runtime="tensorrt",
                     engine=os.path.basename(engine_path))
+        # Fingerprint of the wrapped file (the PyTorch one no longer applies)
+        from sanity import file_sha256
+        # Record it so load_model can verify the copy
+        meta["weights_sha256"] = file_sha256(out_path)
         # Write X_trt.json next to the wrapped .pth
         write_meta(out_path, meta)
     # Path of the wrapped .pth

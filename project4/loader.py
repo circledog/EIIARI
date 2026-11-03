@@ -10,7 +10,9 @@
 * ``list_models`` / ``read_meta`` / ``write_meta`` -- checkpoint + ``.json``.
 
 To add a network: write ``<name>.py`` with ``NAME``, ``FILE_TAG``, ``LABEL``,
-``HEAD_KEY`` and ``build(pretrained, num_outputs)``, then add it to ``ARCHS``.
+``HEAD_KEY``, ``DEFAULTS``, ``build(pretrained, num_outputs)`` and
+``train(model, train_loader, val_loader, device, epochs, lr, tag)``, then add
+it to ``ARCHS``.
 
 Kept Python 3.6 / old-torchvision compatible because it runs on the Jetson Nano.
 """
@@ -25,6 +27,8 @@ import torch.nn as nn
 import mobilenet_v2
 # Network definition: ResNet-18
 import resnet18
+# Weights fingerprint, checked before loading
+from sanity import file_sha256
 
 # Public names of this module
 __all__ = ["ARCHS", "build_model", "detect_arch", "rebuild_from_state_dict", "load_model",
@@ -250,6 +254,13 @@ def load_model(path, device=None, half=None):
     device = torch.device(device)
     # Metadata shown in the UI
     meta = read_meta(path)
+    # Fingerprint recorded by train.py / wrap_trt_engine, if any
+    expected = meta.get("weights_sha256")
+    # Refuse a file that is not the one the .json describes (partial copy, wrong .json)
+    if expected and file_sha256(path) != expected:
+        # Stop before using possibly broken weights
+        raise ValueError("%s: SHA256 does not match its .json; copy the .pth and .json again"
+                         % os.path.basename(path))
     # torch >= 2.6 defaults to weights_only=True, which rejects the engine bytearray
     try:
         # Load the file with full unpickling allowed
