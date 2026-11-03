@@ -367,6 +367,21 @@ python3 convert_trt.py          # 轉成 TensorRT 放到 models_trt/，每個模
 - Notebook 用 Python 3.6 語法解析通過；Nano 端的模組通過 vermin 3.6 檢查（只有 `compression` 同名的已知誤判）；註解規則檢查 0 個問題。
 - **還沒測**：真的 torch2trt／TensorRT 轉換與載入、Nano 上的舊版 ipywidgets 介面（按鈕圖示、ToggleButtons）、實車控制效果。
 
+## 第十五階段（CoordConv：在模型裡加座標通道能不能轉 TensorRT，2026-11-03）
+
+使用者決定：CoordConv 做成**獨立的模型**（不是訓練選項），座標通道在**模型裡面**處理，前處理和讀相機都不改；實際執行的都要是 TRT。隊友的模型用 ResNet 當基底，使用者稍後會提供原始碼，**在那之前不要猜它的結構、不要動手實作模型**。
+
+torch2trt 原始碼分析（github NVIDIA-AI-IOT/torch2trt，看歷史版本）：
+- `torch.cat` 的輸入有常數（buffer）時：2019-09-30 起用 `trt_()` 自動建立常數層，2020-09-01 起改用 `add_missing_trt_tensors`。這兩個時間點之後的版本**都能轉**。更早的版本不行。
+- `Tensor.expand`（2021-01 才加入）直接讀 `input._trt`，對常數 buffer 做 expand **轉不了**。
+- 結論：模型在 batch 1（推論和 TRT 追蹤時）直接 `cat([x, coords])`；訓練時 batch > 1 才用 expand（只在 PyTorch 跑）。
+- ONNX（opset 11，batch 1）匯出後只有 Concat + 常數 initializer，沒有 Expand；onnxruntime 和 PyTorch 差 < 1e-6。trtexec 應該可以轉。
+
+新增 `check_trt_coord.py`（車上執行，不用馬達和相機）：
+- 印出 python／torch／TensorRT／torch2trt 版本，並檢查車上 torch2trt 的 cat 轉換器能不能處理常數。
+- 測三種寫法：A `cat_const`、B `cat_expand`（預期失敗）、C `resnet18_coord`（真正模型會用的寫法），每種都用 torch2trt FP16 和 ONNX→trtexec 轉換，和 PyTorch FP32 比較（容許 2 px）。
+- sandbox 只能跑 PyTorch／ONNX 的部分，已確認可以執行；**TensorRT 部分要使用者在車上跑**。
+
 ## 未完成 / 未驗證
 
 - **CoordConv**（隊友的 5 通道輸入）沒有移植，等使用者決定。
