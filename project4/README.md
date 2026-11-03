@@ -32,6 +32,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `camera.py` | Nano | 相機輸入與前處理 |
 | `control.py` | Nano | 轉向角（隊友公式／投影片公式）＋ PID ＋ 差速控制，含平滑和安全檢查 |
 | `train.py` | PC | 依任務呼叫各網路的 `train()`：訓練 → 剪枝 → finetune → 匯出，可多 seed |
+| `train_experiments.ipynb` | PC / Colab | 一格一個訓練實驗（設定 + `run(...)`），印 test 結果；已訓練過的同設定自動跳過；最後一格總表。第一格是安裝環境 |
 | `live_demo.ipynb` | Nano（PC 也能開介面） | 推論＋控制的操作介面，只列 TensorRT 模型 |
 | `requirements-pc.txt` | PC | PC / Colab 端套件 |
 
@@ -202,6 +203,15 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 模型輸出 NaN / inf、超出畫面（|x| 或 |y| > 1.25）、目標太近時，回傳的 status 不是 `'ok'`，馬達值為 0，`live_demo` 會停車。預設值來自隊友的 `control.json`，**還沒在跑道上調過**。
 
 **控制公式會影響訓練嗎？不會。** 模型學的是「畫面 → 目標點 (x, y)」，標籤是你們點在畫面上的位置，和控制公式無關。換公式不用重新訓練，同一個模型可以直接比較兩種公式。
+
+### `train_experiments.ipynb`
+
+在 `project4/` 裡開，直接 Run All：
+- 第 0 節安裝環境（`pip install -r requirements-pc.txt`，已裝的會略過）並顯示有沒有 GPU。
+- 之後每一格是一個實驗：`model`、`epochs`、`lr`、augmentation 開關、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
+- 檔名由所有設定組成（例如 `resnet18_gen_e70_lr0.001_bs8_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
+- 內建實驗：5 種網路（general augmentation）＋ ResNet-18 的 4 種 augmentation 組合，都不剪枝。最後一格依平均像素誤差排序的總表。
+- `requirements-pc.txt` 用 `opencv-python-headless`：沒有螢幕的伺服器（含 Colab）裝一般版 `opencv-python` 會缺 `libGL` 而無法 import。
 
 ### `train.py`
 

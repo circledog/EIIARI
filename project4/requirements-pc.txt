@@ -6,4 +6,5 @@ onnx
 onnxruntime
 numpy
 pillow
-opencv-python
+# headless build: no GUI libraries needed (servers, Colab); training never opens windows
+opencv-python-headless

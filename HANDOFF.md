@@ -421,6 +421,16 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
   第一版模型（buffer (1,2,H,W)、Linear 無 bias）在 2019 版失敗，所以改成 `view` 和 bias=0 的寫法。torch2trt v0.5（2024，動態形狀）用到模擬器沒做的層，不在範圍內（JetPack 4 也不用它）。
 - `check_trt_coord.py`（車上）改成直接測 pipeline 的 4 個 ResNet 網路 + 2 個對照，同樣用兩組輸入比對。
 
+## 第十七階段（訓練實驗 notebook，2026-11-03）
+
+使用者要求：寫一份 ipynb 跑訓練，每格一個訓練指令（`epochs = ...`、`model = ...`），印 test 結果；Run All 時先檢查同名檔案，已訓練過就不重訓；安裝環境的指令也要寫進去。使用者選擇：檔名自動由設定產生、跳過時印上次的 test 結果、要總表、實驗放 5 種網路＋augmentation 比較、不剪枝。
+
+- 新增 `project4/train_experiments.ipynb`（17 格）：第 0 節安裝（沒有 pip 時先 `ensurepip`）、共用設定與 `run()`、5 種網路、ResNet-18 × 4 種 augmentation、總表。
+- `run()` 用 subprocess 呼叫 `train.py --name <自動檔名>`，即時印出訓練 log；失敗時丟例外，讓 Run All 停在那一格。
+- 單一 seed 檢查 `<name>_base.pth` + `.json`；多 seed 檢查 `<name>_seeds.json`，印平均 ± 標準差。
+- `requirements-pc.txt`：`opencv-python` → `opencv-python-headless`（sandbox 測試時一般版缺 libGL 無法 import）。
+- 已測（sandbox，1 epoch、真實 splits）：第一次 Run All 每個實驗都有訓練，與前面重複的 resnet18+general 自動跳過；第二次 Run All 全部跳過並印出相同結果；2 個 seed 的路徑和總表正確。
+
 ## 未完成 / 未驗證
 
 - 隊友 ① 流程的訓練技巧（部分凍結、AdamW、cosine、Huber、提早停止、用 px 選模型）沒有移植，等使用者決定。
@@ -471,5 +481,5 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 4. 在跑道上調控制參數（隊友的起始值還沒調過）；比較隊友公式和投影片公式。
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
 6. 車上跑 `python3 check_trt_coord.py`，確認 4 個 ResNet 網路在真的 TensorRT 上 OK（離線模擬已全部 OK）；結果貼回來。
-7. 用 `--arch resnet18_coord / resnet18_dsnt / resnet18_coord_dsnt` 正式訓練，和 resnet18 比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
+7. 用 `train_experiments.ipynb`（或 `--arch resnet18_coord / resnet18_dsnt / resnet18_coord_dsnt`）正式訓練，和 resnet18 比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
 8. 決定要不要移植隊友 ① 的訓練技巧。pure pursuit：使用者決定**不做**（2026-11-03）。
