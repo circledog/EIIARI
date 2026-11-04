@@ -4,7 +4,7 @@ Per-sample pipeline:
     load jpg + label  ->  Augmenter (one powerset subset, training split only)
                       ->  preprocessing.mark_lanes_pil (lane marking, always, live)  ->  tensor
 
-With augmentation on, the training set has len(images) x 128 samples: sample
+With augmentation on, the training set has len(images) x 29 samples: sample
 ``i`` is image ``i % n_images`` with method subset ``SUBSETS[i // n_images]``
 (see ``augmentation.py``), so one epoch sees every image with every subset.
 Lane marking comes after augmentation, as on the robot.
@@ -151,7 +151,7 @@ class XYDataset(torch.utils.data.Dataset):
         # Augmentation for this split (None for validation)
         self.augmenter = augmenter
 
-    # Variants per image: 128 with augmentation on, else 1
+    # Variants per image: 29 with augmentation on, else 1
     @property
     def n_variants(self):
         # Powerset size of an enabled augmenter

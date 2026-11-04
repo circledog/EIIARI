@@ -11,7 +11,7 @@ Examples
     # baseline only, no augmentation (course-equivalent, minus the hflip bug)
     python train.py
 
-    # powerset augmentation (each image x 128 per epoch), then prune 30 % and 50 %, export ONNX
+    # augmentation: subsets of at most 2 methods (each image x 29 per epoch), then prune 30 % and 50 %, export ONNX
     python train.py --augment --prune 0.3 0.5 --onnx
 
     # the same with MobileNetV2
@@ -33,12 +33,12 @@ Examples
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
     # (the architecture is detected from the file)
 
-Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``resnet18_aug``, ``mobilenetv2_none``, ...):
+Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``resnet18_aug2``, ``mobilenetv2_none``, ...):
     <name>_base.pth / .json          baseline state_dict + metadata
     <name>_pruned30.pth / .json      pruned + finetuned state_dict + metadata
     <name>_*.onnx                    with --onnx (for trtexec on the Nano)
     <name>_seeds.json                with several --seeds: mean / std per model
-With several seeds every file name gets ``_s<seed>`` (``resnet18_aug_s1_base.pth``).
+With several seeds every file name gets ``_s<seed>`` (``resnet18_aug2_s1_base.pth``).
 The .json holds the loss history, MSE and pixel errors (validation and test),
 MACs/params, data split, the weights' SHA256 and the sanity frames that
 ``live_demo`` uses to check the model on the robot.
@@ -51,7 +51,7 @@ import numpy as np
 import torch
 
 # Names of the augmentation methods, saved in every .json
-from augmentation import METHODS
+from augmentation import MAX_METHODS, METHODS
 # Pruning, size counting and ONNX export
 from compression import count_macs_params, export_onnx, prune_model
 # Dataset folder default and DataLoader construction (incl. lane marking)
@@ -247,7 +247,7 @@ def main():
     ap.add_argument("--name", default=None, help="run name (default <arch>_<aug>)")
     # The only augmentation switch
     ap.add_argument("--augment", action="store_true",
-                    help="powerset of flip / rotate / crop / color / noise / blur / compress (x128 per epoch)")
+                    help="subsets of at most 2 of flip / rotate / crop / color / noise / blur / compress (x29 per epoch)")
     # Baseline training epochs
     ap.add_argument("--epochs", type=int, default=None, help="default: the network's DEFAULTS")
     # Baseline learning rate
@@ -340,7 +340,7 @@ def main():
     common = {
         "arch": args.arch,
         "preprocessing": PREPROCESSING,
-        "augmentation": {"enabled": aug.enabled, "method": "powerset", "methods": list(METHODS),
+        "augmentation": {"enabled": aug.enabled, "method": "powerset", "methods": list(METHODS), "max_methods": MAX_METHODS,
                          "variants_per_image": aug.n_variants, "tag": aug.tag()},
         "data": os.path.abspath(args.data),
         "n_train": len(train_loader.dataset.image_paths), "n_train_samples": len(train_loader.dataset),

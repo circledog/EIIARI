@@ -1,8 +1,11 @@
 """Data augmentation for road-following (x, y) regression: powerset expansion.
 
 One switch only: augmentation on or off. When it is on, the training set is
-expanded with every subset (the powerset) of seven methods, so each image
-appears 2^7 = 128 times per epoch, once per subset:
+expanded with every subset of at most ``MAX_METHODS`` = 2 of the seven
+methods (the powerset cut at size 2): 1 original + 7 single methods + 21 pairs
+= 29 variants, so each image appears 29 times per epoch, once per subset.
+Common practice (AutoAugment, RandAugment) stacks only 1-3 operations per
+image; the full powerset (128 subsets, 3.5 methods on average) was too harsh.
 
     flip      horizontal mirror (label x mirrored)
     rotate    up to +-10 degrees about the centre (label rotated)
@@ -35,13 +38,16 @@ import PIL.Image
 import PIL.ImageEnhance
 
 # Public names of this module
-__all__ = ["Augmenter", "METHODS", "SUBSETS", "perlin_noise", "jpeg_compress", "low_res_compress",
+__all__ = ["Augmenter", "METHODS", "MAX_METHODS", "SUBSETS", "perlin_noise", "jpeg_compress", "low_res_compress",
            "motion_blur"]
 
 # The seven methods, in the order they are applied
 METHODS = ("flip", "rotate", "crop", "color", "noise", "blur", "compress")
-# Every subset of METHODS (the powerset), the empty one (original image) first
-SUBSETS = [tuple(m for i, m in enumerate(METHODS) if mask >> i & 1) for mask in range(2 ** len(METHODS))]
+# Most methods stacked on one image
+MAX_METHODS = 2
+# Every subset of METHODS with at most MAX_METHODS members, the empty one (original image) first
+SUBSETS = [s for s in (tuple(m for i, m in enumerate(METHODS) if mask >> i & 1)
+                       for mask in range(2 ** len(METHODS))) if len(s) <= MAX_METHODS]
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +216,7 @@ class Augmenter(object):
     ----------
     enabled : bool
         The only switch. False -> one variant per image (the original);
-        True -> ``len(SUBSETS)`` = 128 variants per image.
+        True -> ``len(SUBSETS)`` = 29 variants per image.
     max_rotate : float
         Max rotation in degrees (uniform in [-max_rotate, max_rotate]).
     crop_scale : (float, float)
@@ -256,14 +262,14 @@ class Augmenter(object):
     # Number of variants each training image is expanded into
     @property
     def n_variants(self):
-        # Whole powerset when on, only the original when off
+        # Every allowed subset when on, only the original when off
         return len(SUBSETS) if self.enabled else 1
 
     # Short name used in file names
     def tag(self):
-        """'aug' or 'none'."""
-        # One word per state
-        return "aug" if self.enabled else "none"
+        """'aug2' (subsets of at most 2 methods) or 'none'."""
+        # One word per state; the number keeps names apart from the former 7-method powerset ('aug')
+        return "aug%d" % MAX_METHODS if self.enabled else "none"
 
     # Readable representation for log output
     def __repr__(self):

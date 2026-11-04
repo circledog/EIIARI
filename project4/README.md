@@ -16,7 +16,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
 | `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；固定開啟，即時做、不存檔 |
-| `augmentation.py` | PC | 資料增強：一個開關，開了就用 7 種方法的所有組合（powerset）擴張訓練集 |
+| `augmentation.py` | PC | 資料增強：一個開關，開了就用 7 種方法裡最多 2 種的所有組合（29 種）擴張訓練集 |
 | `resnet18.py` | PC + Nano | ResNet-18：網路定義＋它自己的訓練函式 `train()` 與預設參數 |
 | `mobilenet_v2.py` | PC + Nano | MobileNetV2：網路定義＋它自己的訓練函式（比較用的 other model） |
 | `resnet18_coord.py` | PC + Nano | ResNet-18 + CoordConv：模型裡自己加 x / y 座標通道（隊友的 `course_coordconv`） |
@@ -58,7 +58,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
   - 只有一個資料夾時照下面兩種方式切，沒有 test：
     - `split='random'`：用固定 seed 隨機切 9:1。
     - `split='session'`：讀資料集旁邊的 `metadata/`（每張圖一個同名 JSON，含 `session_id`、`captured_at`），**照拍攝段落切**。同一個 `session_id`（一次收集）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
-  - **只有訓練集做 augmentation**，驗證集和測試集一律用原圖（都會標車道線）。augmentation 開時訓練集長度是「圖片數 × 128」：第 `i` 個樣本是第 `i % 圖片數` 張圖配第 `i // 圖片數` 個組合，所以一個 epoch 每張圖的每種組合都會出現一次。
+  - **只有訓練集做 augmentation**，驗證集和測試集一律用原圖（都會標車道線）。augmentation 開時訓練集長度是「圖片數 × 29」：第 `i` 個樣本是第 `i % 圖片數` 張圖配第 `i // 圖片數` 個組合，所以一個 epoch 每張圖的每種組合都會出現一次。
   - 讀不了的圖（空檔、檔案不完整）會跳過，並印出 `warning: skipping unreadable image ...`；跳過的張數記在模型 `.json` 的 `split.skipped_unreadable`。
 - 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
 - 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
@@ -95,7 +95,7 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 
 `Augmenter(enabled=False)`，呼叫方式是 `aug(image, x, y, subset) -> (image, x, y)`。**只有一個開關**，各方法沒有自己的開關。
 
-- 開（`--augment`）：7 種方法的所有組合（powerset，2⁷ = 128 種，`SUBSETS`）都用上，每張訓練圖每個 epoch 出現 128 次，一次一種組合。空集合就是原圖，所以每張原圖每個 epoch 一定出現一次。
+- 開（`--augment`）：7 種方法裡**最多取 2 種**的所有組合（`SUBSETS`：原圖 1 + 單一方法 7 + 兩兩組合 21 = 29 種，`MAX_METHODS = 2`），每張訓練圖每個 epoch 出現 29 次，一次一種組合。原本用完整 powerset（128 種、平均每張疊 3.5 種、7/8 的圖含模糊／壓縮／噪聲）太重；一般做法（AutoAugment、RandAugment）一張圖只疊 1~3 種。空集合就是原圖，所以每張原圖每個 epoch 一定出現一次。
 - 關：只用原圖（每張 1 次）。
 - 組合裡的參數（角度、裁切框、模糊方向……）每次重新隨機。
 - 方法的套用順序固定如下：先幾何（會移動標籤），再顏色和光線，然後模糊，壓縮最後（模擬鏡頭到模型之間的失真）。
@@ -221,7 +221,7 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 在 `project4/` 裡開，直接 Run All：
 - 第 0 節安裝環境（`pip install -r requirements-pc.txt`，已裝的會略過）並顯示有沒有 GPU。
 - 之後每一格是一個實驗：`model`、`epochs`、`lr`、`augment`（開 / 關）、`batch_size`、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
-- 檔名由所有設定組成（例如 `resnet18_aug_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
+- 檔名由所有設定組成（例如 `resnet18_aug2_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
 - 內建實驗：5 種網路各跑 augmentation 開 / 關兩格，都不剪枝。最後一格依平均像素誤差排序的總表。
 - `requirements-pc.txt` 用 `opencv-python-headless`：沒有螢幕的伺服器（含 Colab）裝一般版 `opencv-python` 會缺 `libGL` 而無法 import。
 
@@ -235,8 +235,8 @@ python train.py --help
 | 參數 | 說明 |
 |---|---|
 | `--arch resnet18` / `mobilenet_v2` / `resnet18_coord` / `resnet18_dsnt` / `resnet18_coord_dsnt` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡。前處理（標車道線）固定會做 |
-| `--augment` | augmentation 開關（7 種方法的 powerset，每張圖 ×128）；不加 = 只用原圖 |
-| `--epochs` `--lr` | baseline 訓練；不給就用該網路檔的 `DEFAULTS`（目前都是 10 / 1e-3。augmentation 開時一個 epoch 是 277 × 128 張，所以 epoch 數少） |
+| `--augment` | augmentation 開關（7 種方法裡最多 2 種的組合，每張圖 ×29）；不加 = 只用原圖 |
+| `--epochs` `--lr` | baseline 訓練；不給就用該網路檔的 `DEFAULTS`（目前都是 10 / 1e-3。augmentation 開時一個 epoch 是 277 × 29 張，所以 epoch 數少） |
 | `--batch-size 16` | batch size（預設 16） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs` `--finetune-lr` | 剪枝後的 finetune；不給就用 `DEFAULTS`（目前都是 15 / 1e-4） |
@@ -247,7 +247,7 @@ python train.py --help
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑（有 `train/ validation/ test/` 子資料夾就直接照用）、輸出資料夾（預設 `models/`） |
 
-產出：`models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json}`，例如 `mobilenetv2_aug_pruned30.pth`；多個 seed 時檔名多一段 `_s<seed>`，例如 `mobilenetv2_aug_s1_pruned30.pth`。`.json` 裡有：
+產出：`models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json}`，例如 `mobilenetv2_aug2_pruned30.pth`；多個 seed 時檔名多一段 `_s<seed>`，例如 `mobilenetv2_aug2_s1_pruned30.pth`。`.json` 裡有：
 
 - loss 曲線（每個 epoch 的 train loss、val MSE、val 平均像素誤差）
 - `val_metrics` / `test_metrics`：MSE、x / y 平均誤差、平均距離、p95（px）
@@ -287,7 +287,7 @@ python train.py --help
 ```bash
 cd project4
 python train.py --prune 0.3 0.5             # 無 augmentation
-python train.py --augment --prune 0.3 0.5   # powerset augmentation
+python train.py --augment --prune 0.3 0.5   # augmentation（最多 2 種方法的組合）
 
 # MobileNetV2：同樣的指令加 --arch mobilenet_v2
 python train.py --arch mobilenet_v2 --augment --prune 0.3 0.5

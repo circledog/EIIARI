@@ -447,6 +447,17 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - 已測（sandbox CPU，每個 split 3 張）：`len` = 384、128 種組合都產生 224×224 且標籤在畫面內、空集合回傳原圖；`train.py --arch resnet18_dsnt --augment --epochs 1 --prune 0.3` 完整跑完；`--base` 沿用 `aug` 設定；7 種方法各自和全部疊加的預覽圖目視正確（標籤跟著翻轉 / 旋轉 / 裁切移動）。
 - 訓練量：一個 epoch 277 × 128 = 35,456 張；10 epochs ≈ 22k 步（batch 16），約為舊設定（70 epochs × 277 / 8 ≈ 2.4k 步）的 9 倍。
 
+## 第十九階段（augmentation 改成最多疊 2 種方法，2026-11-04）
+
+使用者回報開了 augmentation 表現不好，懷疑旋轉 / 裁切後座標沒跟著動。
+
+- 驗證標籤跟隨（在標籤位置畫高斯亮點，變換後量亮點中心，各 300 次）：翻轉 / 旋轉平均 0.02 px；裁切平均 0.05 px，最大 2.4 px（亮點在裁切框邊緣被切掉一半，量測誤差，不是 bug）；三者疊加平均 0.06 px。座標有正確跟著動。
+- 推測主因是完整 powerset 太重（平均每張疊 3.5 種、7/8 的圖含模糊 / 壓縮 / 噪聲）；一般做法（AutoAugment 2 種、RandAugment 1~3 種）一張只疊少數幾種。使用者同意改成最多 2 種。
+- `augmentation.py`：`MAX_METHODS = 2`，`SUBSETS` 只留大小 ≤ 2 的組合：原圖 1 + 單一 7 + 兩兩 21 = 29 種；`tag()` 改成 `aug2`（和舊的 128 種 `aug` 檔名分開，notebook 不會誤跳過）。`.json` 多記 `max_methods`。
+- `data_loader.py`、`train.py` 說明、README、notebook 文字同步（×128 → ×29）。notebook 重新產生。
+- 一個 epoch 277 × 29 = 8,033 張；預設 10 epochs、batch 16 ≈ 5k 步，約為舊設定（2.4k 步）的 2 倍。
+- 已測：29 種組合都能跑、tiny split 長度 3 × 29 = 87。
+
 ## 未完成 / 未驗證
 
 - 隊友 ① 流程的訓練技巧（部分凍結、AdamW、cosine、Huber、提早停止、用 px 選模型）沒有移植，等使用者決定。
@@ -456,7 +467,7 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
   - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
   - 髮夾彎擴充（轉彎減速、內側輪反轉）的實際行駛效果。
   - 前處理在板子上的速度（每幀都做）與效果。
-- 第十七階段的正式訓練結果已回報（見第十八階段背景），但都是單一 seed、舊版 augmentation；新版 powerset augmentation（10 epochs、batch 16）還沒在 GPU 上訓練過。
+- 第十七階段的正式訓練結果已回報（見第十八階段背景），但都是單一 seed、舊版 augmentation；使用者用 128 種組合的版本訓練過 5 epochs（`_aug_e5_`），表現不好；改成 29 種（`aug2`）後還沒在 GPU 上訓練過。
 - 剪枝後的 finetune 仍是 15 epochs；augmentation 開時每個 epoch ×128，要不要一起降低還沒決定。
 - 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
 - 測試腳本（假 jetbot、nbclient 模擬）和 notebook 產生器 `make_nb.py` 都沒有進 repo，使用者決定不保留（會在車上實測）。從第十一階段起 `live_demo.ipynb` 直接修改，不再用產生器重新產生。
