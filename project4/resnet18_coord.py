@@ -37,7 +37,7 @@ LABEL = "ResNet18 CoordConv"
 KEYS = ("fc.weight", "coords")
 # Input image size the coordinate maps are made for (camera.preprocess always resizes to it)
 SIZE = 224
-# Training settings (teammate's spatial comparison: Adam 1e-3, 70 epochs, MSE)
+# Training settings: same as the plain ResNet-18 (Adam 1e-3, MSE)
 DEFAULTS = dict(resnet18.DEFAULTS)
 
 

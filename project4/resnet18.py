@@ -53,7 +53,7 @@ def build(pretrained=True, num_outputs=2):
 
 
 # Training settings for ResNet-18; train.py uses them unless given on the command line
-DEFAULTS = {"epochs": 70, "lr": 1e-3, "finetune_epochs": 15, "finetune_lr": 1e-4}
+DEFAULTS = {"epochs": 10, "lr": 1e-3, "finetune_epochs": 15, "finetune_lr": 1e-4}
 
 
 # Train ResNet-18 and keep its best weights

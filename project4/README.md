@@ -6,7 +6,7 @@ JetBot 道路跟隨：模型從相機畫面預測「要前往的目標點 (x, y)
 PC / Colab   Data Loader → Data Augmentation → Preprocessing（即時標車道線）→ Model training → Model compression (DepGraph)
                                                                                                    │ .pth / .onnx
 Jetson Nano  convert_trt.py（.pth → TensorRT）
-             Camera Input →（輸入干擾）→ Preprocessing（同一個函式）→ Model inferencing (TensorRT) → Motor controlling (PID)
+             Camera Input → Preprocessing（同一個函式）→ Model inferencing (TensorRT) → Motor controlling (PID)
 ```
 
 ## 檔案一覽
@@ -16,7 +16,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
 | `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；固定開啟，即時做、不存檔 |
-| `augmentation.py` | PC（Nano 的「輸入干擾」也會用到） | 資料增強，三組開關 |
+| `augmentation.py` | PC | 資料增強：一個開關，開了就用 7 種方法的所有組合（powerset）擴張訓練集 |
 | `resnet18.py` | PC + Nano | ResNet-18：網路定義＋它自己的訓練函式 `train()` 與預設參數 |
 | `mobilenet_v2.py` | PC + Nano | MobileNetV2：網路定義＋它自己的訓練函式（比較用的 other model） |
 | `resnet18_coord.py` | PC + Nano | ResNet-18 + CoordConv：模型裡自己加 x / y 座標通道（隊友的 `course_coordconv`） |
@@ -53,12 +53,12 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 
 - `XYDataset(directory=None, augmenter=None)`：讀取 `xy_<x>_<y>_<uuid>.jpg`，從檔名取出像素座標，再正規化到 [-1, 1]。
   - `directory` 預設是 `data/dataset_xy_2026-10-21/dataset_xy`。
-- `make_loaders(directory, general, perlin, compression, ..., split='random')`：回傳 `(train, val, test, augmenter)`。
+- `make_loaders(directory, augment, ..., split='random')`：回傳 `(train, val, test, augmenter)`。
   - **資料夾已經分好時**（`directory` 底下有 `train/`、`validation/`，`test/` 可有可無）：直接照資料夾用，`split` 和 `val_ratio` 不起作用。`validation` 用來挑最好的 epoch；`test` 訓練中完全不看，只在每個模型存檔前評一次。沒有 `test/` 時 test 是 `None`。
   - 只有一個資料夾時照下面兩種方式切，沒有 test：
     - `split='random'`：用固定 seed 隨機切 9:1。
     - `split='session'`：讀資料集旁邊的 `metadata/`（每張圖一個同名 JSON，含 `session_id`、`captured_at`），**照拍攝段落切**。同一個 `session_id`（一次收集）裡，相隔超過 `segment_gap`（預設 60 秒）就算新的一段；驗證集一次拿整段，相鄰的相似照片就不會分別落進 train 和 val。沒有 metadata 的圖各自算一段；只有一段時會報錯並提示改用 random。
-  - **只有訓練集做 augmentation**，驗證集和測試集一律用原圖（都會標車道線）。
+  - **只有訓練集做 augmentation**，驗證集和測試集一律用原圖（都會標車道線）。augmentation 開時訓練集長度是「圖片數 × 128」：第 `i` 個樣本是第 `i % 圖片數` 張圖配第 `i // 圖片數` 個組合，所以一個 epoch 每張圖的每種組合都會出現一次。
   - 讀不了的圖（空檔、檔案不完整）會跳過，並印出 `warning: skipping unreadable image ...`；跳過的張數記在模型 `.json` 的 `split.skipped_unreadable`。
 - 前處理和課程一致：resize 224 → tensor → RGB 轉 BGR → ImageNet 正規化。這樣和車上 `camera.preprocess` 的結果完全相同（已驗證差 0）。
 - 修掉課程版的 bug：原本就算 `random_hflips=False` 也會隨機翻轉。
@@ -68,7 +68,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 **只做一件事：把車道線標出來**，而且**固定開啟、沒有開關**。
 
 - **即時做、不存檔**：訓練時在 DataLoader 裡對每張圖做（`mark_lanes_pil`），車上 `live_demo.ipynb` 對每一幀做（`apply_frame`）。
-- **順序在 augmentation 之後**：訓練是「讀圖 → augmentation → 標車道線」，車上是「相機 → 輸入干擾（柏林噪聲／壓縮失真）→ 標車道線」。噪聲對偵測的影響兩邊相同，DEMO 切換「輸入干擾」時，模型遇到的情況和訓練時一致。驗證集一樣會標車道線，只是不做 augmentation。
+- **順序在 augmentation 之後**：訓練是「讀圖 → augmentation → 標車道線」，車上是「相機 → 標車道線」（車上不會對鏡頭畫面加任何干擾）。驗證集一樣會標車道線，只是不做 augmentation。
 
 - **做法**：把看起來像白膠帶的像素塗成純紅色 (BGR 0,0,255)。模型仍然看得到原本的畫面（3 通道，網路不用改），只是車道線被明確標出來。標籤不變。
 - **能處理彎道**：逐像素判斷，不是用直線去套。彎道、髮夾彎、鏡頭前面很寬的膠帶都標得出來。
@@ -93,13 +93,26 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 
 ### `augmentation.py`
 
-`Augmenter(general=False, perlin=False, compression=False)`，呼叫方式是 `aug(image, x, y) -> (image, x, y)`。三個開關**全關時原樣輸出**。
+`Augmenter(enabled=False)`，呼叫方式是 `aug(image, x, y, subset) -> (image, x, y)`。**只有一個開關**，各方法沒有自己的開關。
 
-| 開關 | 內容 |
+- 開（`--augment`）：7 種方法的所有組合（powerset，2⁷ = 128 種，`SUBSETS`）都用上，每張訓練圖每個 epoch 出現 128 次，一次一種組合。空集合就是原圖，所以每張原圖每個 epoch 一定出現一次。
+- 關：只用原圖（每張 1 次）。
+- 組合裡的參數（角度、裁切框、模糊方向……）每次重新隨機。
+- 方法的套用順序固定如下：先幾何（會移動標籤），再顏色和光線，然後模糊，壓縮最後（模擬鏡頭到模型之間的失真）。
+
+| 方法 | 內容 |
 |---|---|
-| `general` | 水平翻轉、±10° 旋轉、80~100% 裁切再放大、亮度 / 對比 / 飽和度 ±0.3。幾何變換會同步移動標籤座標 |
-| `perlin` | 柏林噪聲做出大片明暗不均，模擬光線和陰影 |
-| `compression` | JPEG 低品質（q 5~35）重壓，或像 YouTube 144p 那樣縮小、重壓再放大 |
+| `flip` | 水平翻轉，標籤 x 跟著鏡像 |
+| `rotate` | ±10° 旋轉，標籤跟著轉 |
+| `crop` | 裁原圖 80~100% 再放大回原尺寸，標籤跟著換算 |
+| `color` | 亮度 / 對比 / 飽和度各 ×0.7~1.3，順序隨機 |
+| `noise` | 柏林噪聲（2 層 octave）做出大片明暗不均，模擬光線和陰影 |
+| `blur` | 動態模糊，長度 3~15 px，方向 0~360° 隨機 |
+| `compress` | JPEG 低品質（q 5~35）重壓，或像 144p 那樣縮小、重壓再放大（各一半機率） |
+
+旋轉和裁切會讓標籤留在畫面內：隨機試 10 次都會把標籤推出畫面時，那一步就不做。
+
+**這樣還算 augmentation 嗎？** 算，這是 offline（靜態）augmentation：把每張圖展開成多個變換版本、擴大訓練集；原本每個 epoch 隨機變一次的是 online augmentation。兩者都是 data augmentation，只要先切好 train / validation / test、只擴張 train 即可。
 
 ### 網路檔（`resnet18.py`、`mobilenet_v2.py`、`resnet18_coord.py`、`resnet18_dsnt.py`、`resnet18_coord_dsnt.py`）與 `loader.py`
 
@@ -180,7 +193,6 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
   - 原因：jetbot 的 GStreamer `appsink` 不會丟舊畫面。換模型時 TRT engine 反序列化會卡住 GIL，相機讀取執行緒跟著停，畫面就堆起來；之後讀取速度和相機速度一樣，堆積永遠消化不掉，畫面會一直延遲。
   - `'jetbot'` 來源的 flush 是重啟相機管線（約 1~2 秒）；`'csi'` 來源設了 `drop=true max-buffers=1`，本來就不會堆積。
 - `preprocess(frame, device, dtype)`：投影片 P.59 的前處理，dtype 依模型決定，不再寫死 `.half()`。
-- `degrade()`：在即時畫面上加柏林噪聲 / 壓縮失真，給介面的「輸入干擾」用。
 - `draw_overlay()`、`to_jpeg()`：畫預測點和轉向條，供畫面顯示。
 
 ### `control.py`
@@ -208,9 +220,9 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 
 在 `project4/` 裡開，直接 Run All：
 - 第 0 節安裝環境（`pip install -r requirements-pc.txt`，已裝的會略過）並顯示有沒有 GPU。
-- 之後每一格是一個實驗：`model`、`epochs`、`lr`、augmentation 開關、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
-- 檔名由所有設定組成（例如 `resnet18_gen_e70_lr0.001_bs8_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
-- 內建實驗：5 種網路（general augmentation）＋ ResNet-18 的 4 種 augmentation 組合，都不剪枝。最後一格依平均像素誤差排序的總表。
+- 之後每一格是一個實驗：`model`、`epochs`、`lr`、`augment`（開 / 關）、`batch_size`、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
+- 檔名由所有設定組成（例如 `resnet18_aug_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
+- 內建實驗：5 種網路各跑 augmentation 開 / 關兩格，都不剪枝。最後一格依平均像素誤差排序的總表。
 - `requirements-pc.txt` 用 `opencv-python-headless`：沒有螢幕的伺服器（含 Colab）裝一般版 `opencv-python` 會缺 `libGL` 而無法 import。
 
 ### `train.py`
@@ -223,9 +235,9 @@ python train.py --help
 | 參數 | 說明 |
 |---|---|
 | `--arch resnet18` / `mobilenet_v2` / `resnet18_coord` / `resnet18_dsnt` / `resnet18_coord_dsnt` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡。前處理（標車道線）固定會做 |
-| `--general` `--perlin` `--compression` | augmentation 開關，全不加 = 不做 augmentation |
-| `--epochs` `--lr` | baseline 訓練；不給就用該網路檔的 `DEFAULTS`（目前都是 70 / 1e-3） |
-| `--batch-size 8` | batch size |
+| `--augment` | augmentation 開關（7 種方法的 powerset，每張圖 ×128）；不加 = 只用原圖 |
+| `--epochs` `--lr` | baseline 訓練；不給就用該網路檔的 `DEFAULTS`（目前都是 10 / 1e-3。augmentation 開時一個 epoch 是 277 × 128 張，所以 epoch 數少） |
+| `--batch-size 16` | batch size（預設 16） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs` `--finetune-lr` | 剪枝後的 finetune；不給就用 `DEFAULTS`（目前都是 15 / 1e-4） |
 | `--seeds 0 1 2` | **多 seed 訓練**：每個 seed 完整跑一次（baseline + 剪枝），最後印出各模型的平均 ± 標準差，存成 `<名稱>_seeds.json`。只給一個值（預設 0）就是一般訓練 |
@@ -235,7 +247,7 @@ python train.py --help
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑（有 `train/ validation/ test/` 子資料夾就直接照用）、輸出資料夾（預設 `models/`） |
 
-產出：`models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json}`，例如 `mobilenetv2_gen_pruned30.pth`；多個 seed 時檔名多一段 `_s<seed>`，例如 `mobilenetv2_gen_s1_pruned30.pth`。`.json` 裡有：
+產出：`models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json}`，例如 `mobilenetv2_aug_pruned30.pth`；多個 seed 時檔名多一段 `_s<seed>`，例如 `mobilenetv2_aug_s1_pruned30.pth`。`.json` 裡有：
 
 - loss 曲線（每個 epoch 的 train loss、val MSE、val 平均像素誤差）
 - `val_metrics` / `test_metrics`：MSE、x / y 平均誤差、平均距離、p95（px）
@@ -249,7 +261,6 @@ python train.py --help
 | 模型 | 下拉選單**只列 `models_trt/` 的 TensorRT 模型**，一開始是「未載入模型」，選了才載入。載入完成就開始推論，下方顯示 sanity 比對結果 |
 | 連線狀態 | 車子、鏡頭有沒有連上。偵測不到 JetBot 就用假馬達（只顯示數值）；鏡頭打不開就顯示「未連接鏡頭」 |
 | 畫面 | 模型實際看到的影像（紅色車道線）、綠色預測點、上方橘色轉向條 |
-| 輸入干擾 | 柏林噪聲、壓縮失真（按鈕） |
 | 控制參數（全部是按鈕或滑桿） | 轉向角公式、max / min speed、kp、ki、kd、steering bias、轉彎減速、角度平滑 α、馬達變化率、馬達上限、內側輪可反轉、安全逾時 |
 | 即時讀數 | x、y、angle、steering、實際 speed、左右馬達、P / I / D 項、FPS、前處理＋推論延遲、控制狀態 |
 | 運轉 | **開始行駛／停止**（同一個按鈕：綠色「開始行駛」↔ 紅色「停止」）、錄製 CSV |
@@ -275,16 +286,14 @@ python train.py --help
 
 ```bash
 cd project4
-python train.py --prune 0.3 0.5                                   # 無 augmentation
-python train.py --general --prune 0.3 0.5                         # 一般做法
-python train.py --general --perlin --prune 0.3 0.5                # + 柏林噪聲
-python train.py --general --perlin --compression --prune 0.3 0.5  # + 壓縮失真
+python train.py --prune 0.3 0.5             # 無 augmentation
+python train.py --augment --prune 0.3 0.5   # powerset augmentation
 
 # MobileNetV2：同樣的指令加 --arch mobilenet_v2
-python train.py --arch mobilenet_v2 --general --perlin --prune 0.3 0.5
+python train.py --arch mobilenet_v2 --augment --prune 0.3 0.5
 
 # 報告要比較方法時，用多個 seed 看平均和標準差
-python train.py --general --perlin --prune 0.3 --seeds 0 1 2
+python train.py --augment --prune 0.3 --seeds 0 1 2
 ```
 
 資料不在預設的 `data/dataset_xy_2026-10-21/dataset_xy` 時，每行加上 `--data <資料夾>`。
@@ -363,7 +372,6 @@ python preprocessing.py review --data <資料夾>     # 看 label_review.jpg
 - 從下拉選單換模型時，車子會**自動停車**。
   - 換完會自動清掉相機堆積的舊畫面（畫面會停 1~2 秒），之後畫面就是即時的。
   - 換完先看 sanity 比對和綠點正不正常，再按「開始行駛」。
-- 按「輸入干擾」按鈕可以現場示範：有柏林噪聲 / 壓縮 augmentation 的模型在干擾下比較穩。
 - 按 **錄製 CSV**，每一幀的模型、x、y、角度、P / I / D、左右馬達、狀態、延遲和所有控制參數都會寫進 `runs/drive_*.csv`，報告可以用來畫圖。
 
 ### 6. 停車與結束

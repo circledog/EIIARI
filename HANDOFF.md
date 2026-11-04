@@ -431,6 +431,22 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - `requirements-pc.txt`：`opencv-python` → `opencv-python-headless`（sandbox 測試時一般版缺 libGL 無法 import）。
 - 已測（sandbox，1 epoch、真實 splits）：第一次 Run All 每個實驗都有訓練，與前面重複的 resnet18+general 自動跳過；第二次 Run All 全部跳過並印出相同結果；2 個 seed 的路徑和總表正確。
 
+## 第十八階段（augmentation 改成 powerset、移除車上輸入干擾，2026-11-04）
+
+使用者要求：augmentation 只剩一個開關（開 / 關），各方法沒有自己的開關；開的時候用 7 種方法（翻轉、旋轉、裁切、顏色、噪聲、模糊、壓縮）的 powerset 擴張訓練集；新增隨機方向的動態模糊；batch size 預設 16、epochs 10；車上推論**不應該主動加噪聲**。使用者選擇：組合內參數每次隨機、保留空集合（原圖）、模糊 3~15 px、方向 0~360°。
+
+背景：使用者第十七階段的訓練結果（1660 Ti，單一 seed）是 resnet18 none 20.5 px 反而比 gen 26.7 px 好；舊版 `general` 每張圖都會做顏色抖動，所以訓練時完全看不到原圖。
+
+- `augmentation.py`：`Augmenter(enabled)`，`aug(image, x, y, subset)`；`METHODS`、`SUBSETS`（128 種，空集合在 index 0）、`n_variants`、`tag()` = `aug` / `none`。新增 `motion_kernel()`、`motion_blur()`（cv2.filter2D，邊緣鏡像）。方法順序固定：flip → rotate → crop → color → noise → blur → compress。拿掉所有「機率觸發」（perlin_p、compression_p、hflip_p）；壓縮內部仍是 JPEG / 144p 各一半。
+- `data_loader.py`：開 augmentation 時 `len = 圖片數 × 128`，樣本 `i` = 第 `i % 圖片數` 張圖 + `SUBSETS[i // 圖片數]`；`make_loaders(directory, augment, ..., batch_size=16)`；`split_info.train` 記的是圖片數。
+- `train.py`：`--augment` 取代 `--general/--perlin/--compression`；`--batch-size` 預設 16；`.json` 的 `augmentation` = `{enabled, method: powerset, methods, variants_per_image, tag}`，另記 `n_train_samples`；`--base` 讀舊 `.json` 時任一舊開關為真就當作開。
+- `resnet18.py`、`mobilenet_v2.py`：`DEFAULTS["epochs"]` 70 → 10（其他三個網路沿用 resnet18）。finetune 仍是 15 epochs，沒有改。
+- `camera.py` 刪掉 `degrade()`；`live_demo.ipynb` 刪掉兩個「輸入干擾」按鈕、迴圈裡的 `degrade` 呼叫、CSV 的 `perlin` / `compression` 欄。車上畫面現在是 `camera.read()` → `mark_lanes` → 推論，中間沒有其他改動。
+- `train_experiments.ipynb` 重新產生（18 格）：`run(arch, epochs, lr, augment, batch_size=16, seeds)`；第 1 節 5 種網路 augmentation 開、第 2 節 5 種網路 augmentation 關。舊的輸出（第十七階段的結果）不在新 notebook 裡；`models/` 裡的舊檔名（`_gen_e70_..._bs8`）不會和新檔名衝突。
+- `preprocessing.py` 說明文字、README 同步更新（README 也回答了「這樣還算 augmentation 嗎」：算，offline augmentation）。
+- 已測（sandbox CPU，每個 split 3 張）：`len` = 384、128 種組合都產生 224×224 且標籤在畫面內、空集合回傳原圖；`train.py --arch resnet18_dsnt --augment --epochs 1 --prune 0.3` 完整跑完；`--base` 沿用 `aug` 設定；7 種方法各自和全部疊加的預覽圖目視正確（標籤跟著翻轉 / 旋轉 / 裁切移動）。
+- 訓練量：一個 epoch 277 × 128 = 35,456 張；10 epochs ≈ 22k 步（batch 16），約為舊設定（70 epochs × 277 / 8 ≈ 2.4k 步）的 9 倍。
+
 ## 未完成 / 未驗證
 
 - 隊友 ① 流程的訓練技巧（部分凍結、AdamW、cosine、Huber、提早停止、用 px 選模型）沒有移植，等使用者決定。
@@ -440,7 +456,8 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
   - 換模型時的 flush（jetbot `Camera.stop()` / `start()` 重啟要多久、穩不穩）、`'csi'` 來源的 GStreamer 管線字串。
   - 髮夾彎擴充（轉彎減速、內側輪反轉）的實際行駛效果。
   - 前處理在板子上的速度（每幀都做）與效果。
-- 正式訓練（70 epochs、各種 augmentation／前處理組合）的結果還沒回報；sandbox 只跑過 1~3 epochs 的 smoke test。
+- 第十七階段的正式訓練結果已回報（見第十八階段背景），但都是單一 seed、舊版 augmentation；新版 powerset augmentation（10 epochs、batch 16）還沒在 GPU 上訓練過。
+- 剪枝後的 finetune 仍是 15 epochs；augmentation 開時每個 epoch ×128，要不要一起降低還沒決定。
 - 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
 - 測試腳本（假 jetbot、nbclient 模擬）和 notebook 產生器 `make_nb.py` 都沒有進 repo，使用者決定不保留（會在車上實測）。從第十一階段起 `live_demo.ipynb` 直接修改，不再用產生器重新產生。
 
@@ -481,5 +498,5 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 4. 在跑道上調控制參數（隊友的起始值還沒調過）；比較隊友公式和投影片公式。
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
 6. 車上跑 `python3 check_trt_coord.py`，確認 4 個 ResNet 網路在真的 TensorRT 上 OK（離線模擬已全部 OK）；結果貼回來。
-7. 用 `train_experiments.ipynb`（或 `--arch resnet18_coord / resnet18_dsnt / resnet18_coord_dsnt`）正式訓練，和 resnet18 比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
+7. 用新的 `train_experiments.ipynb`（5 種網路 × augmentation 開 / 關）正式訓練，比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
 8. 決定要不要移植隊友 ① 的訓練技巧。pure pursuit：使用者決定**不做**（2026-11-03）。

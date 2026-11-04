@@ -1,11 +1,13 @@
 """Dataset / DataLoader for the road-following (x, y) data.
 
 Per-sample pipeline:
-    load jpg + label  ->  Augmenter (random, training split only)
+    load jpg + label  ->  Augmenter (one powerset subset, training split only)
                       ->  preprocessing.mark_lanes_pil (lane marking, always, live)  ->  tensor
 
-Lane marking comes after augmentation so that Perlin / compression noise
-affects the detection exactly as the "input disturbance" does on the robot.
+With augmentation on, the training set has len(images) x 128 samples: sample
+``i`` is image ``i % n_images`` with method subset ``SUBSETS[i // n_images]``
+(see ``augmentation.py``), so one epoch sees every image with every subset.
+Lane marking comes after augmentation, as on the robot.
 
 Folder layouts (``make_loaders`` picks automatically):
     <dir>/xy_*.jpg                       one folder, split here (random / session)
@@ -34,7 +36,7 @@ import PIL.Image
 import torch
 import torchvision.transforms.functional as TF
 
-# Random training augmentation (general / Perlin / compression)
+# Powerset training augmentation (on / off)
 from augmentation import Augmenter
 # Lane marking, applied to every sample after augmentation
 from preprocessing import mark_lanes_pil
@@ -120,7 +122,8 @@ class XYDataset(torch.utils.data.Dataset):
     directory : str
         Folder with ``xy_*.jpg``. Defaults to ``DEFAULT_DATA_DIR``.
     augmenter : Augmenter or None
-        Applied to (image, x, y) before lane marking. None -> no augmentation.
+        Applied to (image, x, y) before lane marking; when enabled, every image
+        appears once per method subset. None -> no augmentation.
     indices : list[int] or None
         Use only these files (indices into the sorted list of all files).
     """
@@ -148,24 +151,32 @@ class XYDataset(torch.utils.data.Dataset):
         # Augmentation for this split (None for validation)
         self.augmenter = augmenter
 
+    # Variants per image: 128 with augmentation on, else 1
+    @property
+    def n_variants(self):
+        # Powerset size of an enabled augmenter
+        return self.augmenter.n_variants if self.augmenter is not None else 1
+
     # Number of samples
     def __len__(self):
-        # One sample per image
-        return len(self.image_paths)
+        # Every image once per variant
+        return len(self.image_paths) * self.n_variants
 
     # Load one sample as a PIL image plus pixel label
     def load(self, idx):
         """Raw sample: (PIL image, x_px, y_px) after augmentation + lane marking, before tensor."""
+        # Image index and method subset of this sample
+        subset, image_idx = divmod(idx, len(self.image_paths))
         # File of this sample
-        path = self.image_paths[idx]
+        path = self.image_paths[image_idx]
         # Decode the image as RGB
         image = PIL.Image.open(path).convert("RGB")
         # Label from the file name
         x, y = parse_xy(path)
-        # Training split: random augmentation (moves the label with the image)
-        if self.augmenter is not None:
+        # Training split: this sample's method subset (moves the label with the image)
+        if self.augmenter is not None and self.augmenter.enabled:
             # Augmented image and label
-            image, x, y = self.augmenter(image, x, y)
+            image, x, y = self.augmenter(image, x, y, subset)
         # Mark the lane lines last, as on the robot
         return mark_lanes_pil(image), x, y
 
@@ -347,14 +358,13 @@ def split_by_session(paths, metadata_dir, val_ratio=0.1, seed=0, segment_gap=60.
 
 
 # Build the training, validation and test DataLoaders
-def make_loaders(directory=None, general=False, perlin=False, compression=False,
-                 val_ratio=0.1, batch_size=8, num_workers=4, seed=0, augmenter=None,
+def make_loaders(directory=None, augment=False,
+                 val_ratio=0.1, batch_size=16, num_workers=4, seed=0, augmenter=None,
                  split="random", metadata_dir=None, segment_gap=60.0):
     """Train/val/test DataLoaders.
 
     Augmentation is applied to the training split only; lane marking to all.
-    Pass the three augmentation switches, or a pre-configured ``augmenter``
-    (overrides them).
+    Pass ``augment`` (on / off), or a pre-configured ``augmenter`` (overrides it).
 
     If ``directory`` has ``train/`` and ``validation/`` sub-folders (and
     optionally ``test/``) they are used as they are and ``split`` /
@@ -369,10 +379,10 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
     """
     # Fall back to the default dataset
     directory = directory or DEFAULT_DATA_DIR
-    # Build the augmenter from the switches unless one is passed in
+    # Build the augmenter from the switch unless one is passed in
     if augmenter is None:
-        # Augmenter with the requested groups
-        augmenter = Augmenter(general=general, perlin=perlin, compression=compression)
+        # Powerset augmenter, on or off
+        augmenter = Augmenter(enabled=augment)
     # No test split unless a test/ folder exists
     test_ds = None
     # Dataset already split into sub-folders by the team
@@ -390,7 +400,7 @@ def make_loaders(directory=None, general=False, perlin=False, compression=False,
         # Every dataset that was loaded
         parts = [d for d in (train_ds, val_ds, test_ds) if d is not None]
         # Description of the split, saved in the model's .json
-        split_info = {"split": "folders", "train": len(train_ds), "validation": len(val_ds),
+        split_info = {"split": "folders", "train": len(train_ds.image_paths), "validation": len(val_ds),
                       "test": len(test_ds) if test_ds is not None else 0,
                       "skipped_unreadable": sum(d.n_skipped for d in parts)}
     # Single folder: split it here

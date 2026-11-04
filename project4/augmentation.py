@@ -1,16 +1,26 @@
-"""Data augmentation for road-following (x, y) regression.
+"""Data augmentation for road-following (x, y) regression: powerset expansion.
 
-Three independently switchable groups:
+One switch only: augmentation on or off. When it is on, the training set is
+expanded with every subset (the powerset) of seven methods, so each image
+appears 2^7 = 128 times per epoch, once per subset:
 
-* ``general``     -- geometric (h-flip, rotation, crop/zoom) + colour jitter.
-                     Geometric ops move the (x, y) label together with the image.
-* ``perlin``      -- smooth Perlin-noise brightness field (uneven lighting / shadows).
-* ``compression`` -- JPEG artefacts or "YouTube 144p" style down-scale + re-encode.
+    flip      horizontal mirror (label x mirrored)
+    rotate    up to +-10 degrees about the centre (label rotated)
+    crop      80-100 % crop zoomed back to full size (label moved)
+    color     brightness / contrast / saturation x 0.7-1.3, random order
+    noise     smooth Perlin brightness field (uneven lighting / shadows)
+    blur      motion blur, 3-15 px long, random direction
+    compress  JPEG (quality 5-35) or "144p" down-scale + re-encode
 
-With every switch off, ``Augmenter`` returns the input unchanged.
+The empty subset is the original image, so every original is seen once per
+epoch. Inside a subset the parameters (angle, crop box, blur direction, ...)
+are drawn anew every time. The chosen methods are applied in the fixed order
+above: geometry first (it moves the label), then colour and lighting, then
+blur, and compression last (it mimics what happens between lens and model).
 
 Labels are passed in *pixel* coordinates of the given image, exactly like the
-``xy_<x>_<y>_<uuid>.jpg`` file names.
+``xy_<x>_<y>_<uuid>.jpg`` file names. Rotation and crop keep the label inside
+the image: if 10 random tries all push it out, that step leaves the image as is.
 
 Randomness uses Python's ``random`` module, which PyTorch re-seeds in every
 DataLoader worker, so workers do not produce identical augmentations.
@@ -19,12 +29,19 @@ import io
 import math
 import random
 
+import cv2
 import numpy as np
 import PIL.Image
 import PIL.ImageEnhance
 
 # Public names of this module
-__all__ = ["Augmenter", "perlin_noise", "jpeg_compress", "low_res_compress"]
+__all__ = ["Augmenter", "METHODS", "SUBSETS", "perlin_noise", "jpeg_compress", "low_res_compress",
+           "motion_blur"]
+
+# The seven methods, in the order they are applied
+METHODS = ("flip", "rotate", "crop", "color", "noise", "blur", "compress")
+# Every subset of METHODS (the powerset), the empty one (original image) first
+SUBSETS = [tuple(m for i, m in enumerate(METHODS) if mask >> i & 1) for mask in range(2 ** len(METHODS))]
 
 
 # --------------------------------------------------------------------------- #
@@ -153,178 +170,204 @@ def low_res_compress(image, short_side, quality):
 
 
 # --------------------------------------------------------------------------- #
+# Motion blur
+# --------------------------------------------------------------------------- #
+# Straight-line blur kernel of a given length and direction
+def motion_kernel(length, angle):
+    """(length, length) float kernel: a centred line at ``angle`` degrees, summing to 1."""
+    # Odd size so the line passes through the centre pixel
+    size = int(length) | 1
+    # Empty kernel
+    kernel = np.zeros((size, size), dtype=np.float32)
+    # Centre of the kernel
+    c = (size - 1) / 2.0
+    # Half the line as a vector in the chosen direction
+    dx, dy = c * math.cos(math.radians(angle)), c * math.sin(math.radians(angle))
+    # Draw the line (anti-aliased, fixed-point with 4 fractional bits for sub-pixel ends)
+    cv2.line(kernel, (int(round((c - dx) * 16)), int(round((c - dy) * 16))),
+             (int(round((c + dx) * 16)), int(round((c + dy) * 16))), 1.0, 1, cv2.LINE_AA, 4)
+    # Normalise so the image brightness is kept
+    return kernel / kernel.sum()
+
+
+# Simulate camera / robot motion during the exposure
+def motion_blur(image, length, angle):
+    """Blur a PIL image along a line ``length`` px long at ``angle`` degrees."""
+    # Convolve every colour channel with the line kernel (edges mirrored)
+    out = cv2.filter2D(np.asarray(image), -1, motion_kernel(length, angle), borderType=cv2.BORDER_REFLECT)
+    # Back to a PIL image
+    return PIL.Image.fromarray(out)
+
+
+# --------------------------------------------------------------------------- #
 # Augmenter
 # --------------------------------------------------------------------------- #
-# Random augmentation applied to (image, label) pairs during training
+# Applies one subset of the seven methods to (image, label)
 class Augmenter(object):
-    """Callable ``(PIL image, x_px, y_px) -> (PIL image, x_px, y_px)``.
+    """Callable ``(PIL image, x_px, y_px, subset) -> (PIL image, x_px, y_px)``.
 
     Parameters
     ----------
-    general, perlin, compression : bool
-        The three on/off switches. All False -> identity.
-    hflip_p : float
-        Probability of a horizontal flip (label x is mirrored).
+    enabled : bool
+        The only switch. False -> one variant per image (the original);
+        True -> ``len(SUBSETS)`` = 128 variants per image.
     max_rotate : float
         Max rotation in degrees (uniform in [-max_rotate, max_rotate]).
     crop_scale : (float, float)
         Range of crop side length relative to the image (then resized back).
     color_jitter : float
         Strength of brightness / contrast / saturation jitter (0.3 like the course).
-    perlin_p, perlin_strength, perlin_cells, perlin_octaves
-        Probability, max brightness amplitude, lattice-cell range and octaves.
-    compression_p, jpeg_quality, low_res_p, low_res_side
-        Probability, JPEG quality range, share of the "144p" variant among
-        compression ops, and its short-side range in pixels.
+    perlin_strength, perlin_cells, perlin_octaves
+        Max brightness amplitude, lattice-cell range and octaves of the noise.
+    blur_length : (int, int)
+        Range of the motion-blur length in pixels (direction is 0-360 degrees).
+    jpeg_quality, low_res_p, low_res_side
+        JPEG quality range, share of the "144p" variant among compression
+        steps, and its short-side range in pixels.
     """
 
-    # Store the switches and all tuning parameters
-    def __init__(self, general=False, perlin=False, compression=False,
-                 hflip_p=0.5, max_rotate=10.0, crop_scale=(0.8, 1.0), color_jitter=0.3,
-                 perlin_p=0.7, perlin_strength=0.5, perlin_cells=(2, 5), perlin_octaves=2,
-                 compression_p=0.7, jpeg_quality=(5, 35), low_res_p=0.5, low_res_side=(48, 112)):
-        # Switch: flip / rotate / crop + colour jitter
-        self.general = bool(general)
-        # Switch: Perlin-noise lighting
-        self.perlin = bool(perlin)
-        # Switch: JPEG / 144p artefacts
-        self.compression = bool(compression)
-        # Probability of a horizontal flip
-        self.hflip_p = hflip_p
+    # Store the switch and all tuning parameters
+    def __init__(self, enabled=False, max_rotate=10.0, crop_scale=(0.8, 1.0), color_jitter=0.3,
+                 perlin_strength=0.5, perlin_cells=(2, 5), perlin_octaves=2, blur_length=(3, 15),
+                 jpeg_quality=(5, 35), low_res_p=0.5, low_res_side=(48, 112)):
+        # Augmentation on / off
+        self.enabled = bool(enabled)
         # Largest rotation in degrees
         self.max_rotate = max_rotate
         # Range of the crop size relative to the image
         self.crop_scale = crop_scale
         # Strength of the brightness / contrast / saturation jitter
         self.color_jitter = color_jitter
-        # Probability of adding Perlin noise
-        self.perlin_p = perlin_p
         # Largest brightness change caused by the noise
         self.perlin_strength = perlin_strength
         # Range of lattice cells (blob size) for the noise
         self.perlin_cells = perlin_cells
         # Number of noise octaves
         self.perlin_octaves = perlin_octaves
-        # Probability of a compression artefact
-        self.compression_p = compression_p
+        # Range of the motion-blur length
+        self.blur_length = blur_length
         # JPEG quality range
         self.jpeg_quality = jpeg_quality
-        # Share of the "144p" variant among compression artefacts
+        # Share of the "144p" variant among compression steps
         self.low_res_p = low_res_p
         # Short-side range in pixels for the "144p" variant
         self.low_res_side = low_res_side
 
-    # True when at least one switch is on
+    # Number of variants each training image is expanded into
     @property
-    def enabled(self):
-        # Any of the three groups enabled
-        return self.general or self.perlin or self.compression
+    def n_variants(self):
+        # Whole powerset when on, only the original when off
+        return len(SUBSETS) if self.enabled else 1
 
-    # Short name of the enabled groups, used in file names
+    # Short name used in file names
     def tag(self):
-        """Short name for file names, e.g. 'gen+perlin' or 'none'."""
-        # Names of the switches that are on, in a fixed order
-        parts = [n for n, on in (("gen", self.general), ("perlin", self.perlin),
-                                 ("comp", self.compression)) if on]
-        # Joined with '+', or 'none' when all are off
-        return "+".join(parts) if parts else "none"
+        """'aug' or 'none'."""
+        # One word per state
+        return "aug" if self.enabled else "none"
 
     # Readable representation for log output
     def __repr__(self):
-        # Show the three switches
-        return "Augmenter(general=%s, perlin=%s, compression=%s)" % (
-            self.general, self.perlin, self.compression)
+        # Show the switch and the expansion factor
+        return "Augmenter(enabled=%s, %d variants per image)" % (self.enabled, self.n_variants)
 
-    # Augment one sample
-    def __call__(self, image, x, y):
-        # All switches off: identity
-        if not self.enabled:
+    # Augment one sample with the methods of one subset
+    def __call__(self, image, x, y, subset=()):
+        """``subset``: tuple of method names, or an index into ``SUBSETS``."""
+        # Index -> method names
+        if isinstance(subset, int):
+            # Look up the subset
+            subset = SUBSETS[subset]
+        # Empty subset: the original sample
+        if not subset:
             # Unchanged sample
             return image, x, y
         # Work on RGB images
         image = image.convert("RGB")
-        # General group: geometry first (moves the label), then colour
-        if self.general:
-            # Flip / rotate / crop, label moved along
-            image, x, y = self._geometric(image, x, y)
+        # Horizontal flip
+        if "flip" in subset:
+            # Mirror image and label
+            image, x, y = self._flip(image, x, y)
+        # Rotation about the centre
+        if "rotate" in subset:
+            # Rotate image and label
+            image, x, y = self._rotate(image, x, y)
+        # Crop and zoom back
+        if "crop" in subset:
+            # Crop image, move label
+            image, x, y = self._crop(image, x, y)
+        # Colour jitter
+        if "color" in subset:
             # Brightness / contrast / saturation
             image = self._color(image)
-        # Perlin group, applied with probability perlin_p
-        if self.perlin and random.random() < self.perlin_p:
+        # Perlin lighting
+        if "noise" in subset:
             # Uneven lighting
             image = self._perlin(image)
-        # Compression last: it mimics what happens between the lens and the model.
-        if self.compression and random.random() < self.compression_p:
-            # JPEG or 144p artefacts
+        # Motion blur
+        if "blur" in subset:
+            # Random length and direction
+            image = motion_blur(image, random.randint(self.blur_length[0], self.blur_length[1]),
+                                random.uniform(0.0, 360.0))
+        # Compression artefacts
+        if "compress" in subset:
+            # JPEG or 144p
             image = self._compress(image)
         # Augmented sample
         return image, x, y
 
-    # -- general ----------------------------------------------------------- #
-    # Random flip, rotation and crop; the label follows the image
-    def _geometric(self, image, x, y):
+    # -- geometry ---------------------------------------------------------- #
+    # Mirror left-right; the label follows
+    def _flip(self, image, x, y):
+        # Mirror the image (matches the course's normalised x -> -x)
+        return image.transpose(PIL.Image.FLIP_LEFT_RIGHT), image.size[0] - x, y
+
+    # Small random rotation; the label follows
+    def _rotate(self, image, x, y):
         # Image size
         w, h = image.size
-        # Horizontal flip with probability hflip_p
-        if random.random() < self.hflip_p:
-            # Mirror the image left-right
-            image = image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
-            # Mirror the label too (matches the course's normalised x -> -x)
-            x = w - x
-
-        # Small random rotation
-        if self.max_rotate > 0:
-            # Up to 10 tries to find an angle that keeps the label inside the image
-            for _ in range(10):
-                # Random angle in [-max_rotate, max_rotate]
-                deg = random.uniform(-self.max_rotate, self.max_rotate)
-                # Where the label lands after this rotation
-                nx, ny = _rotate_point(x, y, deg, w / 2.0, h / 2.0)
-                # Accept the angle only if the label stays in the frame
-                if 0 <= nx < w and 0 <= ny < h:
-                    # Rotate the image about its centre
-                    image = image.rotate(deg, resample=PIL.Image.BILINEAR)
-                    # Use the rotated label
-                    x, y = nx, ny
-                    # Done with rotation
-                    break
-
-        # Smallest and largest crop size
-        lo, hi = self.crop_scale
-        # Crop only if smaller crops are allowed
-        if lo < 1.0:
-            # Up to 10 tries to find a crop that contains the label
-            for _ in range(10):
-                # Random relative crop size
-                s = random.uniform(lo, hi)
-                # Crop width and height in pixels
-                cw, ch = w * s, h * s
-                # Random left edge
-                left = random.uniform(0, w - cw)
-                # Random top edge
-                top = random.uniform(0, h - ch)
-                # Accept the crop only if the label is inside it
-                if left <= x < left + cw and top <= y < top + ch:
-                    # Cut the box out and scale it back to the full size (zoom in)
-                    image = image.resize((w, h), PIL.Image.BILINEAR,
-                                         box=(left, top, left + cw, top + ch))
-                    # Label x in the zoomed image
-                    x = (x - left) * w / cw
-                    # Label y in the zoomed image
-                    y = (y - top) * h / ch
-                    # Done with cropping
-                    break
-        # Transformed image and label
+        # Up to 10 tries to find an angle that keeps the label inside the image
+        for _ in range(10):
+            # Random angle in [-max_rotate, max_rotate]
+            deg = random.uniform(-self.max_rotate, self.max_rotate)
+            # Where the label lands after this rotation
+            nx, ny = _rotate_point(x, y, deg, w / 2.0, h / 2.0)
+            # Accept the angle only if the label stays in the frame
+            if 0 <= nx < w and 0 <= ny < h:
+                # Rotated image about its centre, rotated label
+                return image.rotate(deg, resample=PIL.Image.BILINEAR), nx, ny
+        # No angle kept the label inside: unchanged
         return image, x, y
 
+    # Random crop zoomed back to full size; the label follows
+    def _crop(self, image, x, y):
+        # Image size
+        w, h = image.size
+        # Smallest and largest crop size
+        lo, hi = self.crop_scale
+        # Up to 10 tries to find a crop that contains the label
+        for _ in range(10):
+            # Random relative crop size
+            s = random.uniform(lo, hi)
+            # Crop width and height in pixels
+            cw, ch = w * s, h * s
+            # Random left edge
+            left = random.uniform(0, w - cw)
+            # Random top edge
+            top = random.uniform(0, h - ch)
+            # Accept the crop only if the label is inside it
+            if left <= x < left + cw and top <= y < top + ch:
+                # Cut the box out and scale it back to the full size (zoom in)
+                image = image.resize((w, h), PIL.Image.BILINEAR, box=(left, top, left + cw, top + ch))
+                # Label in the zoomed image
+                return image, (x - left) * w / cw, (y - top) * h / ch
+        # No crop contained the label: unchanged
+        return image, x, y
+
+    # -- colour / lighting ------------------------------------------------- #
     # Random brightness, contrast and saturation (in random order)
     def _color(self, image):
         # Jitter strength
         j = self.color_jitter
-        # No jitter requested
-        if j <= 0:
-            # Unchanged image
-            return image
         # The three PIL enhancers
         ops = [PIL.ImageEnhance.Brightness, PIL.ImageEnhance.Contrast, PIL.ImageEnhance.Color]
         # Apply them in a random order
@@ -336,7 +379,6 @@ class Augmenter(object):
         # Colour-jittered image
         return image
 
-    # -- perlin ------------------------------------------------------------ #
     # Multiply the image by a smooth random brightness field
     def _perlin(self, image):
         # Image size

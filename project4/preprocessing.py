@@ -1,14 +1,11 @@
 """Preprocessing: mark the lane lines (white tape) on the image, live.
 
     PC     Data Loader -> Data Augmentation -> Preprocessing -> Model training
-    Robot  Camera -> (input disturbance) -> Preprocessing -> Model inference
+    Robot  Camera -> Preprocessing -> Model inference
 
 Always on (no switch) and nothing is written to disk: ``data_loader`` calls
 ``mark_lanes_pil`` on every sample *after* augmentation, and ``live_demo.ipynb``
-calls ``apply_frame`` on every camera frame *after* the optional Perlin /
-compression disturbance. Both sides therefore run the same steps in the same
-order, so noise affects the lane detection the same way in training and on
-the robot.
+calls ``apply_frame`` on every camera frame as it comes from the camera.
 
 What it does
 ------------

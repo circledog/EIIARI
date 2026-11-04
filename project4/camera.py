@@ -32,7 +32,7 @@ import torch
 import torchvision.transforms.functional as TF
 
 # Public names of this module
-__all__ = ["open_camera", "preprocess", "draw_overlay", "to_jpeg", "degrade"]
+__all__ = ["open_camera", "preprocess", "draw_overlay", "to_jpeg"]
 
 # ImageNet per-channel mean used for normalisation (same as training)
 MEAN = [0.485, 0.456, 0.406]
@@ -326,29 +326,6 @@ def preprocess(frame, device="cpu", dtype=torch.float32):
     t.sub_(mean).div_(std)
     # Add the batch dimension
     return t[None, ...]
-
-
-# Add the optional "input disturbance" noise to a live frame
-def degrade(frame, perlin=False, compression=False):
-    """Optionally apply augmentation-style disturbances to a live BGR frame.
-
-    Lets the UI test how robust each checkpoint is to lighting noise /
-    compression artefacts at inference time. Returns a BGR frame.
-    """
-    # Both disturbances off: return the frame untouched
-    if not (perlin or compression):
-        # Unchanged frame
-        return frame
-    # Same noise generators as the training augmentation
-    from augmentation import Augmenter
-    # Always apply the chosen disturbances (probability 1)
-    aug = Augmenter(perlin=perlin, compression=compression, perlin_p=1.0, compression_p=1.0)
-    # The augmenter works on RGB PIL images
-    rgb = PIL.Image.fromarray(frame[:, :, ::-1])
-    # Apply the noise; the label arguments are dummies here
-    rgb, _, _ = aug(rgb, 0.0, 0.0)
-    # Back to a contiguous BGR array
-    return np.ascontiguousarray(np.asarray(rgb)[:, :, ::-1])
 
 
 # --------------------------------------------------------------------------- #

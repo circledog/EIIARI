@@ -11,34 +11,34 @@ Examples
     # baseline only, no augmentation (course-equivalent, minus the hflip bug)
     python train.py
 
-    # general + Perlin augmentation, then prune 30 % and 50 %, export ONNX
-    python train.py --general --perlin --prune 0.3 0.5 --onnx
+    # powerset augmentation (each image x 128 per epoch), then prune 30 % and 50 %, export ONNX
+    python train.py --augment --prune 0.3 0.5 --onnx
 
     # the same with MobileNetV2
-    python train.py --arch mobilenet_v2 --general --perlin --prune 0.3 0.5 --onnx
+    python train.py --arch mobilenet_v2 --augment --prune 0.3 0.5 --onnx
 
     # use the team's fixed split: data/splits/{train,validation,test}/
     # (validation picks the best epoch, test is scored once per saved model)
-    python train.py --data data/splits --general --perlin --prune 0.3
+    python train.py --data data/splits --augment --prune 0.3
 
     # the teammate's variants (CoordConv / DSNT / both), same options as any network
-    python train.py --arch resnet18_coord --data data/splits --general --seeds 17 29 43
-    python train.py --arch resnet18_dsnt --data data/splits --general --prune 0.3
+    python train.py --arch resnet18_coord --data data/splits --augment --seeds 17 29 43
+    python train.py --arch resnet18_dsnt --data data/splits --augment --prune 0.3
 
     # three training seeds on the same split: mean +- std for the report
-    python train.py --data data/splits --general --seeds 0 1 2 --prune 0.3
+    python train.py --data data/splits --augment --seeds 0 1 2 --prune 0.3
 
     # prune an existing baseline without retraining it
-    # (augmentation switches and run name are taken from its .json)
+    # (augmentation switch and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
     # (the architecture is detected from the file)
 
-Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``resnet18_gen``, ``mobilenetv2_gen``, ...):
+Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``resnet18_aug``, ``mobilenetv2_none``, ...):
     <name>_base.pth / .json          baseline state_dict + metadata
     <name>_pruned30.pth / .json      pruned + finetuned state_dict + metadata
     <name>_*.onnx                    with --onnx (for trtexec on the Nano)
     <name>_seeds.json                with several --seeds: mean / std per model
-With several seeds every file name gets ``_s<seed>`` (``resnet18_gen_s1_base.pth``).
+With several seeds every file name gets ``_s<seed>`` (``resnet18_aug_s1_base.pth``).
 The .json holds the loss history, MSE and pixel errors (validation and test),
 MACs/params, data split, the weights' SHA256 and the sanity frames that
 ``live_demo`` uses to check the model on the robot.
@@ -50,6 +50,8 @@ import os
 import numpy as np
 import torch
 
+# Names of the augmentation methods, saved in every .json
+from augmentation import METHODS
 # Pruning, size counting and ONNX export
 from compression import count_macs_params, export_onnx, prune_model
 # Dataset folder default and DataLoader construction (incl. lane marking)
@@ -69,7 +71,7 @@ SUMMARY_KEYS = ("mse", "mean_px", "mae_x_px", "mae_y_px", "p95_px")
 
 # Text describing the augmentation, used in the dropdown label
 def _variant_label(aug):
-    # e.g. "aug=gen+perlin"
+    # "aug=aug" or "aug=none"
     return "aug=%s" % aug.tag()
 
 
@@ -243,20 +245,15 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
     # Optional run name (prefix of the output files)
     ap.add_argument("--name", default=None, help="run name (default <arch>_<aug>)")
-    # Group of augmentation switches in the help text
-    g = ap.add_argument_group("augmentation switches (all off = none)")
-    # Switch: general augmentation
-    g.add_argument("--general", action="store_true", help="flip / rotate / crop / colour jitter")
-    # Switch: Perlin noise
-    g.add_argument("--perlin", action="store_true", help="Perlin-noise lighting")
-    # Switch: compression artefacts
-    g.add_argument("--compression", action="store_true", help="JPEG / 144p artefacts")
+    # The only augmentation switch
+    ap.add_argument("--augment", action="store_true",
+                    help="powerset of flip / rotate / crop / color / noise / blur / compress (x128 per epoch)")
     # Baseline training epochs
     ap.add_argument("--epochs", type=int, default=None, help="default: the network's DEFAULTS")
     # Baseline learning rate
     ap.add_argument("--lr", type=float, default=None, help="default: the network's DEFAULTS")
     # Batch size
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=16)
     # Share of images used for validation
     ap.add_argument("--val-ratio", type=float, default=0.1)
     # How to split train / validation
@@ -304,17 +301,14 @@ def main():
     if args.base:
         # The network type comes from the baseline's weights
         args.arch = detect_arch(torch.load(args.base, map_location="cpu"))
-        # Reuse the baseline's augmentation switches and run name
+        # Reuse the baseline's augmentation switch and run name
         # unless overridden, so pruned files stay grouped with their baseline.
         base_aug = read_meta(args.base).get("augmentation", {})
-        # Only when no augmentation switch was given on the command line
-        if not (args.general or args.perlin or args.compression):
-            # Baseline's general switch
-            args.general = bool(base_aug.get("general"))
-            # Baseline's Perlin switch
-            args.perlin = bool(base_aug.get("perlin"))
-            # Baseline's compression switch
-            args.compression = bool(base_aug.get("compression"))
+        # Only when --augment was not given on the command line
+        if not args.augment:
+            # Baseline's switch (older files: any of the former general / perlin / compression switches)
+            args.augment = bool(base_aug.get("enabled", any(base_aug.get(k) for k in
+                                                            ("general", "perlin", "compression"))))
         # Baseline file name without extension
         stem = os.path.splitext(os.path.basename(args.base))[0]
         # Derive the run name from "<name>_base"
@@ -337,26 +331,28 @@ def main():
         print("note: %s has train/validation sub-folders: --split / --val-ratio are ignored" % args.data)
     # Training / validation / test loaders (lane marking happens inside)
     train_loader, val_loader, test_loader, aug = make_loaders(
-        args.data, general=args.general, perlin=args.perlin, compression=args.compression,
+        args.data, augment=args.augment,
         val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.split_seed,
         split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap)
-    # Run name, e.g. "mobilenetv2_gen"
+    # Run name, e.g. "mobilenetv2_aug"
     name = args.name or "%s_%s" % (arch.FILE_TAG, aug.tag())
     # Metadata shared by every model of this run
     common = {
         "arch": args.arch,
         "preprocessing": PREPROCESSING,
-        "augmentation": {"general": aug.general, "perlin": aug.perlin,
-                         "compression": aug.compression, "tag": aug.tag()},
+        "augmentation": {"enabled": aug.enabled, "method": "powerset", "methods": list(METHODS),
+                         "variants_per_image": aug.n_variants, "tag": aug.tag()},
         "data": os.path.abspath(args.data),
-        "n_train": len(train_loader.dataset), "n_val": len(val_loader.dataset),
+        "n_train": len(train_loader.dataset.image_paths), "n_train_samples": len(train_loader.dataset),
+        "n_val": len(val_loader.dataset),
         "n_test": len(test_loader.dataset) if test_loader is not None else 0,
         "val_ratio": args.val_ratio, "split_seed": args.split_seed, "batch_size": args.batch_size,
         "split": train_loader.split_info,
     }
     # Summary of the setup
-    print("data: %d train / %d val / %d test, %s, %r, lane marking on, device %s"
-          % (common["n_train"], common["n_val"], common["n_test"], arch.LABEL, aug, args.device))
+    print("data: %d train (%d samples per epoch) / %d val / %d test, %s, %r, lane marking on, device %s"
+          % (common["n_train"], common["n_train_samples"], common["n_val"], common["n_test"], arch.LABEL, aug,
+             args.device))
     # How the data was split
     print("split: %s" % train_loader.split_info)
     # Training settings in use
