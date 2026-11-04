@@ -457,6 +457,7 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - `data_loader.py`、`train.py` 說明、README、notebook 文字同步（×128 → ×29）。notebook 重新產生。
 - 一個 epoch 277 × 29 = 8,033 張；預設 10 epochs、batch 16 ≈ 5k 步，約為舊設定（2.4k 步）的 2 倍。
 - 已測：29 種組合都能跑、tiny split 長度 3 × 29 = 87。
+- `train_experiments.ipynb` 的實驗依使用者要求換成 5 種網路 × augmentation 開 × 10 epochs（檔名 `<網路>_aug2_e10_lr0.001_bs16_seed0`），拿掉 augmentation 關的那 5 格。
 
 ## 未完成 / 未驗證
 

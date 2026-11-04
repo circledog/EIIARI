@@ -222,7 +222,7 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 - 第 0 節安裝環境（`pip install -r requirements-pc.txt`，已裝的會略過）並顯示有沒有 GPU。
 - 之後每一格是一個實驗：`model`、`epochs`、`lr`、`augment`（開 / 關）、`batch_size`、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
 - 檔名由所有設定組成（例如 `resnet18_aug2_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
-- 內建實驗：5 種網路各跑 augmentation 開 / 關兩格，都不剪枝。最後一格依平均像素誤差排序的總表。
+- 內建實驗：5 種網路，augmentation 開、10 epochs，都不剪枝。最後一格依平均像素誤差排序的總表。
 - `requirements-pc.txt` 用 `opencv-python-headless`：沒有螢幕的伺服器（含 Colab）裝一般版 `opencv-python` 會缺 `libGL` 而無法 import。
 
 ### `train.py`
