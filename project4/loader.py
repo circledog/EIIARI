@@ -146,7 +146,7 @@ def _meta_path(path):
 # Save a checkpoint's metadata (label, history, MACs, ...)
 def write_meta(path, meta):
     # Open the sidecar .json for writing
-    with open(_meta_path(path), "w") as f:
+    with open(_meta_path(path), "w", encoding="utf-8") as f:
         # Pretty-printed, keeping non-ASCII text readable
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
@@ -158,7 +158,7 @@ def read_meta(path):
     # Only read it if it exists
     if os.path.exists(p):
         # Open the .json
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             # Parsed metadata
             return json.load(f)
     # No metadata for this checkpoint

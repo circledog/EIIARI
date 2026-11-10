@@ -28,8 +28,10 @@ Python 3.6 compatible.
 """
 import argparse
 import glob
+import io
 import os
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -181,6 +183,10 @@ def convert_one(src, method, dst_dir=DST_DIR):
 
 # Command-line entry point
 def main():
+    # The JetBot container has no UTF-8 locale: print sanity messages (Chinese) as UTF-8 anyway
+    if (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        # Re-wrap stdout with UTF-8, flushing every line
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
     # Parser that shows the module docstring as help
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     # Models to convert (default: all in models/)

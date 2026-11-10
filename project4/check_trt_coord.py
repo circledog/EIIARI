@@ -175,7 +175,7 @@ def main():
         # Show it
         print("torch2trt %s" % folder)
         # Source of the cat converter
-        cat_src = open(os.path.join(folder, "converters", "cat.py")).read()
+        cat_src = open(os.path.join(folder, "converters", "cat.py"), encoding="utf-8").read()
         # Era of the converter: add_missing_trt_tensors (2020-09 on) or trt_ (2019-09 .. 2020-08)
         era = ("2020-09 or newer" if "add_missing_trt_tensors" in cat_src else
                "2019-09 .. 2020-08 (cat_const expected to fail)" if "trt_(" in cat_src else "before 2019-09")

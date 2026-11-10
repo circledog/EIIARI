@@ -472,6 +472,13 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - 已測（sandbox CPU，tiny split）：5 個網路各跑 2 epochs，被改到的參數全部在 `TRAINABLE` 內、BN running stats 沒變、DSNT 固定層仍 requires_grad=False、結束後 flag 恢復；提早停止（patience 2、min 3）在第 4 epoch 停；`train.py --augment --loss huber --prune 0.3` 完整跑完；notebook `run()` 第二次正確跳過。
 - 注意：預設 epochs 10 = `min_epochs`，所以 10 epochs 時提早停止不會觸發；要讓它作用，epochs 要設大一點（例如 30~70）。
 
+## 第二十一階段（車上容器沒有 UTF-8 語系，2026-11-10）
+
+- 車上 Jupyter 的 docker 容器語系是 ASCII：`convert_trt.py` 寫 `.json`（含中文 sanity 訊息）時出現 `UnicodeEncodeError`。
+- 修正：所有文字檔的 `open()` 都指定 `encoding="utf-8"`（`loader.write_meta/read_meta`、`data_loader`、`train.py`、`live_demo` 的 CSV、`check_trt_coord.py`）；`convert_trt.py` 的 stdout 不是 UTF-8 時改包成 UTF-8。
+- 已在 `LANG=C` 下驗證讀寫和印出中文都正常。
+- 車上要在 Jupyter 容器裡跑（SSH 的 `/usr/bin/python3` 沒有 torchvision、jetbot）；板子家目錄 = 容器的 `/workspace`。
+
 ## 未完成 / 未驗證
 
 - 隊友流程 ① 的訓練方式已移植（第二十階段），但還沒在 GPU 上用真實資料訓練、和舊結果比較。

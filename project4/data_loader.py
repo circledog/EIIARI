@@ -264,7 +264,7 @@ def split_by_session(paths, metadata_dir, val_ratio=0.1, seed=0, segment_gap=60.
         # Only images with a metadata file have a session and time
         if os.path.exists(meta_path):
             # Open the metadata
-            with open(meta_path) as f:
+            with open(meta_path, encoding="utf-8") as f:
                 # Parsed metadata
                 meta = json.load(f)
             # Which notebook run captured it

@@ -388,7 +388,7 @@ def main():
         # Summary file next to the models
         path = os.path.join(args.out, name + "_seeds.json")
         # Write it with the run settings
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             # Seeds, shared metadata and the statistics
             json.dump({"name": name, "seeds": args.seeds, "summary": summary,
                        "settings": {k: v for k, v in common.items()}}, f, indent=2, ensure_ascii=False)
