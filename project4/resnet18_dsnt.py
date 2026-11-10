@@ -8,7 +8,7 @@ Instead of regressing (x, y) from a pooled vector, the network predicts a
     bilinear upsampling to 28 x 28, softmax over the 784 cells -> heatmap
     (x, y) = sum(heatmap * x-grid), sum(heatmap * y-grid)   (grids -1 .. 1)
 
-Training loss (teammate): MSE(x, y) + 0.1 * Jensen-Shannon divergence between
+Training loss (teammate): MSE (or Huber) on (x, y) + 0.1 * Jensen-Shannon divergence between
 the heatmap and a Gaussian (sigma 1.5 cells) at the label.
 
 TensorRT-friendly form, same values as the teammate's code: the bilinear
@@ -34,6 +34,8 @@ import torch.nn.functional as F
 
 # Plain ResNet-18: backbone weights and the shared training routine
 import resnet18
+# Coordinate losses (MSE / Huber)
+import training
 
 # Value of --arch and of meta["arch"] for this network
 NAME = "resnet18_dsnt"
@@ -49,6 +51,11 @@ FEATURE = 14
 HEATMAP = 28
 # Training settings: shared ones + the teammate's heatmap-loss weight and Gaussian width
 DEFAULTS = dict(resnet18.DEFAULTS, js_weight=0.1, sigma_bins=1.5)
+# Trained parameters: same backbone stages as ResNet-18 plus the heatmap head
+# (the fixed upsample / expect layers stay frozen)
+TRAINABLE = ("backbone.conv1", "backbone.layer3", "backbone.layer4", "head")
+# Parameters that get the full learning rate
+HEAD = ("head",)
 
 
 # Cell-centre coordinates of a size x size heatmap, -1 .. 1
@@ -90,7 +97,7 @@ def fixed_linear(matrix):
         layer.weight.copy_(matrix)
         # No offset
         layer.bias.zero_()
-    # Neither is trained (Adam skips parameters without gradients)
+    # Neither is trained (the optimiser skips parameters without gradients)
     for p in layer.parameters():
         # Frozen
         p.requires_grad_(False)
@@ -194,22 +201,25 @@ def gaussian_js(heatmap, target, sigma_bins=1.5):
     return (0.5 * (p * (p.log() - middle.log()) + q * (q.log() - middle.log())).sum(dim=(1, 2, 3))).mean()
 
 
-# Loss function for resnet18.train: MSE on (x, y) + weighted heatmap divergence
-def make_loss(js_weight=DEFAULTS["js_weight"], sigma_bins=DEFAULTS["sigma_bins"]):
-    """``loss(model, images, labels)`` as in the teammate's spatial comparison."""
+# Loss function for resnet18.train: coordinate loss on (x, y) + weighted heatmap divergence
+def make_loss(js_weight=DEFAULTS["js_weight"], sigma_bins=DEFAULTS["sigma_bins"], coordinate="mse"):
+    """``loss(model, images, labels)`` as in the teammate's spatial comparison (``coordinate``: mse / huber)."""
+    # MSE or Huber on the predicted (x, y)
+    coord_loss = training.coordinate_loss(coordinate)
     # The loss
     def loss(model, images, labels):
         # Prediction and heatmap
         prediction, heat = model.training_output(images)
         # Coordinate error + heatmap shape term
-        return F.mse_loss(prediction, labels) + js_weight * gaussian_js(heat, labels, sigma_bins)
+        return coord_loss(prediction, labels) + js_weight * gaussian_js(heat, labels, sigma_bins)
     # Hand it to the training loop
     return loss
 
 
 # Shared ResNet-18 training loop with the DSNT loss
-def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME):
-    """Adam, MSE + 0.1 JS loss, keep the epoch with the lowest validation MSE (teammate's selection)."""
-    # Shared routine with the heatmap loss
+def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse"):
+    """Teammate's recipe (``training.py``) with coordinate loss + 0.1 JS heatmap loss."""
+    # Shared routine with the heatmap loss and the DSNT parameter names
     return resnet18.train(model, train_loader, val_loader, device, epochs, lr, tag,
-                          loss_fn=make_loss(DEFAULTS["js_weight"], DEFAULTS["sigma_bins"]))
+                          loss_fn=make_loss(DEFAULTS["js_weight"], DEFAULTS["sigma_bins"], loss),
+                          trainable=TRAINABLE, head=HEAD)

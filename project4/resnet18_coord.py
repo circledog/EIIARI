@@ -37,7 +37,7 @@ LABEL = "ResNet18 CoordConv"
 KEYS = ("fc.weight", "coords")
 # Input image size the coordinate maps are made for (camera.preprocess always resizes to it)
 SIZE = 224
-# Training settings: same as the plain ResNet-18 (Adam 1e-3, MSE)
+# Training settings: same as the plain ResNet-18 (teammate recipe, see training.py)
 DEFAULTS = dict(resnet18.DEFAULTS)
 
 
@@ -133,8 +133,8 @@ def build(pretrained=True, num_outputs=2):
     return model
 
 
-# Same training routine as the plain ResNet-18 (Adam + MSE, best validation MSE)
-def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME):
+# Same training routine as the plain ResNet-18 (same parameter names, so the same layers are trained)
+def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse"):
     """See ``resnet18.train``. Returns (best validation metrics, per-epoch history)."""
     # Shared routine
-    return resnet18.train(model, train_loader, val_loader, device, epochs, lr, tag)
+    return resnet18.train(model, train_loader, val_loader, device, epochs, lr, tag, loss=loss)

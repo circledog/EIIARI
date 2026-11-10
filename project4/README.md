@@ -32,6 +32,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `camera.py` | Nano | 相機輸入與前處理 |
 | `control.py` | Nano | 轉向角（隊友公式／投影片公式）＋ PID ＋ 差速控制，含平滑和安全檢查 |
 | `train.py` | PC | 依任務呼叫各網路的 `train()`：訓練 → 剪枝 → finetune → 匯出，可多 seed |
+| `training.py` | PC | 共用訓練迴圈 `fit()`：隊友流程 ① 的訓練方式（部分凍結、凍結 BN、AdamW、cosine、gradient clipping、用 px 挑模型、提早停止） |
 | `train_experiments.ipynb` | PC / Colab | 一格一個訓練實驗（設定 + `run(...)`），印 test 結果；已訓練過的同設定自動跳過；最後一格總表。第一格是安裝環境 |
 | `live_demo.ipynb` | Nano（PC 也能開介面） | 推論＋控制的操作介面，只列 TensorRT 模型 |
 | `requirements-pc.txt` | PC | PC / Colab 端套件 |
@@ -138,8 +139,9 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 
 - 每個網路檔都有：
   - `build(pretrained, num_outputs)`：建立網路。
-  - `DEFAULTS`：這個網路的預設 epochs、lr、finetune epochs、finetune lr。`train.py` 沒指定時就用這裡的值。
-  - `train(model, train_loader, val_loader, device, epochs, lr, tag)`：這個網路的訓練流程（目前兩個都是 Adam + MSE，保留 validation MSE 最低的 epoch）。要針對某個網路改 optimizer、loss 或學習率排程，只改它自己的檔案，不會影響另一個。
+  - `DEFAULTS`：這個網路的預設 epochs、lr（head 的學習率）、finetune epochs、finetune lr，以及 `backbone_lr_scale`（0.1）、`weight_decay`（1e-4）、`patience`（5）、`min_epochs`（10）。`train.py` 沒指定時就用這裡的值。
+  - `TRAINABLE` / `HEAD`：要訓練的參數名稱前綴、拿完整學習率的前綴（見下方「訓練方式」）。
+  - `train(model, train_loader, val_loader, device, epochs, lr, tag, loss)`：呼叫共用的 `training.fit()`，帶入這個網路的設定。
 - MobileNetV2 是給報告比較用的 other model：運算量約 ResNet-18 的 1/6，本來就是為行動裝置設計的。剪枝 30% 後是 0.15 G / 1.08 M。
   - 注意：PC CPU 上兩者未剪枝的延遲差不多（depthwise convolution 在 CPU 上效率不好），差距要在 Nano 的 GPU / TensorRT 上才看得出來，請以板子上的 benchmark 為準。
 - `loader.py`：
@@ -149,7 +151,24 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
   - `load_model(path)`：自動判斷 `.pth` 是 PyTorch 權重還是 TensorRT 包裝。TRT 的輸入 dtype 從 engine 讀。**`.json` 有記錄 SHA256 時會先比對，對不上就拒絕載入**（檔案沒傳完整，或 `.json` 配錯檔）。
   - `list_models(dir)`：給介面下拉選單用，顯示名稱來自同名的 `.json`。
 - 要再加網路：新增一個 `<名稱>.py`（`NAME`、`FILE_TAG`、`LABEL`、`KEYS`、`DEFAULTS`、`build()`、`train()`），再加進 `loader.ARCHS`。加完先跑 `check_trt_offline.py` 確認轉得了 TRT。
-- `resnet18.train()` 可以傳 `loss_fn(model, images, labels)` 換掉 MSE（DSNT 就是這樣用），選最佳 epoch 仍然看 validation MSE。
+- `resnet18.train()` 可以傳 `loss_fn(model, images, labels)` 換掉座標 loss（DSNT 就是這樣用：座標 loss + 0.1 × 熱圖 JS），以及自己的 `trainable` / `head`。
+
+### 訓練方式（`training.py`，隊友流程 ①）
+
+所有網路共用，取代原本課程那套（Adam、固定 lr、MSE、用 validation MSE 挑模型）。
+
+| 項目 | 做法 |
+|---|---|
+| 部分凍結 | 只訓練 `TRAINABLE` 開頭的參數。ResNet-18 / CoordConv：`conv1`、`layer3`、`layer4`、`fc`；DSNT：`backbone.conv1/layer3/layer4` + `head`（固定的 `upsample` / `expect` 永遠不訓練）；MobileNetV2 比照：`features.0`、`features.11~18`、`classifier` |
+| BatchNorm | 全部固定在 eval 模式，running mean / var 不被小 batch 改掉 |
+| Optimizer | AdamW，head 用 `lr`，被訓練的 backbone 用 `lr × 0.1`，weight decay 1e-4 |
+| 學習率 | cosine，從 `lr` 降到 1e-6（跨整個 `epochs`） |
+| Gradient clipping | norm 5 |
+| Loss | `--loss mse`（預設）或 `--loss huber`（SmoothL1，beta 0.1 ≈ 11 px） |
+| 挑模型 | validation **平均像素誤差**最低的 epoch |
+| 提早停止 | 至少跑 `min_epochs`（10）後，連續 `patience`（5）個 epoch 沒進步就停 |
+
+隊友的 `experiments.json` 不在 zip 裡，backbone lr 倍率、weight decay、patience 這些數值是常見值，不是隊友實際用的。
 
 ### `metrics.py`、`sanity.py`
 
@@ -221,7 +240,7 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 在 `project4/` 裡開，直接 Run All：
 - 第 0 節安裝環境（`pip install -r requirements-pc.txt`，已裝的會略過）並顯示有沒有 GPU。
 - 之後每一格是一個實驗：`model`、`epochs`、`lr`、`augment`（開 / 關）、`batch_size`、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
-- 檔名由所有設定組成（例如 `resnet18_aug2_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
+- 檔名由所有設定組成（例如 `resnet18_aug2_mse_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
 - 內建實驗：5 種網路，augmentation 開、10 epochs，都不剪枝。最後一格依平均像素誤差排序的總表。
 - `requirements-pc.txt` 用 `opencv-python-headless`：沒有螢幕的伺服器（含 Colab）裝一般版 `opencv-python` 會缺 `libGL` 而無法 import。
 
@@ -236,8 +255,9 @@ python train.py --help
 |---|---|
 | `--arch resnet18` / `mobilenet_v2` / `resnet18_coord` / `resnet18_dsnt` / `resnet18_coord_dsnt` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡。前處理（標車道線）固定會做 |
 | `--augment` | augmentation 開關（7 種方法裡最多 2 種的組合，每張圖 ×29）；不加 = 只用原圖 |
-| `--epochs` `--lr` | baseline 訓練；不給就用該網路檔的 `DEFAULTS`（目前都是 10 / 1e-3。augmentation 開時一個 epoch 是 277 × 29 張，所以 epoch 數少） |
+| `--epochs` `--lr` | baseline 訓練（`--lr` 是 head 的學習率）；不給就用該網路檔的 `DEFAULTS`（目前都是 10 / 1e-3。augmentation 開時一個 epoch 是 277 × 29 張，所以 epoch 數少） |
 | `--batch-size 16` | batch size（預設 16） |
+| `--loss mse` / `huber` | 座標 loss（預設 mse） |
 | `--prune 0.3 0.5` | 剪枝比例，可一次給多個 |
 | `--finetune-epochs` `--finetune-lr` | 剪枝後的 finetune；不給就用 `DEFAULTS`（目前都是 15 / 1e-4） |
 | `--seeds 0 1 2` | **多 seed 訓練**：每個 seed 完整跑一次（baseline + 剪枝），最後印出各模型的平均 ± 標準差，存成 `<名稱>_seeds.json`。只給一個值（預設 0）就是一般訓練 |

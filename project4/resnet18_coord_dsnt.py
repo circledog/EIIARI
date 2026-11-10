@@ -49,7 +49,7 @@ def build(pretrained=True, num_outputs=2):
 
 
 # Same training as DSNT
-def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME):
-    """See ``resnet18_dsnt.train``."""
+def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse"):
+    """See ``resnet18_dsnt.train`` (same parameter names, so the same layers are trained)."""
     # Shared DSNT routine
-    return resnet18_dsnt.train(model, train_loader, val_loader, device, epochs, lr, tag)
+    return resnet18_dsnt.train(model, train_loader, val_loader, device, epochs, lr, tag, loss=loss)

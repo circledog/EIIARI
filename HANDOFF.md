@@ -459,9 +459,22 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - 已測：29 種組合都能跑、tiny split 長度 3 × 29 = 87。
 - `train_experiments.ipynb` 的實驗依使用者要求換成 5 種網路 × augmentation 開 × 10 epochs（檔名 `<網路>_aug2_e10_lr0.001_bs16_seed0`），拿掉 augmentation 關的那 5 格。
 
+## 第二十階段（移植隊友流程 ① 的訓練方式，2026-11-10）
+
+使用者對結果不滿意，討論後決定先移植隊友流程 ① 的訓練方式（網路維持簡單）。使用者選擇：直接取代課程那套、超參數用常見值（隊友的 experiments.json 不在 zip 裡）、loss 預設 MSE 可選 Huber、MobileNetV2 比照 ResNet 部分凍結。
+
+- 背景：使用者用 70 epochs 跑的 aug2 結果（`a99f7be`）：coord_dsnt 21.0、dsnt 22.5、resnet18 22.9、coord 24.4、mobilenet 24.8 px；x 誤差 9~12 px、y 16~21 px（y 約是 x 的兩倍）。
+- 新增 `training.py`：`fit()` 共用迴圈。部分凍結（`TRAINABLE` 前綴；原本就凍結的參數不會被解凍，結束時恢復原本的 requires_grad）、BN 全部 eval、AdamW 兩組 lr（head = lr、backbone = lr × 0.1）、weight decay 1e-4、cosine 到 1e-6、clip 5、MSE 或 Huber（beta 0.1）、用 validation `mean_px` 挑模型、`min_epochs` 10 後 `patience` 5 提早停止、非有限 loss 直接報錯。回傳的 metrics 多 `best_epoch`，history 多 `lr`。
+- `resnet18.py`、`mobilenet_v2.py`：`train()` 改呼叫 `training.fit`；`DEFAULTS` 加 `backbone_lr_scale`、`weight_decay`、`patience`、`min_epochs`；新增 `TRAINABLE` / `HEAD`。MobileNetV2 訓練 `features.0`、`features.11~18`、`classifier`。
+- `resnet18_dsnt.py`：`TRAINABLE = backbone.conv1/layer3/layer4 + head`、`HEAD = head`；`make_loss(..., coordinate)` 座標項可選 MSE / Huber。`resnet18_coord.py`、`resnet18_coord_dsnt.py` 轉傳 `loss`。
+- `train.py`：`--loss mse|huber`；`.json` 多 `training`（recipe 與數值）。剪枝後 finetune 也用同一套（lr = finetune_lr）。
+- `train_experiments.ipynb`：每格多 `loss = "mse"`，檔名多 loss 一段（`resnet18_aug2_mse_e10_...`），不會和舊訓練方式的檔案撞名。
+- 已測（sandbox CPU，tiny split）：5 個網路各跑 2 epochs，被改到的參數全部在 `TRAINABLE` 內、BN running stats 沒變、DSNT 固定層仍 requires_grad=False、結束後 flag 恢復；提早停止（patience 2、min 3）在第 4 epoch 停；`train.py --augment --loss huber --prune 0.3` 完整跑完；notebook `run()` 第二次正確跳過。
+- 注意：預設 epochs 10 = `min_epochs`，所以 10 epochs 時提早停止不會觸發；要讓它作用，epochs 要設大一點（例如 30~70）。
+
 ## 未完成 / 未驗證
 
-- 隊友 ① 流程的訓練技巧（部分凍結、AdamW、cosine、Huber、提早停止、用 px 選模型）沒有移植，等使用者決定。
+- 隊友流程 ① 的訓練方式已移植（第二十階段），但還沒在 GPU 上用真實資料訓練、和舊結果比較。
 - CoordConv / DSNT 還沒有用真實資料完整訓練過，也還沒在車上轉 TRT（離線模擬全部 OK）。
 - **TensorRT 路徑完全沒有測過**（sandbox 沒有 GPU／TensorRT）：`load_model` 讀 TRT `.pth` 的部分、`_trt_input_dtype`、`TRTModule` 跟 trtexec 建出的 explicit-batch engine 是否相容（前次交接列的最大風險）。
 - **Nano 實測進度**：使用者在板子上跑過 live_demo，修好舊版 torchvision 的 `TypeError` 後，模型能載入、畫面能更新（第三階段）。以下**還沒在板子上驗證**：
@@ -511,4 +524,4 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
 6. 車上跑 `python3 check_trt_coord.py`，確認 4 個 ResNet 網路在真的 TensorRT 上 OK（離線模擬已全部 OK）；結果貼回來。
 7. 用新的 `train_experiments.ipynb`（5 種網路 × augmentation 開 / 關）正式訓練，比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
-8. 決定要不要移植隊友 ① 的訓練技巧。pure pursuit：使用者決定**不做**（2026-11-03）。
+8. 用新訓練方式重跑 `train_experiments.ipynb`，和第二十階段背景的舊結果比較；之後再決定要不要把轉向角誤差加進評估。pure pursuit：使用者決定**不做**（2026-11-03）。

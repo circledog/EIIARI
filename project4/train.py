@@ -60,6 +60,8 @@ from data_loader import DEFAULT_DATA_DIR, has_split_folders, make_loaders
 from loader import ARCHS, build_model, detect_arch, read_meta, rebuild_from_state_dict, write_meta
 # MSE and pixel-error metrics
 from metrics import evaluate
+# Training recipe description and the selectable losses
+from training import LOSSES, RECIPE
 # Description of the lane-marking preprocessing, saved in every .json
 from preprocessing import CONFIG as PREPROCESSING
 # Weights fingerprint and sanity frames for the robot-side check
@@ -151,7 +153,8 @@ def run_seed(args, arch, seed, name, loaders, common, aug):
         # Fresh network (ImageNet weights unless --no-pretrained)
         model = build_model(args.arch, pretrained=not args.no_pretrained).to(device)
         # The network's own training routine
-        best, history = arch.train(model, train_loader, val_loader, device, args.epochs, args.lr, "base")
+        best, history = arch.train(model, train_loader, val_loader, device, args.epochs, args.lr, "base",
+                                   loss=args.loss)
         # Test metrics of the chosen weights
         test = report_test(model, test_loader, device, "base")
         # Its size
@@ -186,7 +189,7 @@ def run_seed(args, arch, seed, name, loaders, common, aug):
         tag = "pruned%02d" % round(ratio * 100)
         # Fine-tune with the network's own training routine
         best, history = arch.train(pruned, train_loader, val_loader, device,
-                                   args.finetune_epochs, args.finetune_lr, tag)
+                                   args.finetune_epochs, args.finetune_lr, tag, loss=args.loss)
         # Test metrics of the chosen weights
         test = report_test(pruned, test_loader, device, tag)
         # Metadata of the pruned model
@@ -250,8 +253,10 @@ def main():
                     help="subsets of at most 2 of flip / rotate / crop / color / noise / blur / compress (x29 per epoch)")
     # Baseline training epochs
     ap.add_argument("--epochs", type=int, default=None, help="default: the network's DEFAULTS")
-    # Baseline learning rate
-    ap.add_argument("--lr", type=float, default=None, help="default: the network's DEFAULTS")
+    # Baseline learning rate (head; the trained backbone parts get it x backbone_lr_scale)
+    ap.add_argument("--lr", type=float, default=None, help="head lr, default: the network's DEFAULTS")
+    # Coordinate loss
+    ap.add_argument("--loss", choices=LOSSES, default="mse", help="coordinate loss (huber: SmoothL1, beta 0.1)")
     # Batch size
     ap.add_argument("--batch-size", type=int, default=16)
     # Share of images used for validation
@@ -340,6 +345,8 @@ def main():
     common = {
         "arch": args.arch,
         "preprocessing": PREPROCESSING,
+        "training": dict(RECIPE, loss=args.loss, **{k: arch.DEFAULTS[k] for k in
+                                                    ("backbone_lr_scale", "weight_decay", "patience", "min_epochs")}),
         "augmentation": {"enabled": aug.enabled, "method": "powerset", "methods": list(METHODS), "max_methods": MAX_METHODS,
                          "variants_per_image": aug.n_variants, "tag": aug.tag()},
         "data": os.path.abspath(args.data),
@@ -356,8 +363,8 @@ def main():
     # How the data was split
     print("split: %s" % train_loader.split_info)
     # Training settings in use
-    print("training: %d epochs lr %g, finetune %d epochs lr %g, seeds %s"
-          % (args.epochs, args.lr, args.finetune_epochs, args.finetune_lr, args.seeds))
+    print("training: %d epochs lr %g, finetune %d epochs lr %g, loss %s, seeds %s"
+          % (args.epochs, args.lr, args.finetune_epochs, args.finetune_lr, args.loss, args.seeds))
     # (seed, results) of every run
     per_seed = []
     # One full run per seed
