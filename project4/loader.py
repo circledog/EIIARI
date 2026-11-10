@@ -147,8 +147,8 @@ def _meta_path(path):
 def write_meta(path, meta):
     # Open the sidecar .json for writing
     with open(_meta_path(path), "w", encoding="utf-8") as f:
-        # Pretty-printed, keeping non-ASCII text readable
-        json.dump(meta, f, indent=2, ensure_ascii=False)
+        # Pretty-printed, ASCII only (non-ASCII escaped) so any locale can read and write it
+        json.dump(meta, f, indent=2)
 
 
 # Load a checkpoint's metadata, or an empty dict if there is none

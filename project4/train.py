@@ -391,7 +391,7 @@ def main():
         with open(path, "w", encoding="utf-8") as f:
             # Seeds, shared metadata and the statistics
             json.dump({"name": name, "seeds": args.seeds, "summary": summary,
-                       "settings": {k: v for k, v in common.items()}}, f, indent=2, ensure_ascii=False)
+                       "settings": {k: v for k, v in common.items()}}, f, indent=2)
         # Readable table: model, split, mean +- std of MSE and pixel error
         for tag, splits in summary.items():
             # Validation and test rows

@@ -477,6 +477,7 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - 車上 Jupyter 的 docker 容器語系是 ASCII：`convert_trt.py` 寫 `.json`（含中文 sanity 訊息）時出現 `UnicodeEncodeError`。
 - 修正：所有文字檔的 `open()` 都指定 `encoding="utf-8"`（`loader.write_meta/read_meta`、`data_loader`、`train.py`、`live_demo` 的 CSV、`check_trt_coord.py`）；`convert_trt.py` 的 stdout 不是 UTF-8 時改包成 UTF-8。
 - 已在 `LANG=C` 下驗證讀寫和印出中文都正常。
+- 之後再改成不寫中文：`sanity.py` 的三個訊息改英文（所有 `.py` 現在都是純 ASCII）；`.json` 拿掉 `ensure_ascii=False`，一律只輸出 ASCII。`live_demo` 介面上的中文（按鈕、狀態文字）只顯示在瀏覽器，不寫檔、不印到終端機，保留。
 - 車上要在 Jupyter 容器裡跑（SSH 的 `/usr/bin/python3` 沒有 torchvision、jetbot）；板子家目錄 = 容器的 `/workspace`。
 
 ## 未完成 / 未驗證

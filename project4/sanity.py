@@ -101,7 +101,7 @@ def check(model, meta=None):
     if not samples:
         # Nothing to compare
         return {"status": "missing", "max_error_px": None, "tolerance_px": tol, "samples": 0,
-                "message": "這個模型的 .json 沒有 sanity 資料（舊版 train.py 產生），無法比對"}
+                "message": "no sanity data in this model's .json (made by an old train.py), cannot compare"}
     # Largest difference so far
     worst = 0.0
     # Every stored frame
@@ -114,14 +114,14 @@ def check(model, meta=None):
         if not np.all(np.isfinite(out)):
             # Report it right away
             return {"status": "failed", "max_error_px": float("inf"), "tolerance_px": tol,
-                    "samples": len(samples), "message": "模型輸出 NaN / inf"}
+                    "samples": len(samples), "message": "model output is NaN / inf"}
         # Largest coordinate difference in pixels
         worst = max(worst, float(np.max(np.abs(out - np.asarray(s["expected"])))) * PX_PER_UNIT)
     # Passed if within the tolerance
     status = "passed" if worst <= tol else "failed"
     # Result for the UI
     return {"status": status, "max_error_px": worst, "tolerance_px": tol, "samples": len(samples),
-            "message": "%d 張比對，最大差 %.3f px（容許 %.1f px）" % (len(samples), worst, tol)}
+            "message": "%d frames compared, max diff %.3f px (tolerance %.1f px)" % (len(samples), worst, tol)}
 
 
 # CPU FP32 copy of a network, leaving the original untouched
