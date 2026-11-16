@@ -217,9 +217,9 @@ def make_loss(js_weight=DEFAULTS["js_weight"], sigma_bins=DEFAULTS["sigma_bins"]
 
 
 # Shared ResNet-18 training loop with the DSNT loss
-def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse"):
+def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse", early_stop=False):
     """Teammate's recipe (``training.py``) with coordinate loss + 0.1 JS heatmap loss."""
     # Shared routine with the heatmap loss and the DSNT parameter names
     return resnet18.train(model, train_loader, val_loader, device, epochs, lr, tag,
                           loss_fn=make_loss(DEFAULTS["js_weight"], DEFAULTS["sigma_bins"], loss),
-                          trainable=TRAINABLE, head=HEAD)
+                          trainable=TRAINABLE, head=HEAD, early_stop=early_stop)

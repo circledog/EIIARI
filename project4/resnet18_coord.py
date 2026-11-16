@@ -39,6 +39,8 @@ KEYS = ("fc.weight", "coords")
 SIZE = 224
 # Training settings: same as the plain ResNet-18 (teammate recipe, see training.py)
 DEFAULTS = dict(resnet18.DEFAULTS)
+# Trained / full-lr parameter prefixes: the same names as the plain ResNet-18
+TRAINABLE, HEAD = resnet18.TRAINABLE, resnet18.HEAD
 
 
 # Fixed coordinate maps: channel 0 = x (varies along the width), channel 1 = y (along the height)
@@ -134,7 +136,8 @@ def build(pretrained=True, num_outputs=2):
 
 
 # Same training routine as the plain ResNet-18 (same parameter names, so the same layers are trained)
-def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse"):
+def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse", early_stop=False):
     """See ``resnet18.train``. Returns (best validation metrics, per-epoch history)."""
     # Shared routine
-    return resnet18.train(model, train_loader, val_loader, device, epochs, lr, tag, loss=loss)
+    return resnet18.train(model, train_loader, val_loader, device, epochs, lr, tag, loss=loss,
+                          early_stop=early_stop)

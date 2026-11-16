@@ -60,7 +60,7 @@ HEAD = ("fc",)
 
 # Train ResNet-18 and keep its best weights
 def train(model, train_loader, val_loader, device, epochs, lr, tag="resnet18", loss="mse", loss_fn=None,
-          trainable=TRAINABLE, head=HEAD):
+          trainable=TRAINABLE, head=HEAD, early_stop=False):
     """ResNet-18 training with the teammate's recipe (see ``training.py``).
 
     Used for the baseline and for fine-tuning after pruning (train.py passes
@@ -68,11 +68,11 @@ def train(model, train_loader, val_loader, device, epochs, lr, tag="resnet18", l
     ``loss_fn(model, images, labels) -> loss`` replaces the coordinate loss
     (DSNT's heatmap loss); ``trainable`` / ``head`` are parameter-name
     prefixes (the variants pass their own). Model selection: validation
-    mean pixel distance, with early stopping.
+    mean pixel distance; ``early_stop`` turns on early stopping.
     Returns (best validation metrics, per-epoch history).
     """
     # Shared loop with this network's settings
     return training.fit(model, train_loader, val_loader, device, epochs, lr, tag, trainable, head,
                         backbone_lr_scale=DEFAULTS["backbone_lr_scale"], weight_decay=DEFAULTS["weight_decay"],
                         patience=DEFAULTS["patience"], min_epochs=DEFAULTS["min_epochs"], loss=loss,
-                        loss_fn=loss_fn)
+                        loss_fn=loss_fn, early_stop=early_stop)

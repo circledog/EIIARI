@@ -15,14 +15,15 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 |---|---|---|
 | `train_model.ipynb` | — | 課程原始範例，留作參考 |
 | `data_loader.py` | PC | 資料集與 DataLoader |
-| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；固定開啟，即時做、不存檔 |
+| `preprocessing.py` | PC + Nano | 前處理：把車道線（白膠帶）標成紅色，彎道也適用；預設開啟（`train.py --no-lanes` 可關，做對照組），即時做、不存檔 |
 | `augmentation.py` | PC | 資料增強：一個開關，開了就用 7 種方法裡最多 2 種的所有組合（29 種）擴張訓練集 |
 | `resnet18.py` | PC + Nano | ResNet-18：網路定義＋它自己的訓練函式 `train()` 與預設參數 |
 | `mobilenet_v2.py` | PC + Nano | MobileNetV2：網路定義＋它自己的訓練函式（比較用的 other model） |
 | `resnet18_coord.py` | PC + Nano | ResNet-18 + CoordConv：模型裡自己加 x / y 座標通道（隊友的 `course_coordconv`） |
 | `resnet18_dsnt.py` | PC + Nano | ResNet-18 + DSNT：熱圖 + 期望值輸出，訓練多一項熱圖損失（隊友的 `dsnt`） |
 | `resnet18_coord_dsnt.py` | PC + Nano | CoordConv + DSNT（隊友的 `coordconv_dsnt`） |
-| `metrics.py` | PC | 評估指標：MSE 和像素誤差（平均、x / y、p95） |
+| `metrics.py` | PC | 評估指標：MSE、像素誤差（平均、x / y、p95）、轉向角誤差（度） |
+| `version.py` | PC + Nano | 程式碼版本（git commit）：訓練時存進 `.json`，`live_demo` 載入模型時和車上的程式碼比對 |
 | `sanity.py` | PC + Nano | 權重 SHA256、sanity 比對畫面（訓練時存、車上比對） |
 | `loader.py` | PC + Nano | 所有網路共用：建立、剪枝後重建、載入（PyTorch / TensorRT）、`.json` |
 | `compression.py` | PC（`wrap_trt_engine` 在 Nano） | DepGraph 剪枝、ONNX 匯出、TRT 包裝 |
@@ -32,9 +33,11 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `camera.py` | Nano | 相機輸入與前處理 |
 | `control.py` | Nano | 轉向角（隊友公式／投影片公式）＋ PID ＋ 差速控制，含平滑和安全檢查 |
 | `train.py` | PC | 依任務呼叫各網路的 `train()`：訓練 → 剪枝 → finetune → 匯出，可多 seed |
-| `training.py` | PC | 共用訓練迴圈 `fit()`：隊友流程 ① 的訓練方式（部分凍結、凍結 BN、AdamW、cosine、gradient clipping、用 px 挑模型、提早停止） |
+| `training.py` | PC | 共用訓練迴圈 `fit()`：隊友流程 ① 的訓練方式（部分凍結、凍結 BN、AdamW、cosine、gradient clipping、用 px 挑模型、可選的提早停止） |
 | `train_experiments.ipynb` | PC / Colab | 一格一個訓練實驗（設定 + `run(...)`），印 test 結果；已訓練過的同設定自動跳過；最後一格總表。第一格是安裝環境 |
 | `live_demo.ipynb` | Nano（PC 也能開介面） | 推論＋控制的操作介面，只列 TensorRT 模型 |
+| `tools/make_train_experiments.py` | PC | 產生 `train_experiments.ipynb`；要改實驗改這個檔案再重新產生 |
+| `tests/` | PC | 自動化測試（不需要資料、GPU、網路），見下方「測試」 |
 | `requirements-pc.txt` | PC | PC / Colab 端套件 |
 
 程式碼註解規則：每行有實質內容的程式碼，上一行都有一條英文註解（常見的 library import、單獨的括號、docstring 除外）。修改程式時請維持這個格式。
@@ -66,7 +69,9 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 
 ### `preprocessing.py`
 
-**只做一件事：把車道線標出來**，而且**固定開啟、沒有開關**。
+**只做一件事：把車道線標出來**。預設開啟；`train.py --no-lanes` 可以關掉，用原圖訓練當對照組（看這個前處理到底有沒有幫助）。
+
+- **開關在 `train.py`，不在這個檔案**：關掉時 `.json` 的 `preprocessing.method` 記成 `"none"`、檔名多 `_nolane`、sanity 比對畫面也存原圖；`live_demo` 依每個模型的 `.json` 決定每一幀要不要標，所以兩種模型可以在車上直接切換。舊模型照舊會標。
 
 - **即時做、不存檔**：訓練時在 DataLoader 裡對每張圖做（`mark_lanes_pil`），車上 `live_demo.ipynb` 對每一幀做（`apply_frame`）。
 - **順序在 augmentation 之後**：訓練是「讀圖 → augmentation → 標車道線」，車上是「相機 → 標車道線」（車上不會對鏡頭畫面加任何干擾）。驗證集一樣會標車道線，只是不做 augmentation。
@@ -166,13 +171,14 @@ python preprocessing.py review --data <資料夾> --model models/X.pth    # 依�
 | Gradient clipping | norm 5 |
 | Loss | `--loss mse`（預設）或 `--loss huber`（SmoothL1，beta 0.1 ≈ 11 px） |
 | 挑模型 | validation **平均像素誤差**最低的 epoch |
-| 提早停止 | 至少跑 `min_epochs`（10）後，連續 `patience`（5）個 epoch 沒進步就停 |
+| 提早停止 | **預設關閉**，跑完全部 epoch、留 validation 最好的那個。`train.py --early-stop` 打開：至少跑 `min_epochs`（10）後，連續 `patience`（5）個 epoch 沒進步就停。關掉的原因：patience 是用 epoch 算的，augmentation 開（epoch 少）和關（epoch 多）時效果不同，比較會不公平 |
 
 隊友的 `experiments.json` 不在 zip 裡，backbone lr 倍率、weight decay、patience 這些數值是常見值，不是隊友實際用的。
 
 ### `metrics.py`、`sanity.py`
 
-- `metrics.evaluate(model, loader)`：回傳 `mse`、`mae_x_px`、`mae_y_px`、`mean_px`（平均距離）、`p95_px`（95% 的圖誤差在這以內）。標籤是 224×224 圖上的座標，1 個正規化單位 = 112 px。像素誤差比 MSE 好理解，例如「目標點平均偏 15 px」。
+- `metrics.evaluate(model, loader)`：回傳 `mse`、`mae_x_px`、`mae_y_px`、`mean_px`（平均距離）、`p95_px`（95% 的圖誤差在這以內），以及 `angle_deg` / `p95_angle_deg`（轉向角誤差，度）。標籤是 224×224 圖上的座標，1 個正規化單位 = 112 px。像素誤差比 MSE 好理解，例如「目標點平均偏 15 px」。
+  - 轉向角誤差：把預測點和標籤點都用車上預設的轉向公式（`control.py` 的隊友公式）換成角度再相減。遠處的 y 誤差對轉向影響小、近處的 x 誤差影響大，這個指標比像素誤差更接近「開得好不好」。標籤在停車線以下的點會夾到停車線，所以每張圖都有角度。
 - `sanity.py`（借用隊友部署包的做法）：
   - 訓練存檔時，在 `.json` 存 8 張 validation 畫面（已標車道線，PNG 無損）和 PC 上 FP32 的輸出，以及 `.pth` 的 SHA256。
   - 車上 `sanity.check(model)` 用同樣的畫面跑一次，最大差超過容許值（FP32 1 px；FP16 / TensorRT 2 px）就算失敗。`convert_trt.py` 轉完會比對一次，`live_demo` 每次載入模型也會比對；**沒通過就禁止開車**。
@@ -239,9 +245,14 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 
 在 `project4/` 裡開，直接 Run All：
 - 第 0 節安裝環境（`pip install -r requirements-pc.txt`，已裝的會略過）並顯示有沒有 GPU。
-- 之後每一格是一個實驗：`model`、`epochs`、`lr`、`augment`（開 / 關）、`batch_size`、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE 和像素誤差。
-- 檔名由所有設定組成（例如 `resnet18_aug2_mse_e10_lr0.001_bs16_seed0`），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
-- 內建實驗：5 種網路，augmentation 開、10 epochs，都不剪枝。最後一格依平均像素誤差排序的總表。
+- 由 `tools/make_train_experiments.py` 產生（`python3 tools/make_train_experiments.py`）。要改實驗改那個檔案再重新產生；`tests/` 會檢查兩者一致。
+- 之後每一格是一個實驗：`model`、`epochs`、`lr`、`augment`（開 / 關）、`lanes`（標 / 不標車道線）、`early_stop`、`batch_size`、`loss`、`seeds`，最後 `run(...)` 呼叫 `train.py`，訓練完印出 **test** 的 MSE、像素誤差和轉向角誤差。
+- 檔名由所有設定組成（例如 `resnet18_aug2_mse_e5_lr0.001_bs16`，不標車道線多 `_nolane`、提早停止多 `_es`；3 個 seed 的檔案再加 `_s17` 等），`models/` 裡已有同名模型就不訓練，直接讀 `.json` 印上次的結果。要重訓就刪掉那個模型的檔案。
+- 內建實驗（每個都跑 seeds 17 / 29 / 43，看平均 ± 標準差，都不剪枝、不提早停止）：
+  1. 5 種網路，augmentation 開、5 epochs
+  2. 5 種網路，augmentation 關、145 epochs：277 × 145 = 277 × 29 × 5 = 40,165 個樣本，和第 1 節練一樣多，比較才公平
+  3. 5 種網路，augmentation 開、5 epochs、不標車道線（和第 1 節比，看車道線前處理有沒有幫助）
+  4. 依平均像素誤差排序的總表（含轉向角誤差）
 - `requirements-pc.txt` 用 `opencv-python-headless`：沒有螢幕的伺服器（含 Colab）裝一般版 `opencv-python` 會缺 `libGL` 而無法 import。
 
 ### `train.py`
@@ -253,7 +264,9 @@ python train.py --help
 
 | 參數 | 說明 |
 |---|---|
-| `--arch resnet18` / `mobilenet_v2` / `resnet18_coord` / `resnet18_dsnt` / `resnet18_coord_dsnt` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡。前處理（標車道線）固定會做 |
+| `--arch resnet18` / `mobilenet_v2` / `resnet18_coord` / `resnet18_dsnt` / `resnet18_coord_dsnt` | 網路（預設 resnet18）。訓練流程在該網路的檔案裡 |
+| `--no-lanes` | 不標車道線，用原圖訓練（對照組）；檔名多 `_nolane`。`--base` 時沿用 baseline 的設定 |
+| `--early-stop` | 打開提早停止（預設關閉，跑完全部 epoch、留 validation 最好的） |
 | `--augment` | augmentation 開關（7 種方法裡最多 2 種的組合，每張圖 ×29）；不加 = 只用原圖 |
 | `--epochs` `--lr` | baseline 訓練（`--lr` 是 head 的學習率）；不給就用該網路檔的 `DEFAULTS`（目前都是 10 / 1e-3。augmentation 開時一個 epoch 是 277 × 29 張，所以 epoch 數少） |
 | `--batch-size 16` | batch size（預設 16） |
@@ -267,18 +280,19 @@ python train.py --help
 | `--split session` `--metadata DIR` `--segment-gap 60` | 照拍攝段落切 train / val（`--metadata` 預設是 `--data` 旁邊的 `metadata/`） |
 | `--data` `--out` | 資料集路徑（有 `train/ validation/ test/` 子資料夾就直接照用）、輸出資料夾（預設 `models/`） |
 
-產出：`models/<網路>_<aug>_{base,pruned30,pruned50}.{pth,json}`，例如 `mobilenetv2_aug2_pruned30.pth`；多個 seed 時檔名多一段 `_s<seed>`，例如 `mobilenetv2_aug2_s1_pruned30.pth`。`.json` 裡有：
+產出：`models/<網路>_<aug>[_nolane]_{base,pruned30,pruned50}.{pth,json}`，例如 `mobilenetv2_aug2_pruned30.pth`；多個 seed 時檔名多一段 `_s<seed>`，例如 `mobilenetv2_aug2_s1_pruned30.pth`。`.json` 裡有：
 
 - loss 曲線（每個 epoch 的 train loss、val MSE、val 平均像素誤差）
-- `val_metrics` / `test_metrics`：MSE、x / y 平均誤差、平均距離、p95（px）
-- MACs / params、資料切分、seed
+- `val_metrics` / `test_metrics`：MSE、x / y 平均誤差、平均距離、p95（px）、轉向角誤差（度）
+- MACs / params、資料切分、seed、`preprocessing`（有沒有標車道線）、`training.early_stop`
+- `code_version`：訓練時的 git commit 和有沒有未 commit 的修改（`live_demo` 會和車上的程式碼比對）
 - `weights_sha256` 和 `sanity`（車上比對用，約 0.9 MB，主要是 8 張 PNG）
 
 ### `live_demo.ipynb`
 
 | 區塊 | 內容 |
 |---|---|
-| 模型 | 下拉選單**只列 `models_trt/` 的 TensorRT 模型**，一開始是「未載入模型」，選了才載入。載入完成就開始推論，下方顯示 sanity 比對結果 |
+| 模型 | 下拉選單**只列 `models_trt/` 的 TensorRT 模型**，一開始是「未載入模型」，選了才載入。載入完成就開始推論，下方顯示 sanity 比對結果。資訊列會顯示程式碼版本比對：綠字＝和訓練時同一個 commit；橘字＝不同或無法判斷（例如用 scp 複製、沒有 git），這時先確認車上的程式碼是最新的。`--no-lanes` 模型會標示「不標車道線」，畫面也不會塗紅 |
 | 連線狀態 | 車子、鏡頭有沒有連上。偵測不到 JetBot 就用假馬達（只顯示數值）；鏡頭打不開就顯示「未連接鏡頭」 |
 | 畫面 | 模型實際看到的影像（紅色車道線）、綠色預測點、上方橘色轉向條 |
 | 控制參數（全部是按鈕或滑桿） | 轉向角公式、max / min speed、kp、ki、kd、steering bias、轉彎減速、角度平滑 α、馬達變化率、馬達上限、內側輪可反轉、安全逾時 |
@@ -301,6 +315,26 @@ python train.py --help
 **沒有車也能看介面**：PC 上裝好 `jupyter`、`ipywidgets` 和 `requirements-pc.txt` 的套件後，開 `live_demo.ipynb` 執行全部 cell 即可。PC 沒有 TensorRT，下拉選單會是空的或載入失敗，這是正常的；要看推論畫面的話，第 1 節可以改 `CAMERA_SOURCE = 'opencv'`（筆電 webcam）或 `'folder'`，`MODELS_DIR` 改指向 `models/`。
 
 ---
+
+## 測試
+
+在 `project4/` 裡（PC，不需要資料集、GPU、網路，約 15 秒）：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+| 檔案 | 檢查什麼 |
+|---|---|
+| `test_augmentation.py` | 29 個組合；翻轉、旋轉、裁切後標籤跟著畫面移動（誤差 < 1.5 px）；每個組合都能跑 |
+| `test_data_loader.py` | augmentation 長度 ×29；`lanes` 開關；訓練路徑和車上路徑餵進模型的 tensor 相同 |
+| `test_training.py` | 每個網路只訓練 `TRAINABLE` 的層、BN 統計值不變、DSNT 固定層不變；`early_stop` 開關 |
+| `test_metrics.py` | 轉向角誤差和 `control.py` 的公式一致；完美預測誤差為 0 |
+| `test_sanity.py` | sanity 畫面依 `lanes` 存標過 / 原圖，同一個模型比對會通過，訊息是 ASCII |
+| `test_version.py` | 程式碼版本比對規則 |
+| `test_files.py` | 所有 `.py` 都是 ASCII（車上容器是 ASCII 語系）、`.json` 只輸出 ASCII、notebook 和產生器一致 |
+
+TensorRT 轉換另外用 `check_trt_offline.py`（PC，需要 torch2trt 原始碼）和車上的 `check_trt_coord.py` 檢查。
 
 ## DEMO 前（PC / Colab，有 GPU）
 

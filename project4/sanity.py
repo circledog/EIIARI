@@ -15,8 +15,9 @@ If the largest difference exceeds the tolerance (1 px for FP32, 2 px for
 FP16 / TensorRT) something went wrong in the conversion and ``live_demo``
 does not allow driving.
 
-The frames are stored after lane marking, so the check covers the network
-and its runtime only; lane marking itself is the same code on both sides.
+The frames are stored after lane marking (plain frames for a model trained
+with ``train.py --no-lanes``), so the check covers the network and its
+runtime only; lane marking itself is the same code on both sides.
 
 Python 3.6 compatible (runs on the Jetson Nano).
 """
@@ -58,8 +59,11 @@ def file_sha256(path):
 
 
 # Build the sanity data for a freshly trained model (PC side)
-def make_sanity(model, image_paths, n=N_SAMPLES):
-    """``{"samples": [{"file", "png_b64", "expected"}]}`` for the first ``n`` paths."""
+def make_sanity(model, image_paths, n=N_SAMPLES, lanes=True):
+    """``{"samples": [{"file", "png_b64", "expected"}]}`` for the first ``n`` paths.
+
+    ``lanes``: mark the lane lines first, as the model's training did.
+    """
     # Evaluate a CPU FP32 copy so the reference is exact
     ref = _cpu_fp32_copy(model)
     # One entry per frame
@@ -68,8 +72,8 @@ def make_sanity(model, image_paths, n=N_SAMPLES):
     for path in list(image_paths)[:n]:
         # Raw camera-like BGR frame, resized like the robot's 224x224 camera
         frame = cv2.resize(cv2.imread(path), (224, 224))
-        # Lane marking, exactly as on the robot
-        marked = apply_frame(frame)
+        # Lane marking, exactly as on the robot (plain frame for a no-lanes model)
+        marked = apply_frame(frame) if lanes else frame
         # Lossless encoding so the robot decodes identical pixels
         ok, png = cv2.imencode(".png", marked)
         # Reference output of the network

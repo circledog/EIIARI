@@ -21,6 +21,8 @@ LABEL = "ResNet18 CoordConv+DSNT"
 KEYS = ("expect.weight", "coords")
 # Same settings as DSNT
 DEFAULTS = dict(resnet18_dsnt.DEFAULTS)
+# Trained / full-lr parameter prefixes: the same names as DSNT
+TRAINABLE, HEAD = resnet18_dsnt.TRAINABLE, resnet18_dsnt.HEAD
 
 
 # DSNT whose stem also sees the coordinate maps
@@ -49,7 +51,8 @@ def build(pretrained=True, num_outputs=2):
 
 
 # Same training as DSNT
-def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse"):
+def train(model, train_loader, val_loader, device, epochs, lr, tag=NAME, loss="mse", early_stop=False):
     """See ``resnet18_dsnt.train`` (same parameter names, so the same layers are trained)."""
     # Shared DSNT routine
-    return resnet18_dsnt.train(model, train_loader, val_loader, device, epochs, lr, tag, loss=loss)
+    return resnet18_dsnt.train(model, train_loader, val_loader, device, epochs, lr, tag, loss=loss,
+                               early_stop=early_stop)

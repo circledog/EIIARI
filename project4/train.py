@@ -1,7 +1,8 @@
 """PC training entry point: baseline -> DepGraph pruning -> finetune -> export.
 
-Preprocessing (lane marking) always runs, live inside the DataLoader after
-augmentation; nothing is written to disk. ``--arch`` picks the network; the
+Preprocessing (lane marking) runs live inside the DataLoader after
+augmentation (``--no-lanes`` switches it off, for the comparison); nothing
+is written to disk. ``--arch`` picks the network; the
 training routine itself lives in that network's file (``resnet18.train`` /
 ``mobilenet_v2.train``), together with its default epochs and learning rates.
 This script only decides *what* to run (task) and calls the network's code.
@@ -28,12 +29,18 @@ Examples
     # three training seeds on the same split: mean +- std for the report
     python train.py --data data/splits --augment --seeds 0 1 2 --prune 0.3
 
+    # comparison without lane marking (plain images; live_demo then skips it for this model)
+    python train.py --data data/splits --augment --no-lanes
+
+    # stop early when validation px has not improved for 5 epochs (off by default)
+    python train.py --data data/splits --epochs 70 --early-stop
+
     # prune an existing baseline without retraining it
     # (augmentation switch and run name are taken from its .json)
     python train.py --base models/resnet18_none_base.pth --prune 0.3 --onnx
     # (the architecture is detected from the file)
 
-Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>`` (``resnet18_aug2``, ``mobilenetv2_none``, ...):
+Outputs in ``--out`` (default ``models/``), per run name ``<arch>_<aug>[_nolane]`` (``resnet18_aug2``, ``mobilenetv2_none``, ...):
     <name>_base.pth / .json          baseline state_dict + metadata
     <name>_pruned30.pth / .json      pruned + finetuned state_dict + metadata
     <name>_*.onnx                    with --onnx (for trtexec on the Nano)
@@ -66,9 +73,13 @@ from training import LOSSES, RECIPE
 from preprocessing import CONFIG as PREPROCESSING
 # Weights fingerprint and sanity frames for the robot-side check
 from sanity import file_sha256, make_sanity
+# Git commit of the code, saved in every .json
+from version import code_version
 
 # Metrics summarised across seeds
-SUMMARY_KEYS = ("mse", "mean_px", "mae_x_px", "mae_y_px", "p95_px")
+SUMMARY_KEYS = ("mse", "mean_px", "mae_x_px", "mae_y_px", "p95_px", "angle_deg", "p95_angle_deg")
+# Stored in .json when lane marking is switched off
+NO_PREPROCESSING = {"method": "none"}
 
 
 # Text describing the augmentation, used in the dropdown label
@@ -79,14 +90,15 @@ def _variant_label(aug):
 
 # Short text of a metrics dict for the log
 def _fmt(m):
-    # MSE and mean / p95 pixel error
-    return "mse %.5f, %.1f px (p95 %.1f px)" % (m["mse"], m["mean_px"], m["p95_px"])
+    # MSE, mean / p95 pixel error and mean steering-angle error
+    return "mse %.5f, %.1f px (p95 %.1f px), angle %.1f deg" % (m["mse"], m["mean_px"], m["p95_px"],
+                                                               m["angle_deg"])
 
 
 # Write a checkpoint, optionally its ONNX file, and its .json
-def save(model, path, meta, onnx, sanity_paths):
-    # Reference frames + outputs for the robot-side check
-    meta["sanity"] = make_sanity(model, sanity_paths)
+def save(model, path, meta, onnx, sanity_paths, lanes):
+    # Reference frames + outputs for the robot-side check (same preprocessing as training)
+    meta["sanity"] = make_sanity(model, sanity_paths, lanes=lanes)
     # Save the weights (state_dict)
     torch.save(model.state_dict(), path)
     # Fingerprint of the saved weights
@@ -154,7 +166,7 @@ def run_seed(args, arch, seed, name, loaders, common, aug):
         model = build_model(args.arch, pretrained=not args.no_pretrained).to(device)
         # The network's own training routine
         best, history = arch.train(model, train_loader, val_loader, device, args.epochs, args.lr, "base",
-                                   loss=args.loss)
+                                   loss=args.loss, early_stop=args.early_stop)
         # Test metrics of the chosen weights
         test = report_test(model, test_loader, device, "base")
         # Its size
@@ -168,7 +180,7 @@ def run_seed(args, arch, seed, name, loaders, common, aug):
         # File of the baseline
         base_path = os.path.join(args.out, name + "_base.pth")
         # Save it
-        save(model, base_path, base_meta, args.onnx, sanity_paths)
+        save(model, base_path, base_meta, args.onnx, sanity_paths, not args.no_lanes)
         # Remember the result for the seed summary
         results["base"] = {"val": best, "test": test}
 
@@ -189,7 +201,8 @@ def run_seed(args, arch, seed, name, loaders, common, aug):
         tag = "pruned%02d" % round(ratio * 100)
         # Fine-tune with the network's own training routine
         best, history = arch.train(pruned, train_loader, val_loader, device,
-                                   args.finetune_epochs, args.finetune_lr, tag, loss=args.loss)
+                                   args.finetune_epochs, args.finetune_lr, tag, loss=args.loss,
+                                   early_stop=args.early_stop)
         # Test metrics of the chosen weights
         test = report_test(pruned, test_loader, device, tag)
         # Metadata of the pruned model
@@ -202,7 +215,8 @@ def run_seed(args, arch, seed, name, loaders, common, aug):
                     test_loss=test["mse"] if test else None, test_metrics=test,
                     macs=info["macs_after"], params=info["params_after"], history=history)
         # Save it
-        save(pruned, os.path.join(args.out, "%s_%s.pth" % (name, tag)), meta, args.onnx, sanity_paths)
+        save(pruned, os.path.join(args.out, "%s_%s.pth" % (name, tag)), meta, args.onnx, sanity_paths,
+             not args.no_lanes)
         # Remember the result for the seed summary
         results[tag] = {"val": best, "test": test}
     # Results of this seed
@@ -257,6 +271,12 @@ def main():
     ap.add_argument("--lr", type=float, default=None, help="head lr, default: the network's DEFAULTS")
     # Coordinate loss
     ap.add_argument("--loss", choices=LOSSES, default="mse", help="coordinate loss (huber: SmoothL1, beta 0.1)")
+    # Lane-marking switch (on unless --no-lanes)
+    ap.add_argument("--no-lanes", action="store_true",
+                    help="train on plain images, without lane marking (comparison); name gets _nolane")
+    # Early stopping switch (off unless --early-stop)
+    ap.add_argument("--early-stop", action="store_true",
+                    help="stop when validation px has not improved for `patience` epochs (after `min_epochs`)")
     # Batch size
     ap.add_argument("--batch-size", type=int, default=16)
     # Share of images used for validation
@@ -314,6 +334,10 @@ def main():
             # Baseline's switch (older files: any of the former general / perlin / compression switches)
             args.augment = bool(base_aug.get("enabled", any(base_aug.get(k) for k in
                                                             ("general", "perlin", "compression"))))
+        # Reuse the baseline's preprocessing unless --no-lanes was given
+        if not args.no_lanes:
+            # Plain-image baseline -> plain-image pruned models (old files: lane marking)
+            args.no_lanes = read_meta(args.base).get("preprocessing", {}).get("method") == "none"
         # Baseline file name without extension
         stem = os.path.splitext(os.path.basename(args.base))[0]
         # Derive the run name from "<name>_base"
@@ -338,14 +362,15 @@ def main():
     train_loader, val_loader, test_loader, aug = make_loaders(
         args.data, augment=args.augment,
         val_ratio=args.val_ratio, batch_size=args.batch_size, num_workers=args.workers, seed=args.split_seed,
-        split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap)
-    # Run name, e.g. "mobilenetv2_aug"
-    name = args.name or "%s_%s" % (arch.FILE_TAG, aug.tag())
+        split=args.split, metadata_dir=args.metadata, segment_gap=args.segment_gap, lanes=not args.no_lanes)
+    # Run name, e.g. "mobilenetv2_aug2" or "mobilenetv2_aug2_nolane"
+    name = args.name or "%s_%s%s" % (arch.FILE_TAG, aug.tag(), "_nolane" if args.no_lanes else "")
     # Metadata shared by every model of this run
     common = {
         "arch": args.arch,
-        "preprocessing": PREPROCESSING,
-        "training": dict(RECIPE, loss=args.loss, **{k: arch.DEFAULTS[k] for k in
+        "preprocessing": NO_PREPROCESSING if args.no_lanes else PREPROCESSING,
+        "code_version": code_version(),
+        "training": dict(RECIPE, loss=args.loss, early_stop=args.early_stop, **{k: arch.DEFAULTS[k] for k in
                                                     ("backbone_lr_scale", "weight_decay", "patience", "min_epochs")}),
         "augmentation": {"enabled": aug.enabled, "method": "powerset", "methods": list(METHODS), "max_methods": MAX_METHODS,
                          "variants_per_image": aug.n_variants, "tag": aug.tag()},
@@ -357,14 +382,17 @@ def main():
         "split": train_loader.split_info,
     }
     # Summary of the setup
-    print("data: %d train (%d samples per epoch) / %d val / %d test, %s, %r, lane marking on, device %s"
+    print("data: %d train (%d samples per epoch) / %d val / %d test, %s, %r, lane marking %s, device %s"
           % (common["n_train"], common["n_train_samples"], common["n_val"], common["n_test"], arch.LABEL, aug,
-             args.device))
+             "off" if args.no_lanes else "on", args.device))
     # How the data was split
     print("split: %s" % train_loader.split_info)
     # Training settings in use
-    print("training: %d epochs lr %g, finetune %d epochs lr %g, loss %s, seeds %s"
-          % (args.epochs, args.lr, args.finetune_epochs, args.finetune_lr, args.loss, args.seeds))
+    print("training: %d epochs lr %g, finetune %d epochs lr %g, loss %s, early stop %s, seeds %s"
+          % (args.epochs, args.lr, args.finetune_epochs, args.finetune_lr, args.loss,
+             "on" if args.early_stop else "off", args.seeds))
+    # Version of the code (also in every .json)
+    print("code: %s" % common["code_version"])
     # (seed, results) of every run
     per_seed = []
     # One full run per seed
@@ -397,10 +425,11 @@ def main():
             # Validation and test rows
             for split, stats in splits.items():
                 # One row
-                print("%-10s %-4s mse %.5f +- %.5f | mean %.1f +- %.1f px | p95 %.1f +- %.1f px"
+                print("%-10s %-4s mse %.5f +- %.5f | mean %.1f +- %.1f px | p95 %.1f +- %.1f px | angle %.1f +- %.1f deg"
                       % (tag, split, stats["mse"]["mean"], stats["mse"]["std"],
                          stats["mean_px"]["mean"], stats["mean_px"]["std"],
-                         stats["p95_px"]["mean"], stats["p95_px"]["std"]))
+                         stats["p95_px"]["mean"], stats["p95_px"]["std"],
+                         stats["angle_deg"]["mean"], stats["angle_deg"]["std"]))
         # Where the summary went
         print("seed summary -> %s" % path)
 

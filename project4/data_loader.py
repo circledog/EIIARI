@@ -2,7 +2,7 @@
 
 Per-sample pipeline:
     load jpg + label  ->  Augmenter (one powerset subset, training split only)
-                      ->  preprocessing.mark_lanes_pil (lane marking, always, live)  ->  tensor
+                      ->  preprocessing.mark_lanes_pil (lane marking, live; lanes=False skips it)  ->  tensor
 
 With augmentation on, the training set has len(images) x 29 samples: sample
 ``i`` is image ``i % n_images`` with method subset ``SUBSETS[i // n_images]``
@@ -126,10 +126,13 @@ class XYDataset(torch.utils.data.Dataset):
         appears once per method subset. None -> no augmentation.
     indices : list[int] or None
         Use only these files (indices into the sorted list of all files).
+    lanes : bool
+        Paint the lane lines red (default, as on the robot). False feeds the
+        plain images (the "no lane marking" comparison).
     """
 
     # Find the images and remember which ones this split uses
-    def __init__(self, directory=None, augmenter=None, indices=None):
+    def __init__(self, directory=None, augmenter=None, indices=None, lanes=True):
         # Folder with the images
         self.directory = directory or DEFAULT_DATA_DIR
         # All labelled images in a stable order
@@ -150,6 +153,8 @@ class XYDataset(torch.utils.data.Dataset):
         self.image_paths = chosen
         # Augmentation for this split (None for validation)
         self.augmenter = augmenter
+        # Lane marking on / off
+        self.lanes = lanes
 
     # Variants per image: 29 with augmentation on, else 1
     @property
@@ -177,8 +182,8 @@ class XYDataset(torch.utils.data.Dataset):
         if self.augmenter is not None and self.augmenter.enabled:
             # Augmented image and label
             image, x, y = self.augmenter(image, x, y, subset)
-        # Mark the lane lines last, as on the robot
-        return mark_lanes_pil(image), x, y
+        # Mark the lane lines last, as on the robot (unless switched off)
+        return (mark_lanes_pil(image) if self.lanes else image), x, y
 
     # Sample in the form the training loop needs
     def __getitem__(self, idx):
@@ -360,10 +365,11 @@ def split_by_session(paths, metadata_dir, val_ratio=0.1, seed=0, segment_gap=60.
 # Build the training, validation and test DataLoaders
 def make_loaders(directory=None, augment=False,
                  val_ratio=0.1, batch_size=16, num_workers=4, seed=0, augmenter=None,
-                 split="random", metadata_dir=None, segment_gap=60.0):
+                 split="random", metadata_dir=None, segment_gap=60.0, lanes=True):
     """Train/val/test DataLoaders.
 
-    Augmentation is applied to the training split only; lane marking to all.
+    Augmentation is applied to the training split only; lane marking to all
+    (``lanes=False`` switches it off for every split).
     Pass ``augment`` (on / off), or a pre-configured ``augmenter`` (overrides it).
 
     If ``directory`` has ``train/`` and ``validation/`` sub-folders (and
@@ -388,15 +394,15 @@ def make_loaders(directory=None, augment=False,
     # Dataset already split into sub-folders by the team
     if has_split_folders(directory):
         # Training folder, with augmentation
-        train_ds = XYDataset(os.path.join(directory, "train"), augmenter=augmenter)
+        train_ds = XYDataset(os.path.join(directory, "train"), augmenter=augmenter, lanes=lanes)
         # Validation folder, never augmented
-        val_ds = XYDataset(os.path.join(directory, "validation"), augmenter=None)
+        val_ds = XYDataset(os.path.join(directory, "validation"), augmenter=None, lanes=lanes)
         # Test folder, if present
         test_dir = os.path.join(directory, "test")
         # Load it only when it exists
         if os.path.isdir(test_dir):
             # Test folder, never augmented
-            test_ds = XYDataset(test_dir, augmenter=None)
+            test_ds = XYDataset(test_dir, augmenter=None, lanes=lanes)
         # Every dataset that was loaded
         parts = [d for d in (train_ds, val_ds, test_ds) if d is not None]
         # Description of the split, saved in the model's .json
@@ -433,9 +439,9 @@ def make_loaders(directory=None, augment=False,
         # Record how many broken files were left out
         split_info["skipped_unreadable"] = full.n_skipped
         # Training split, with augmentation
-        train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx)
+        train_ds = XYDataset(directory, augmenter=augmenter, indices=train_idx, lanes=lanes)
         # Validation split, never augmented
-        val_ds = XYDataset(directory, augmenter=None, indices=val_idx)
+        val_ds = XYDataset(directory, augmenter=None, indices=val_idx, lanes=lanes)
     # Seeded generator so the shuffling order is reproducible
     g = torch.Generator()
     # Seed it

@@ -63,14 +63,15 @@ HEAD = ("classifier",)
 
 
 # Train MobileNetV2 and keep its best weights
-def train(model, train_loader, val_loader, device, epochs, lr, tag="mobilenet_v2", loss="mse"):
+def train(model, train_loader, val_loader, device, epochs, lr, tag="mobilenet_v2", loss="mse", early_stop=False):
     """MobileNetV2 training with the teammate's recipe (see ``training.py``).
 
     Used for the baseline and for fine-tuning after pruning (train.py passes
-    the matching epochs / lr). ``loss``: "mse" or "huber".
+    the matching epochs / lr). ``loss``: "mse" or "huber"; ``early_stop``: see ``training.fit``.
     Returns (best validation metrics, per-epoch history).
     """
     # Shared loop with this network's settings
     return training.fit(model, train_loader, val_loader, device, epochs, lr, tag, TRAINABLE, HEAD,
                         backbone_lr_scale=DEFAULTS["backbone_lr_scale"], weight_decay=DEFAULTS["weight_decay"],
-                        patience=DEFAULTS["patience"], min_epochs=DEFAULTS["min_epochs"], loss=loss)
+                        patience=DEFAULTS["patience"], min_epochs=DEFAULTS["min_epochs"], loss=loss,
+                        early_stop=early_stop)

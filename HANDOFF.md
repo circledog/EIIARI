@@ -480,6 +480,20 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - 之後再改成不寫中文：`sanity.py` 的三個訊息改英文（所有 `.py` 現在都是純 ASCII）；`.json` 拿掉 `ensure_ascii=False`，一律只輸出 ASCII。`live_demo` 介面上的中文（按鈕、狀態文字）只顯示在瀏覽器，不寫檔、不印到終端機，保留。
 - 車上要在 Jupyter 容器裡跑（SSH 的 `/usr/bin/python3` 沒有 torchvision、jetbot）；板子家目錄 = 容器的 `/workspace`。
 
+## 第二十二階段（嚴格檢討後的 2、3 項：對照組、多 seed、轉向角、測試、版本，2026-11-16）
+
+背景：車上 `convert_trt.py` 已成功轉出 TRT（使用者回報「轉換完成」，總結數字還沒貼）。使用者要求嚴格檢討，選做第 2 項（多 seed、轉向角誤差、不標車道線對照）和第 3 項（測試和產生器進 repo、`.json` 記 commit），並要求解決 augmentation 開／關訓練量不同的問題。
+
+- `train.py --no-lanes`：原圖訓練。`data_loader`（`XYDataset` / `make_loaders` 的 `lanes`）、`sanity.make_sanity(lanes=)`、`.json` 的 `preprocessing = {"method": "none"}`、檔名 `_nolane`；`--base` 沿用 baseline 的設定。`live_demo` 依模型 `.json` 決定每幀要不要標（`state['lanes']`），舊模型照舊會標。
+- `train.py --early-stop`：**提早停止改成預設關閉**（使用者指定用 `--early-stop` 打開）。`training.fit(early_stop=False)`，五個網路的 `train()` 都多 `early_stop` 參數。`.json` 的 `training.early_stop`。
+- 公平比較：augmentation 開 5 epochs 和關 145 epochs 都是 40,165 個樣本（277 × 29 × 5 = 277 × 145）。
+- `metrics.py`：`angle_deg`、`p95_angle_deg`（用 `control.py` 隊友公式換成角度再相減；停車線以下夾到 v = 0.98）。`train.py` 的 log、seed 總結都有。
+- `version.py`：`code_version()`（git commit + dirty，只看 project4/ 的已追蹤檔），`.json` 的 `code_version`；`live_demo` 資訊列顯示比對結果（綠＝同一個 commit，橘＝不同／未知）。
+- `resnet18_coord.py`、`resnet18_coord_dsnt.py` 補上 `TRAINABLE` / `HEAD`（和原本實際使用的一樣，方便測試和閱讀）。
+- `tools/make_train_experiments.py`：notebook 產生器進 repo。`train_experiments.ipynb` 重新產生：第 1 節 aug 開 e5、第 2 節 aug 關 e145、第 3 節 aug 開 e5 不標車道線，每個 seeds 17 / 29 / 43，總表多轉向角。檔名 `<tag>_<aug>[_nolane]_<loss>_e<E>_lr<lr>_bs<bs>[_es]`（多 seed 沒有 seed 段）。之前給使用者的單 seed 指令產生的 `_seed0` 檔案不會被 notebook 重用。
+- `tests/`（unittest，17 個測試，約 10 秒，不需要資料／GPU／網路）：`python3 -m unittest discover -s tests`。augmentation 標籤追蹤（翻轉有 ~1 px 的像素中心慣例差，容許 1.5 px）、訓練路徑 = 車上路徑、部分凍結 / BN / DSNT 固定層、early stop 開關、轉向角 = control.py、sanity lanes、版本比對、所有 `.py` ASCII、`.json` ASCII、notebook = 產生器。
+- 驗證：17 個測試全過；`train.py --arch resnet18_dsnt --no-lanes --early-stop --seeds 1 2 --prune 0.3` 端到端跑完，`.json` 有 `preprocessing none`、`code_version`、`early_stop`、角度指標；`--base` 沿用 no-lanes；所有輸出模型 `load_model` + `sanity.check` 通過。`live_demo` 只確認 cell 能編譯，沒有實際跑。
+
 ## 未完成 / 未驗證
 
 - 隊友流程 ① 的訓練方式已移植（第二十階段），但還沒在 GPU 上用真實資料訓練、和舊結果比較。
@@ -492,7 +506,8 @@ PyTorch 端已測（`scratchpad/newmodels/test_models.py`）：
 - 第十七階段的正式訓練結果已回報（見第十八階段背景），但都是單一 seed、舊版 augmentation；使用者用 128 種組合的版本訓練過 5 epochs（`_aug_e5_`），表現不好；改成 29 種（`aug2`）後還沒在 GPU 上訓練過。
 - 剪枝後的 finetune 仍是 15 epochs；augmentation 開時每個 epoch ×128，要不要一起降低還沒決定。
 - 還沒做的訓練改進：合成偏離畫面（augmentation）、Huber loss、推論平滑。
-- 測試腳本（假 jetbot、nbclient 模擬）和 notebook 產生器 `make_nb.py` 都沒有進 repo，使用者決定不保留（會在車上實測）。從第十一階段起 `live_demo.ipynb` 直接修改，不再用產生器重新產生。
+- live_demo 的測試腳本（假 jetbot、nbclient 模擬）和產生器 `make_nb.py` 沒有進 repo，`live_demo.ipynb` 直接修改。`train_experiments.ipynb` 的產生器已進 repo（`tools/make_train_experiments.py`，第二十二階段）。
+- live_demo 的 `--no-lanes` 切換和版本比對只確認能編譯，還沒在車上或模擬器跑過。
 
 ## 測試指令與結果
 
@@ -532,4 +547,5 @@ python train.py --base <tmp>/models/resnet18_gen+perlin+comp_base.pth --prune 0.
 5. 板子上比較 ResNet-18 和 MobileNetV2 的延遲（`convert_trt.py` 的 `trt_validation` 和 `benchmark()`）。
 6. 車上跑 `python3 check_trt_coord.py`，確認 4 個 ResNet 網路在真的 TensorRT 上 OK（離線模擬已全部 OK）；結果貼回來。
 7. 用新的 `train_experiments.ipynb`（5 種網路 × augmentation 開 / 關）正式訓練，比 test 像素誤差（建議 `--seeds 17 29 43`，和隊友一樣）。DSNT 運算量約 1.7 倍，要看 Nano 的延遲。
-8. 用新訓練方式重跑 `train_experiments.ipynb`，和第二十階段背景的舊結果比較；之後再決定要不要把轉向角誤差加進評估。pure pursuit：使用者決定**不做**（2026-11-03）。
+8. 用新的 `train_experiments.ipynb`（第二十二階段：aug e5 / 無 aug e145 / 不標車道線，各 3 seeds）訓練，比 test 的像素和轉向角誤差（平均 ± 標準差）。
+9. 嚴格檢討的其他項目還沒做：多拍資料並照拍攝段落重切 train/val/test（可能有資料洩漏）、augmentation 設計和其他做法比較、Nano 上的延遲 vs 誤差、PID 從 CSV 分析、部署自動化、HANDOFF 精簡。pure pursuit：使用者決定**不做**（2026-11-03）。

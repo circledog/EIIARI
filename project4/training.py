@@ -12,8 +12,9 @@ Small-data fine-tuning of an ImageNet-pretrained network:
 * cosine learning-rate schedule from ``lr`` down to 1e-6 over ``epochs``
 * gradient clipping (norm 5)
 * loss: MSE (default) or Huber / SmoothL1 with beta 0.1 on (x, y)
-* model selection on the validation *mean pixel distance*, early stop when
-  it has not improved for ``patience`` epochs (after at least ``min_epochs``)
+* model selection on the validation *mean pixel distance*; optional early
+  stop (``early_stop=True``, train.py ``--early-stop``) when it has not
+  improved for ``patience`` epochs (after at least ``min_epochs``)
 
 Parameters that are already frozen (``requires_grad=False``, e.g. DSNT's
 fixed upsampling / expectation layers) are never unfrozen.
@@ -76,12 +77,14 @@ def _freeze_batchnorm(model):
 
 # Train with the teammate's recipe and keep the best weights
 def fit(model, train_loader, val_loader, device, epochs, lr, tag, trainable, head,
-        backbone_lr_scale=0.1, weight_decay=1e-4, patience=5, min_epochs=10, loss="mse", loss_fn=None):
+        backbone_lr_scale=0.1, weight_decay=1e-4, patience=5, min_epochs=10, loss="mse", loss_fn=None, early_stop=False):
     """Returns (best validation metrics, per-epoch history); the model ends with the best weights.
 
     ``trainable`` / ``head``: tuples of parameter-name prefixes. ``loss``:
     one of LOSSES. ``loss_fn(model, images, labels)`` replaces the plain
-    coordinate loss (DSNT adds its heatmap term).
+    coordinate loss (DSNT adds its heatmap term). ``early_stop``: stop after
+    ``patience`` epochs without improvement (after ``min_epochs``); off by
+    default, so every run trains all ``epochs`` and the best epoch is kept.
     """
     # Coordinate loss unless the network brings its own
     criterion = loss_fn or (lambda m, images, labels, f=coordinate_loss(loss): f(m(images), labels))
@@ -167,7 +170,7 @@ def fit(model, train_loader, val_loader, device, epochs, lr, tag, trainable, hea
         print("[%s] epoch %3d/%d  train %.5f  val %.5f (%.1f px)  lr %.2g  (%.1fs)%s"
               % (tag, epoch, epochs, train_loss, val["mse"], val["mean_px"], epoch_lr, time.time() - t0, mark))
         # Early stop: no improvement for `patience` epochs, after the minimum
-        if epoch >= min_epochs and epoch - best_epoch >= patience:
+        if early_stop and epoch >= min_epochs and epoch - best_epoch >= patience:
             # Say why training ends early
             print("[%s] early stop: no better validation px for %d epochs (best epoch %d)"
                   % (tag, patience, best_epoch))
