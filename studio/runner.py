@@ -274,7 +274,7 @@ class Runner(object):
         # Create it
         self.runtime = cls(ctx)
         # Stop the motors when the page link is lost
-        self.watchdog = LinkWatchdog(self._link_lost, timeout=float(ctx.params.get("link_timeout", 0.5)))
+        self.watchdog = LinkWatchdog(self._link_lost, timeout=float(ctx.params.get("link_timeout", 5.0)))
         # Start the task's background work
         self.runtime.start()
         # Start the watchdog

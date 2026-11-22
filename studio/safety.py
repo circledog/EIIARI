@@ -7,6 +7,8 @@ lives here, close to the motors:
   at least one open task page answers. When no heartbeat arrived for
   ``link_timeout`` seconds (page closed, Wi-Fi lost, web process hung) the
   motors are stopped. Motion commands are refused while the link is down.
+  Default 5 s (user's decision, 2026-11-22): a short Wi-Fi stall must not
+  stop a lane-following robot; set it lower for manual driving.
 * **Web process gone**: the runner's socket closes -> stop at once, exit.
 * **E-stop**: the page's emergency button (or the space bar) -> stop at once.
 * **SIGTERM / SIGINT** -> stop, exit.
@@ -24,7 +26,7 @@ class LinkWatchdog(object):
     """Calls ``on_lost(seconds_since_heartbeat)`` once per link loss."""
 
     # Store the callback; the link counts as down until the first heartbeat
-    def __init__(self, on_lost, timeout=0.5, period=0.02, clock=time.monotonic):
+    def __init__(self, on_lost, timeout=5.0, period=0.02, clock=time.monotonic):
         # Called when the link is lost
         self.on_lost = on_lost
         # Seconds without heartbeat that count as lost (may change at runtime)

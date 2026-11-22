@@ -1,0 +1,29 @@
+# JetBot Studio as a systemd service on the Jetson Nano (host side).
+# studio runs INSIDE the jetbot Jupyter container (that is where torch,
+# torchvision, jetbot and the camera libraries are), started with docker exec.
+#
+# Install: sudo bash studio/deploy/install.sh   (see studio/README.md)
+# Edit CONTAINER / REPO / STUDIO_HOME below if your setup differs.
+[Unit]
+Description=JetBot Studio web workspace (port 8890)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Name of the jetbot Jupyter container
+Environment=CONTAINER=jetbot_jupyter
+# Repository path inside the container (board home = container /workspace)
+Environment=REPO=/workspace/EIIARI
+# Settings / password / jobs folder inside the container; must be on the persistent volume
+Environment=STUDIO_HOME=/workspace/.studio
+# Wait until the container runs (it starts with docker at boot)
+ExecStartPre=/bin/sh /opt/studio/wait_container.sh ${CONTAINER}
+ExecStart=/usr/bin/docker exec -e STUDIO_HOME=${STUDIO_HOME} -w ${REPO} ${CONTAINER} python3 -m studio
+# docker exec does not forward signals: stop the server inside the container (it stops the motors first)
+ExecStop=/usr/bin/docker exec ${CONTAINER} pkill -INT -f "python3 -m studio$"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

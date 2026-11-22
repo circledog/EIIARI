@@ -31,6 +31,14 @@
 - `DriveLoop` 不認識 ipywidgets，也不輸出中文：停車原因、事件都是英文代碼（`drive.STOP_CODES`），介面自己翻譯。
 - 事件（模型載入、停車、錯誤）也交給顯示執行緒更新介面 → 推論執行緒**完全不寫 widget**（TASKS M0-3 原本允許出錯時寫 `model_info`）。代價：按停車後按鈕變色最多慢一個顯示週期，但馬達是立刻停的。
 - 顯示調整規則：畫一張超過預算（1/目前 FPS）→ FPS ×0.7、JPEG 品質 −10（下限 1 FPS／40）；約 1 秒都在預算一半以內 → +1 FPS、品質 +5（上限 `DISPLAY_FPS`／80）。
+- **斷線容忍時間（`link_timeout`）預設 5 秒**（使用者決定，2026-11-22），範圍 0.3～10 秒，每個任務都有、執行中可以改。解決 TASKS M1-7（0.5 秒停車）和 M0-8（網路卡住照常循線）的衝突。關掉分頁也是等這個時間才停（不另外立刻停，因為 Wi-Fi 不穩也會讓連線斷掉）；要立刻停就按緊急停止。
+- 只有任務行程套用 `link_timeout`；網頁行程只看「最近 0.3 秒內有沒有頁面心跳」來決定要不要轉送心跳（兩邊都套的話時間會加倍，測試時發現並修正）。
+- studio 的介面文字：Python 一律英文（ASCII 規則），頁面上用 `studio/static/i18n.js` 翻成中文；HTML／JS 檔可以直接寫中文。
+- 單一密碼、使用者名稱固定為 `operator`（TASKS 只要求密碼登入）。
+- 任務行程和網頁行程之間用 127.0.0.1 TCP（不是 Unix socket），PC 是 Windows 也能跑；任務行程要回傳啟動時拿到的隨機 token。
+- 任務行程只有在網頁行程要畫面時才壓 JPEG（沒人看就不花 CPU）。
+- `motor_guard.py`：任務行程被 kill 時，馬達驅動晶片會保持最後的速度，所以網頁行程要另外開一個行程直接透過 I2C（Adafruit_MotorHAT，channel 1、2）停馬達，失敗才退回 `jetbot.Robot().stop()`。
+- 車上 studio 跑在 jetbot 的 Jupyter 容器裡（torch／jetbot 只在容器裡）；`STUDIO_HOME=/workspace/.studio` 放在持久化的 volume 上。
 - `'opencv'` 來源打不開時改成直接報錯（以前會一直回傳 None），和 `'csi'` 一致，notebook 會顯示「未連接鏡頭」。
 
 ## 已完成
@@ -49,18 +57,25 @@
 | M0-8 實機驗證 | ⏳ 需要使用者在車上做 | 見「下一步」 |
 | M0-9 文件 | ✅ | `project4/README.md`：檔案表、`camera.py`、`live_demo` 架構圖與調整規則、測試表、疑難排解 3 條 |
 
+### M1 studio 平台骨架（2026-11-22）
+
+| ID | 狀態 | 內容 |
+|---|---|---|
+| M1-1 骨架 | ✅ | `studio/`；`python3 -m studio`，預設 port 8890；PC 上實際啟動並用 HTTP 走過完整流程 |
+| M1-2 tornado | ✅ | 支援 tornado 5.1+／6.x、Python 3.6（不用 `asyncio.run`／`create_task`）；Python 3.6.15 + tornado 6.1 的 docker 裡測試全過 |
+| M1-3 密碼登入 | ✅ | `set-password`、PBKDF2-SHA256 100k 次＋salt、`config.json` 權限 600、簽章 cookie（HttpOnly）、5 次鎖 60 秒、登出、XSRF |
+| M1-4 任務清單 | ✅ | 掃描 `studio/tasks/`；`drive_check`（ready）、`navigate`／`search`（灰色「開發中」）。`lane_follow` 在 M2 加 |
+| M1-5 參數表單 | ✅ | `params.py` 驗證＋`static/form.js` 依同一份 schema 產生表單；前後端都擋範圍外的值；preset 載入／另存／刪除；⚡ 參數執行中可改 |
+| M1-6 影像串流 | ✅ | 瀏覽器顯示完才回 ack、沒 ack 不送下一張；JPEG 品質依來回時間調整。⏳ 瀏覽器開發者工具限速 3G 的實測還沒做 |
+| M1-7 安全停車 | ✅（motor_guard 未實機測） | 見「測試指令與結果」 |
+| M1-8 工作與資源 | ✅ | 同時只有一個任務；工作佇列（訓練／TRT 轉換用）；CPU／GPU／RAM／硬碟／行程記憶體；配額 |
+| M1-9 開機自動啟動 | ✅ 寫好，⏳ 未在車上試 | `studio/deploy/studio.service`、`install.sh`；容器名稱 `jetbot_jupyter`、`/workspace/EIIARI` 是推測值 |
+| M1-10 測試 | ✅ | `studio/tests/`，28 個 |
+
 ## 未完成
 
 - M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
-- **M1 進行中（未完成，還沒跑過也還沒測過）**。已寫好的檔案（commit「M1 WIP」）：
-  - `studio/__init__.py`、`config.py`（`STUDIO_HOME=~/.studio`、`car`/`pc` 角色自動判斷、4 GB Nano 的資源預算 `BUDGET_MB`）
-  - `auth.py`（PBKDF2-SHA256、`Lockout`：同一個位址錯 5 次鎖 60 秒）
-  - `params.py`（參數表驗證、preset 存取）
-  - `tasks/__init__.py`（掃描任務套件、自動加上 `link_timeout` 安全參數）
-  - `ipc.py`（runner 和網頁行程之間的訊息格式：JSON 標頭＋二進位資料）
-  - `hardware.py`、`sensors.py`（相機已實作；里程計／IMU／距離感測器只有介面）、`motor_guard.py`（runner 當掉時直接透過 I2C 停馬達，**還沒在實機測過**）
-  - `safety.py`（`LinkWatchdog`）、`runner.py`（任務行程：讀取、命令、影像、遙測四個執行緒）、`runlink.py`（網頁端：啟動 runner、有頁面在回應時才轉發心跳、只保留最新一幀、runner 死掉就跑 motor_guard）
-  - **還沒寫**：`jobs.py`（工作佇列、資源監控、硬碟配額）、`stream.py`（WebSocket 影像＋ack 背壓、控制 socket）、`server.py`、`__main__.py`（serve／set-password）、templates、static（form.js、stream.js、i18n.js）、`tasks/drive_check`（相機＋手動馬達測試，拿來驗證平台）、`tasks/lane_follow`／`navigate`／`search` 的宣告、`deploy/`、`studio/README.md`、`studio/tests/`
+- M1 需要車上驗證：在 Jupyter 容器裡啟動 studio、`drive_check` 架高測試馬達方向、`motor_guard`（kill 任務行程時馬達有沒有停）、systemd 開機啟動、瀏覽器限速 3G 看畫面延遲。
 - M2 ～ M4 全部。
 
 ## 測試指令與結果
@@ -84,6 +99,23 @@ python -m unittest tests.test_live_demo_nb -v
 #   顯示 1.8 FPS、JPEG 40、仍在行駛 → 停車（按鈕變回「開始行駛」、顯示「手動停止」）→
 #   結束：0.52 秒、沒有執行緒殘留、馬達 0
 
+# M1：studio 測試（PC，Python 3.12 + tornado 6.6；任務行程用假畫面、假馬達）
+cd studio/tests && python -m unittest discover -s .
+# → Ran 28 tests, OK（約 25 秒）
+#   [safety] 斷線（link_timeout 0.3、hold_time 1.0）→ 0.55 秒停車（改之前是 2 倍時間，見重要決策）
+#   [safety] 緊急停止 → 0.05 秒
+#   [safety] 網頁端連線關掉 → 任務行程 0.15~0.65 秒內停車並結束（exit code 2）
+#   [safety] 任務行程 SIGKILL → 0.25 秒內執行 motor_guard，裝置釋放
+#   串流：不回 ack 1.5 秒內沒有第二張；回 ack 後收到最新一張（跳過中間的）
+#   第二個任務被拒絕（409，訊息有任務名稱）；網頁行程沒有 import torch／cv2／numpy
+# 同一組測試在 docker（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU）→ Ran 28 tests, OK
+# project4 的 M0 測試在同一個 docker → test_decoupling + test_latest_slot 12 個 OK
+#   （test_data_loader 在 3.6 image 裡失敗，但原本的 c7a9067 也一樣失敗：image 的套件版本太舊，和這次修改無關）
+#   3.6 上 tracemalloc 看到 13 MB「成長」→ 是還沒被 GC 回收的循環垃圾，gc.collect() 後只剩 0.6 MB；測試改成量之前先 gc.collect()
+
+# 手動走一次（PC）：set-password → python -m studio --camera dummy → 登入 → 範圍外參數 400 →
+#   啟動 drive_check 3.5 秒 → 第二次啟動 409 → 停止 → 任務頁 200
+
 # 其他檢查
 vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 ✅；notebook 的 code cell 也是 3.2 ✅
 # 註解規則檢查（scratchpad/check_comments.py，AST 找每個 statement 上一行是不是註解）→ 新檔 0 個問題
@@ -97,10 +129,9 @@ vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 �
    - 正常 Wi-Fi 跑 1 分鐘，記下 stats 列的「控制週期 p50 / p95」和各段耗時；
    - 用手機熱點／離遠一點／瀏覽器開發者工具限速，再跑 1 分鐘，看 p95 有沒有變、畫面有沒有降 FPS／JPEG、看門狗會不會誤停；
    - 兩次都按「錄製 CSV」，把 CSV 傳回來就能畫圖。
-2. M1：把上面「還沒寫」的部分做完，接著用 tornado.testing 測試（登入、參數驗證、背壓串流、用假馬達測安全停車）。
-   - 3.6 測試環境：本機 Docker image `studio-py36`（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU、opencv 4.5.5），Dockerfile 在 scratchpad/py36。車上的程式要用它跑一次測試。
-   - 車上 Python 3.6 不能用 `asyncio.run`、`asyncio.create_task`、`get_running_loop`；改用 tornado 的 `spawn_callback`／`gen`。
-   - **待使用者決定**：`link_timeout` 預設 0.5 秒（TASKS M1-7）和 M0-8 的「網路卡住時車子照常循線」有衝突；目前是可以調的參數（0.3～5 秒）。
+2. **（使用者，車上）M1**：照 `studio/README.md`「車上」一節啟動，打開 `http://<車子 IP>:8890`，跑「相機與馬達檢查」（架高），確認畫面和馬達方向；在任務頁按住前進時把分頁關掉，看 5 秒後有沒有停。
+3. M2：車道線任務（`studio/tasks/lane_follow/`）。
+   - 3.6 測試環境：本機 Docker image `studio-py36`（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU、opencv 4.5.5），Dockerfile 在 scratchpad/py36（sandbox 重開就沒了，要重建）。
 
 ---
 

@@ -1,0 +1,46 @@
+<div class="row drive-pad">
+  <button data-l="1" data-r="1">▲ 前進</button>
+  <button data-l="-1" data-r="1">◀ 左轉</button>
+  <button data-l="1" data-r="-1">右轉 ▶</button>
+  <button data-l="-1" data-r="-1">▼ 後退</button>
+</div>
+<p class="muted small">按住按鈕（或方向鍵）才會動，放開就停。請先把車子架高。</p>
+<script>
+(function () {
+  // Command repeated while a button is held (null = released)
+  var held = null;
+  // Send the held command every 100 ms (the runner stops after hold_time without one)
+  setInterval(function () { if (held && window.studio) window.studio.control.command("drive", held); }, 100);
+  // Start / stop holding
+  function hold(cmd) {
+    // Remember it
+    held = cmd;
+    // Released: stop right away
+    if (!cmd && window.studio) window.studio.control.command("stop");
+    // Pressed: send at once
+    else if (window.studio) window.studio.control.command("drive", cmd);
+  }
+  // Buttons: press and release (mouse and touch)
+  document.querySelectorAll(".drive-pad button").forEach(function (b) {
+    // Values of this button
+    var cmd = { left: Number(b.dataset.l), right: Number(b.dataset.r) };
+    // Press
+    ["mousedown", "touchstart"].forEach(function (ev) { b.addEventListener(ev, function (e) { e.preventDefault(); hold(cmd); }); });
+    // Release (also when the pointer leaves the button)
+    ["mouseup", "mouseleave", "touchend", "touchcancel"].forEach(function (ev) { b.addEventListener(ev, function () { if (held === cmd) hold(null); }); });
+  });
+  // Arrow keys -> motor values
+  var KEYS = { ArrowUp: [1, 1], ArrowDown: [-1, -1], ArrowLeft: [-1, 1], ArrowRight: [1, -1] };
+  // Key pressed
+  document.addEventListener("keydown", function (e) {
+    // Arrow keys only, ignore auto-repeat
+    if (!KEYS[e.key] || e.repeat) return;
+    // No page scrolling
+    e.preventDefault();
+    // Hold it
+    hold({ left: KEYS[e.key][0], right: KEYS[e.key][1] });
+  });
+  // Key released: stop
+  document.addEventListener("keyup", function (e) { if (KEYS[e.key]) hold(null); });
+})();
+</script>

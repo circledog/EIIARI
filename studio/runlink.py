@@ -43,6 +43,8 @@ log = logging.getLogger("studio.runlink")
 START_TIMEOUT = 120.0
 # Heartbeat interval in milliseconds
 HEARTBEAT_MS = 100
+# A page counts as present when its last heartbeat is at most this old (pages beat every 0.1 s)
+PRESENCE_WINDOW = 0.3
 # Maximum events kept for pages that (re)connect
 MAX_EVENTS = 200
 
@@ -493,23 +495,25 @@ class RunnerLink(object):
 
     # A page closed its control socket
     def leave(self, client_id):
-        """Forget the page; stop the motors at once if no page is left."""
+        """Forget the page; the runner stops after ``link_timeout`` if no page is left.
+
+        No immediate stop: a flaky Wi-Fi also closes sockets, and the user chose
+        to tolerate ``link_timeout`` (default 5 s) of silence.
+        """
         # Forget it
         self.presence.pop(client_id, None)
-        # No page left that answers: stop now instead of waiting for the timeout
-        if not self.present():
-            # Emergency stop
-            self.estop()
 
     # Whether at least one page answered recently
     def present(self):
-        """True when a page heartbeat arrived within ``link_timeout``."""
-        # Allowed silence
-        timeout = float(self.params.get("link_timeout", 0.5))
+        """True when a page heartbeat arrived within ``PRESENCE_WINDOW``.
+
+        Pages beat every 0.1 s; only the runner applies ``link_timeout``
+        (otherwise the two timeouts would add up).
+        """
         # Now
         now = time.monotonic()
         # Any recent heartbeat
-        return any(now - t <= timeout for t in self.presence.values())
+        return any(now - t <= PRESENCE_WINDOW for t in self.presence.values())
 
     # Heartbeat timer
     def _heartbeat(self):

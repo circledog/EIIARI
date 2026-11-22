@@ -4,6 +4,7 @@ Fake camera (new frame every 1/30 s), fake model (5 ms, releases the GIL like
 TensorRT) and fake motors; the display's render callback is made slow on
 purpose (0.5 s per frame, like a stalled Wi-Fi / widget).
 """
+import gc
 import time
 import tracemalloc
 import unittest
@@ -179,10 +180,14 @@ class DecouplingTest(unittest.TestCase):
             tracemalloc.start()
             # Slow display, first part
             measure(loop, 0.5, 1)
+            # Collect cyclic garbage first: it is freed later anyway and is not a backlog
+            gc.collect()
             # Memory now
             mem_mid = tracemalloc.get_traced_memory()[0]
             # Keep running slowly a bit longer
             measure(loop, 0.5, 2)
+            # Same before the second reading
+            gc.collect()
             # Memory after more slow rendering
             mem_end = tracemalloc.get_traced_memory()[0]
             # Stop tracking

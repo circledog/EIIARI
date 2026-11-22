@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ task['title'] }}{% end %}
+{% block body %}
+<h2><span class="t">{{ task['title'] }}</span> <span id="state" class="badge">未啟動</span></h2>
+<p class="t muted">{{ task['description'] }}</p>
+<div id="other" class="warnings hidden"></div>
+<div class="task-grid">
+  <section class="card view">
+    <div class="video-box"><img id="video" alt=""><div id="video-msg" class="video-msg">任務未啟動</div></div>
+    <div id="video-stats" class="muted small"></div>
+    <div class="row">
+      {% if startable %}
+      <button id="start" class="primary">啟動任務</button>
+      <button id="stop">停止任務</button>
+      {% else %}
+      <span class="badge warn t">{{ reason }}</span>
+      {% end %}
+      <span id="link" class="badge">頁面連線中…</span>
+    </div>
+    <div id="task-body">{% if body %}{% raw body %}{% end %}</div>
+  </section>
+  <section class="card">
+    <h3>參數</h3>
+    <div class="row">
+      <select id="preset"><option value="">（預設值）</option></select>
+      <button id="preset-load">載入</button>
+      <input id="preset-name" placeholder="preset 名稱" size="12">
+      <button id="preset-save">另存</button>
+      <button id="preset-del">刪除</button>
+    </div>
+    <form id="params" class="params" onsubmit="return false"></form>
+    <p class="muted small">標 ⚡ 的參數可以在任務執行中修改，其他的要在啟動前設定。</p>
+  </section>
+</div>
+<div class="task-grid">
+  <section class="card"><h3>即時狀態</h3><pre id="telemetry" class="telemetry">—</pre></section>
+  <section class="card"><h3>事件</h3><ol id="events" class="events"></ol></section>
+</div>
+{% end %}
+{% block scripts %}
+<script>window.STUDIO_TASK = {% raw task_json %};</script>
+<script src="{{ static_url('form.js') }}"></script>
+<script src="{{ static_url('task.js') }}"></script>
+{% end %}

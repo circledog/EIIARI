@@ -37,7 +37,7 @@ from studio import params as params_mod
 TASKS_DIR = os.path.dirname(os.path.abspath(__file__))
 # Safety parameter added to every task
 LINK_TIMEOUT_PARAM = {
-    "name": "link_timeout", "type": "float", "min": 0.3, "max": 5.0, "step": 0.1, "default": 0.5,
+    "name": "link_timeout", "type": "float", "min": 0.3, "max": 10.0, "step": 0.1, "default": 5.0,
     "label": "Link timeout (s)", "group": "Safety", "live": True,
     "help": "Stop the motors when no open page has answered for this long (page closed, Wi-Fi lost, "
             "web process crashed). Longer values tolerate a weak Wi-Fi but stop later.",

@@ -14,6 +14,7 @@ Python 3.6 compatible (runs on the Jetson Nano).
 import base64
 import hashlib
 import hmac
+import http.cookies
 import os
 import threading
 import time
@@ -107,3 +108,32 @@ class Lockout(object):
         with self.lock:
             # Forget it
             self.table.pop(addr, None)
+
+
+# Mixin for tornado handlers: the logged-in user from the signed cookie
+class CurrentUserMixin(object):
+    """``get_current_user`` for RequestHandler and WebSocketHandler subclasses."""
+
+    # Read and verify the signed cookie
+    def get_current_user(self):
+        """User name, or None when not logged in / the cookie is invalid or expired."""
+        # tornado >= 6.3 renamed secure cookies to signed cookies
+        getter = getattr(self, "get_signed_cookie", None) or self.get_secure_cookie
+        # Verified value (None if missing, tampered or older than the login period)
+        value = getter(COOKIE_NAME, max_age_days=self.settings.get("login_days", 7))
+        # Bytes -> text
+        return value.decode("utf-8") if value else None
+
+    # Write the signed cookie after a successful login
+    def set_login(self, user):
+        """Sign ``user`` into the login cookie."""
+        # tornado >= 6.3 name, older name otherwise
+        setter = getattr(self, "set_signed_cookie", None) or self.set_secure_cookie
+        # HttpOnly: scripts cannot read it
+        extra = {"httponly": True}
+        # SameSite (not sent by other sites' forms) only exists in Python >= 3.8's cookie module
+        if "samesite" in http.cookies.Morsel._reserved:
+            # Add it
+            extra["samesite"] = "Strict"
+        # Write the cookie
+        setter(COOKIE_NAME, user, expires_days=self.settings.get("login_days", 7), **extra)

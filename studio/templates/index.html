@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}任務{% end %}
+{% block body %}
+<section id="running" class="card hidden"></section>
+<h2>任務</h2>
+<div class="tasks">
+{% for t in tasks %}
+  {% set ok, reason = startable(t) %}
+  <a class="card task {{ '' if t['status'] == 'ready' else 'dev' }}" href="/task/{{ t['id'] }}">
+    <h3 class="t">{{ t['title'] }}</h3>
+    <p class="t">{{ t['description'] }}</p>
+    {% if t['status'] != 'ready' %}<span class="badge">開發中</span>
+    {% elif not ok %}<span class="badge warn t">{{ reason }}</span>{% end %}
+  </a>
+{% end %}
+</div>
+{% if errors %}
+<h2>載入失敗的任務</h2>
+{% for name, tb in errors.items() %}<details class="card"><summary>{{ name }}</summary><pre>{{ tb }}</pre></details>{% end %}
+{% end %}
+<h2>背景工作</h2>
+<div id="jobs" class="card">讀取中…</div>
+<h2>硬碟配額</h2>
+<div id="quotas" class="card">讀取中…</div>
+{% end %}
+{% block scripts %}<script src="{{ static_url('index.js') }}"></script>{% end %}

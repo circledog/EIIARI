@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Studio{% end %} · JetBot Studio</title>
+<link rel="stylesheet" href="{{ static_url('app.css') }}">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">JetBot Studio</a>
+  <span id="res" class="res">資源讀取中…</span>
+  <span class="spacer"></span>
+  <button id="estop" class="estop" title="緊急停止（空白鍵）">緊急停止</button>
+  <form method="post" action="/logout" class="logout">{% module xsrf_form_html() %}<button>登出</button></form>
+</header>
+<div id="warnings" class="warnings"></div>
+<main>{% block body %}{% end %}</main>
+<footer>studio {{ handler.settings.get('studio_version') }} · 只在區網使用（沒有 HTTPS）</footer>
+<script src="{{ static_url('i18n.js') }}"></script>
+<script src="{{ static_url('app.js') }}"></script>
+{% block scripts %}{% end %}
+</body>
+</html>
