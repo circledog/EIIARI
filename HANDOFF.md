@@ -84,12 +84,25 @@
 | M2-6 行駛頁 | ✅（⏳ 實車） | 選模型 → sanity → 即時畫面、`live_demo` 的所有控制選項、開始／停止、錄 CSV（先查配額）、推論速度比較。⏳ M0-8 的網路干擾實車測試 |
 | M2-7 文件 | ✅ | `project4/README.md`「live_demo.ipynb 和 studio 網頁的差別」、`studio/README.md` |
 
+### M3 避障＋點選目標前進（2026-11-22）
+
+| ID | 狀態 | 內容 |
+|---|---|---|
+| M3-1 spike | ✅ PC 部分，⏳ Nano 數字 | `tasks/navigate/SPIKE.md`、`spike.py`。決定：**預設用地板顏色比對（不用模型）**；深度模型要等 Nano 上 ≥ 8 FPS 再接。Depth Anything V2 沒量：連 huggingface.co 需要網路核准 |
+| M3-2 空地估計 | ✅（合成圖） | `freespace.py`：HSV 直方圖反投影、N 個扇區的可通行距離、白膠帶算地板、半透明色塊疊圖。合成圖「前方有障礙」20/20；⏳ 20 張真實照片 |
+| M3-3 點選與追蹤 | ✅ | 頁面依圖片實際顯示大小換算座標（object-fit contain 的留白也算進去）；`tracker.py`：三種尺度的模板比對＋「比第二名高 0.1 以上才算」＋只在強匹配時更新模板；追丟（連續 5 幀）就停車。合成全景轉 30°（112 px）仍追到 |
+| M3-4 規劃 | ✅（⏳ 架高／實地） | `planner.py`：目標扇區／最近空扇區；正前方 < `stop_distance` 一律停車；輸出目標點直接給 `control.py` |
+| M3-5 標註收集 | ✅ | `dataset.py`：點選＝`xy_*.jpg`（`data_loader.XYDataset` 讀得到）、緊急停止＝`blocked/`、正常行駛＝`free/`（每秒最多 1 張）、`labels.jsonl`、配額；zip 下載 API |
+| M3-6 微調 | ✅ 流程（改成在 PC 上訓練） | 使用者決定訓練只在 PC：zip 下載 → PC 訓練頁 → TRT → 任務頁載入、切學習版。學習版保留停車規則。⏳「保留的 20% 標註上誤差下降」要有真實標註才能驗證 |
+| M3-7 測試與文件 | ✅ | `studio/tests/test_navigate.py`（9 個）、`studio/README.md` |
+
 ## 未完成
 
 - M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
 - M2 需要車上驗證：上傳模型 → 網頁上轉 TensorRT → 行駛頁載入 TRT 模型開車；看控制週期 p95。
 - M1 需要車上驗證：在 Jupyter 容器裡啟動 studio、`drive_check` 架高測試馬達方向、`motor_guard`（kill 任務行程時馬達有沒有停）、systemd 開機啟動、瀏覽器限速 3G 看畫面延遲。
-- M3、M4 全部（M3-1、M4-1 的 spike 需要車上的數字）。
+- M3 需要車上：spike 數字、20 張真實照片的障礙判斷、架高與實地繞箱子、收集標註後訓練學習版並比較。
+- M4 全部。
 
 ## 測試指令與結果
 
@@ -137,6 +150,11 @@ cd studio/tests && python -m unittest discover -s .
 #   資料集 dataset_xy 200 張（壞檔 0）、splits 277/60/61；兩個模型載入後 sanity 都通過（8 張，差 0.000 px）；
 #   畫面 meta 有預測值。開車後很快自己停：folder 相機每秒只有 2 張，0.5 秒的相機逾時正確觸發
 
+# M3：studio/tests/test_navigate.py → 9 個 OK；整個 studio → Ran 47 tests, OK（PC）；Python 3.6 docker → 47 OK (skipped=1)
+#   [navigate] 合成圖「前方有障礙」20/20
+#   追蹤器第一版在無關畫面上分數 0.64~0.8 還一直升（模板被更新成錯的東西）→ 加上唯一性條件、只在強匹配時更新模板
+# spike（python -m studio.tasks.navigate.spike）：PC 地板比對 0.33~0.89 ms、追蹤 1.2~2.9 ms（224~320）
+
 # 其他檢查
 vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 ✅；notebook 的 code cell 也是 3.2 ✅
 # 註解規則檢查（scratchpad/check_comments.py，AST 找每個 statement 上一行是不是註解）→ 新檔 0 個問題
@@ -152,7 +170,8 @@ vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 �
    - 兩次都按「錄製 CSV」，把 CSV 傳回來就能畫圖。
 2. **（使用者，車上）M1**：照 `studio/README.md`「車上」一節啟動，打開 `http://<車子 IP>:8890`，跑「相機與馬達檢查」（架高），確認畫面和馬達方向；在任務頁按住前進時把分頁關掉，看 5 秒後有沒有停。
 3. **（使用者，車上）M2**：模型庫上傳 `.pth`＋`.json` → 轉 TensorRT → 行駛頁載入、架高測試、跑道上開；看 stats 的控制週期 p95，和 `live_demo` 比較。
-4. M3：先做 M3-1 spike（深度模型在 Nano 上的 FPS／記憶體）需要車上；不依賴車的部分（標註收集格式、地板比對法、目標追蹤、規劃器）可以先做。
+4. **（使用者，車上）M3**：`python3 -m studio.tasks.navigate.spike` 的數字貼回來；「避障＋點選目標」架高測試、地上放箱子試繞路／停車；拍 20 張有／沒有障礙的照片。
+5. M4：目標物搜尋＋地圖。先做不依賴車的部分：目標物登錄與偵測（M4-2、M4-3）、2D 佔據格地圖、檢視器；視覺里程計的 spike（M4-1）需要車上錄的影片。
    - 3.6 測試環境：本機 Docker image `studio-py36`（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU、opencv 4.5.5），Dockerfile 在 scratchpad/py36（sandbox 重開就沒了，要重建）。
 
 ---

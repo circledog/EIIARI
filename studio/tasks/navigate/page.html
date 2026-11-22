@@ -1,0 +1,121 @@
+<p class="small">在畫面上<b>點一下</b>設定目標（綠圈＝追蹤中，紅圈＝追丟）。每次點選都會存成訓練標註；按緊急停止會存成「前方有障礙」的標註。</p>
+<div class="row">
+  <button id="nv-drive" class="primary" style="min-width:120px">開始前往</button>
+  <button id="nv-clear">取消目標</button>
+  <button id="nv-refit" title="車子正前方是乾淨地板時按，重新學地板顏色">重新學地板</button>
+  <span id="nv-status">停車中</span>
+</div>
+<div class="row">
+  <select id="nv-model" style="min-width:220px"><option value="">（學習版用的模型）</option></select>
+  <button id="nv-load">載入模型</button><span id="nv-model-info" class="small"></span>
+</div>
+<div class="small" id="nv-labels">標註：-</div>
+<div class="row small"><a href="/api/navigate/labels.zip">下載全部標註（zip）</a> · <button id="nv-clear-labels">清除全部標註</button></div>
+<p class="muted small">學習版：把 zip 解壓到電腦的 <code>project4/data/</code>，在訓練頁選 <code>navigate_labels/xy</code>（建議關掉「標車道線」），轉 TensorRT 後在這裡載入，參數「模式」切成學習版。學習版仍保留「前方太近就停車」的規則。</p>
+<div id="nv-stats" class="small muted"></div>
+<script>
+window.addEventListener("load", function () {
+  // Short element lookup
+  var $ = function (id) { return document.getElementById(id); };
+  // Readable stop / refusal reasons
+  var R = { manual: "手動停止", arrived: "已到達目標", target_lost: "目標追丟", too_close: "前方太近", blocked: "沒有可走的方向",
+    watchdog: "迴圈逾時", camera_stalled: "相機沒有新畫面", estop: "緊急停止", link_lost: "頁面斷線", no_target: "請先在畫面上點目標",
+    no_model: "學習版請先載入模型", no_camera: "未連接鏡頭", link_down: "沒有頁面在回應，不能開動", mode_change: "切換模式",
+    target_cleared: "取消目標", model_switch: "切換模型", shutdown: "任務停止", loop_error: "迴圈錯誤", ok: "行駛中", detour: "繞路中", idle: "待命" };
+  // Readable reason
+  function r(code) { return R[code] || code; }
+  // Driving state
+  var driving = false;
+  // Click on the picture: convert with the picture's real displayed rectangle (object-fit: contain)
+  $("video").addEventListener("click", function (e) {
+    // Element rectangle
+    var box = this.getBoundingClientRect();
+    // Picture size
+    var iw = this.naturalWidth || 1, ih = this.naturalHeight || 1;
+    // Displayed scale of the picture inside the element
+    var s = Math.min(box.width / iw, box.height / ih);
+    // Offsets of the picture inside the element (letterbox)
+    var ox = (box.width - iw * s) / 2, oy = (box.height - ih * s) / 2;
+    // Click as fractions of the picture
+    var u = (e.clientX - box.left - ox) / (iw * s), v = (e.clientY - box.top - oy) / (ih * s);
+    // Outside the picture (in the letterbox)
+    if (u < 0 || u > 1 || v < 0 || v > 1) return;
+    // Send the target
+    studio.control.command("set_target", { u: u, v: v }).then(function (res) {
+      // Error or quota message
+      if (!res.ok) $("nv-status").textContent = res.error;
+      // Label refused because the quota is full
+      else if (res.result.refused) $("nv-status").innerHTML = "<span class='err'>標註沒存：" + res.result.refused + "</span>";
+    });
+  });
+  // Pointer cursor on the picture
+  $("video").style.cursor = "crosshair";
+  // Drive / stop
+  $("nv-drive").onclick = function () {
+    // Toggle
+    studio.control.command(driving ? "stop_drive" : "start_drive").then(function (res) {
+      // Refused
+      if (!res.ok) $("nv-status").innerHTML = "<span class='err'>" + r(res.error.replace(/^ValueError\('|'\)$/g, "")) + "</span>";
+    });
+  };
+  // Clear target
+  $("nv-clear").onclick = function () { studio.control.command("clear_target"); };
+  // Refit the floor
+  $("nv-refit").onclick = function () { studio.control.command("refit_floor"); };
+  // Model list for the learned mode
+  function models() {
+    // Ask the runner
+    studio.control.command("list_models").then(function (res) {
+      // Error
+      if (!res.ok) return;
+      // Fill the select
+      $("nv-model").innerHTML = res.result.models.map(function (m) { return "<option>" + m.name + "</option>"; }).join("") || "<option value=''>（沒有模型）</option>";
+    });
+  }
+  // Load the selected model
+  $("nv-load").onclick = function () {
+    // Progress
+    $("nv-model-info").textContent = "載入中…";
+    // Ask the runner
+    studio.control.command("load_model", { name: $("nv-model").value }).then(function (res) {
+      // Result
+      $("nv-model-info").textContent = res.ok ? "已載入 " + res.result.model + "（sanity " + res.result.sanity.status + "）" : res.error;
+    });
+  };
+  // Clear all labels
+  $("nv-clear-labels").onclick = function () {
+    // Confirm
+    if (confirm("刪除全部標註？")) api("POST", "/api/navigate/labels/clear", { kind: "all" });
+  };
+  // Telemetry
+  window.onTelemetry = function (d) {
+    // Driving state
+    driving = d.driving;
+    // Button
+    $("nv-drive").textContent = driving ? "停止" : "開始前往";
+    // Colour
+    $("nv-drive").style.background = driving ? "#c62828" : "";
+    // Label counts
+    var c = d.labels || {};
+    // Text
+    $("nv-labels").textContent = "標註：點選 " + c.xy + " · 前方有障礙 " + c.blocked + " · 正常行駛 " + c.free +
+      (d.labels_refused ? "（" + d.labels_refused + "）" : "");
+    // Loop statistics
+    var s = d.loop || {}, f = function (v, n) { return v === undefined || v === null ? "-" : v.toFixed(n); };
+    // Line
+    $("nv-stats").textContent = "迴圈 " + f(s.fps, 1) + " FPS · 週期 p95 " + f(s.period_p95_ms, 1) + " ms · 空地 " + f(s.free_ms, 1) +
+      " · 追蹤 " + f(s.track_ms, 1) + " · 規劃 " + f(s.plan_ms, 1) + " ms · 模式 " + d.mode + " · " + r((d.state || {}).status);
+    // Model list once
+    if (!models.done) { models.done = true; models(); }
+  };
+  // Stop events: show the reason
+  window.onEvent = function (ev, replay) {
+    // Stopped
+    if (ev.kind === "nav.stopped" && !replay) $("nv-status").innerHTML = ev.fault ? "<b class='err'>已停車：" + r(ev.code) + "</b>" : "停車中：" + r(ev.code);
+    // Started
+    else if (ev.kind === "nav.started" && !replay) $("nv-status").innerHTML = "<b style='color:#c62828'>前往中</b>";
+    // Target lost
+    else if (ev.kind === "nav.target_lost" && !replay) $("nv-status").innerHTML = "<span class='err'>目標追丟了，請重新點選</span>";
+  };
+});
+</script>

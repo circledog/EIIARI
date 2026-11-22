@@ -105,6 +105,15 @@ sudo bash studio/deploy/install.sh
 
 行駛頁的模型資料夾預設「自動」：車上用 `models_trt/`（和 `live_demo` 一樣只用 TRT），電腦上用 `models/`。資料夾位置可以在 `config.json` 用 `lane_data_dir`、`lane_models_dir`、`lane_trt_dir` 改。
 
+## 任務：避障＋點選目標前進（`navigate`）
+
+- 在畫面上**點一下**設定目標（換算座標時用圖片實際顯示的大小和位置）；追蹤器（模板比對）每幀找到目標，追丟就停車。
+- 空地估計不用模型：起步時正前方那一塊當作地板，學它的顏色；畫面下半部分成 N 個扇區，每個扇區算出「可以往前走多遠」（畫面上的半透明色塊）。白膠帶算地板。
+- 規劃：目標所在的扇區夠空就往目標走，不夠就往最近的空扇區繞；**正前方太近就停車**（最後一道保護，不依賴模型）。輸出和車道線模型一樣是一個目標點，所以直接交給 `project4/control.py`。目標夠低（靠近車子）就算到達。
+- 標註（互動式模仿學習）：每次點選＝`xy_<x>_<y>_<id>.jpg`（和 dataset_xy 同格式，`train.py` 可以直接用）、緊急停止＝「前方有障礙」、沒人介入的行駛畫面＝「正常行駛」（每秒最多一張）。存在 `~/.studio/recordings/navigate/`，有配額。
+- 學習版：下載標註 zip → 電腦上解壓到 `project4/data/` → 訓練頁選 `navigate_labels/xy` → 轉 TRT → 在任務頁載入、模式切成學習版。停車規則仍然有效。
+- 為什麼不用深度模型：見 `tasks/navigate/SPIKE.md`（Nano 4 GB 的 RAM／GPU 要留給控制模型；地板比對在 CPU 上每幀幾毫秒）。
+
 ## 寫一個新任務
 
 在 `studio/tasks/<任務名>/` 建資料夾：
@@ -135,7 +144,7 @@ sudo bash studio/deploy/install.sh
 | `ipc.py` | 兩個行程之間的訊息格式 |
 | `hardware.py`、`sensors.py` | 馬達（沒有車時用假的）、感測器介面 |
 | `motor_guard.py` | 最後手段：直接透過 I2C 停馬達 |
-| `tasks/` | 任務：`drive_check`（相機與馬達檢查）、`lane_follow`（車道線跟隨）、`navigate`（M3，開發中）、`search`（M4，開發中） |
+| `tasks/` | 任務：`drive_check`（相機與馬達檢查）、`lane_follow`（車道線跟隨）、`navigate`（避障＋點選目標）、`search`（M4，開發中） |
 | `templates/`、`static/` | 頁面與前端（不需要建置工具） |
 | `deploy/` | systemd service 與安裝腳本 |
 | `tests/` | 測試 |
@@ -154,6 +163,7 @@ cd studio/tests && python3 -m unittest discover -s .
 | `test_params.py` | 每種型別的驗證、NaN／inf／布林不算數字、執行中只能改 ⚡ 參數、宣告錯誤會被抓到、preset、透過 API 啟動時範圍外的值被擋 |
 | `test_runner.py` | 真的任務行程：串流背壓、沒有頁面時不能開動、斷線停車、緊急停止、網頁行程斷線時任務行程自己停車結束、任務行程被 kill 時跑 motor_guard、第二個任務被拒絕 |
 | `test_lane.py` | 車道線任務：兩種資料集格式、表單預設值等於 `train.py` 和各網路的 `DEFAULTS`、**每個表單選項都原樣傳給 `train.py`**（用 `train.build_parser()` 解析檢查）、控制預設值等於 `control.DEFAULTS`、訓練 log 解析與記憶體不足重試、真的用 job 佇列跑一次 `train.py`（1 epoch）、資料集／縮圖／壞檔 API、模型上傳／下載／刪除、電腦上轉 TRT 被拒、真的任務行程：載入模型 → sanity → 開車 → 畫面有預測值 → 即時改參數 → benchmark → 停車 |
+| `test_navigate.py` | 空地估計（乾淨地板、正前方箱子、20 張合成圖判斷「前方有障礙」20/20）、追蹤器（轉 30° 仍追到、離開畫面／換場景會追丟）、規劃器規則、輸出可以直接給 `control.py`、標註格式能被 `project4/data_loader` 讀、配額滿時拒絕；真的任務行程：沒目標不能開、點選存標註、開往目標、緊急停止存「前方有障礙」、到達後停車、zip 下載 |
 | `test_jobs.py` | 工作佇列（執行、日誌、進度解析、失敗、取消、等 GPU、重啟後標成中斷）、資源與配額、`LinkWatchdog`、網頁行程不會 import torch／cv2／numpy |
 
 也在 Python 3.6.15 + tornado 6.1 的 docker 裡跑過（和車上相同的 Python 版本），全部通過。

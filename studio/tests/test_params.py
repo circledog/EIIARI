@@ -96,7 +96,7 @@ class RegistryTest(unittest.TestCase):
         # The four tasks
         self.assertTrue({"drive_check", "navigate", "search"} <= set(by_id))
         # Development tasks are marked
-        self.assertEqual(by_id["navigate"]["status"], "dev")
+        self.assertEqual(by_id["search"]["status"], "dev")
         # Safety parameter added to every task
         link = [p for p in by_id["drive_check"]["params"] if p["name"] == "link_timeout"][0]
         # Default chosen by the user: 5 s
@@ -120,7 +120,7 @@ class ParamsHttpTest(StudioTestCase):
         # No runner was created
         self.assertIsNone(self.studio.manager.runner)
         # A development task cannot start
-        self.assertEqual(self.api("POST", "/api/tasks/navigate/start", {"values": {}})[0], 409)
+        self.assertEqual(self.api("POST", "/api/tasks/search/start", {"values": {}})[0], 409)
 
     # Presets through the API
     def test_presets_http(self):

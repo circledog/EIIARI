@@ -53,6 +53,15 @@ var T = {
   "Needed for TensorRT conversion with trtexec.": "用 trtexec 轉 TensorRT 時需要。", "Run name": "名稱",
   "Prefix of the output files; empty = automatic.": "輸出檔名的前綴；空白＝自動。",
   "choose a dataset": "請選資料集", "at least one seed": "至少一個 seed",
+  // navigate
+  "Mode": "模式", "Rule-based (free space + tracker)": "規則版（空地估計＋目標追蹤）", "Learned model": "學習版（模型）",
+  "Free space": "空地估計", "Planner": "規劃", "Labels": "標註", "Sectors": "扇區數",
+  "Horizon (fraction of height)": "地平線（畫面高度比例）", "Only the picture below this line is analysed.": "只分析這條線以下的畫面。",
+  "Floor similarity threshold": "地板相似度門檻", "White tape counts as floor": "白膠帶算地板",
+  "Free distance to drive into": "可以開進去的空地距離", "Stop distance (obstacle ahead)": "停車距離（前方障礙）",
+  "Last protection, independent of any model: stop when the sectors ahead are blocked closer.": "最後一道保護，不依賴模型：正前方的扇區比這個距離還近就停車。",
+  "Arrived when the target is this low": "目標低於這個位置就算到達", "Record 'free' pictures while driving": "行駛中記錄「正常行駛」畫面",
+  "Loop / camera timeout (s)": "迴圈／相機逾時（秒）",
   // Runner / server messages
   "task is not running": "任務沒有在執行",
   "link_down": "沒有開著的頁面在回應，不能開動（請確認網路）",
