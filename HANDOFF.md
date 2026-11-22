@@ -1,3 +1,55 @@
+# HANDOFF — `studio` 網頁平台與 live_demo 解耦（branch `studio-dev`）
+
+> 這一段是**目前進行中的工作**（2026-11-22 起）。下面「HANDOFF — Project 4 pipeline」以後是 `project4` 先前的紀錄（第一～二十二階段），保留作歷史。
+
+分支：`studio-dev`，從主機的 `project4` 分支（`c7a9067`）開出。sandbox 是 clone mode：主機用 `git fetch sandbox-<name>` 取回。
+
+## 任務目標
+
+依使用者提供的 `TASKS.md`（2026-11-22）：
+
+- **M0**：`project4/live_demo.ipynb` 的推論＋控制和畫面顯示拆成兩個執行緒，網路慢時只讓畫面變慢，不拖累推論和送馬達。
+- **M1**：新資料夾 `studio/`，像 Jupyter 一樣在車上開網頁：密碼登入、任務清單、參數表單、不排隊的影像串流、集中的安全停車、資源管理。
+- **M2**：任務一「車道線跟隨」：把 `project4` 包成網頁（資料集、訓練設定與執行、模型庫與 TRT 轉換、行駛頁）。
+- **M3**：任務二「避障＋點選目標前進」（互動式模仿學習）。
+- **M4**：任務三「目標物搜尋＋3D 地圖」。
+
+## 使用者對 TASKS.md 0.4 的回答（2026-11-22）
+
+| 問題 | 回答 | 影響 |
+|---|---|---|
+| 板子 | **Jetson Nano 4 GB**（Python 3.6.9，HANDOFF 記錄的是對的；「8 GB」是講錯） | 車上一律 Python 3.6、JetPack 4；RAM 預算全部按 4 GB（CPU 與 GPU 共用）重算 |
+| 感測器 | **只有鏡頭**，但要留其他感測器的接口 | `studio/sensors.py` 定義感測器介面，目前只實作相機；里程計／IMU／距離感測器是空的介面。M4 的位姿只能靠視覺 |
+| 訓練在哪裡跑 | **全部在 PC**，車上只做 TRT 轉換 | studio 分成 PC 與車兩種角色：訓練頁只在 PC 開放；車上的模型庫負責上傳與 TRT 轉換 |
+| 網頁範圍 | **只在區網** | 不做 HTTPS；密碼（PBKDF2）＋簽章 cookie＋登入失敗鎖定就夠 |
+
+## 重要決策
+
+- 沿用 `project4` 的規則：車上會 import 的模組保持 Python 3.6 相容；每行有實質內容的程式碼上一行都要有英文註解；程式碼和訊息只寫英文、JSON 只用 ASCII；文件可以寫中文。
+- `project4/` 不搬動，`studio` 以匯入的方式重用它，不複製程式碼。
+
+## 已完成
+
+（隨進度更新）
+
+## 未完成
+
+- M0 ～ M4 全部。
+
+## 測試指令與結果
+
+```bash
+# Python 環境（sandbox）：scratchpad/venv，Python 3.12，torch 2.15（CPU 執行），tornado 6.6
+cd project4 && python -m unittest discover -s tests
+# → Ran 17 tests, OK（開工前的基準）
+```
+
+## 下一步
+
+1. M0：量測、`LatestSlot`、拆開推論與顯示執行緒、相機來源改成非阻塞、回歸測試。
+
+---
+
 # HANDOFF — Project 4 pipeline (branch `feat/pipeline`)
 
 Worktree: `/home/user/projects/EIIARI-pipeline`（從 `main` 開出）。所有程式在 `project4/`。
