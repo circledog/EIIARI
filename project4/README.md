@@ -30,7 +30,9 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `convert_trt.py` | Nano | 把上傳到 `models/` 的模型轉成 TensorRT，放到 `models_trt/`，並做比對和計時 |
 | `check_trt_coord.py` | Nano | 用隨機權重測每個網路能不能正確轉 TRT（torch2trt 和 trtexec 兩條路） |
 | `check_trt_offline.py` + `fake_tensorrt/` | PC | 沒有 GPU 時的 TRT 轉換檢查：真的 torch2trt 原始碼 + 模擬的 TensorRT，逐層算出結果比對 |
-| `camera.py` | Nano | 相機輸入與前處理 |
+| `camera.py` | Nano | 相機輸入與前處理；`read()` 一律不阻塞（`'csi'`／`'opencv'` 由背景執行緒讀） |
+| `latest_slot.py` | Nano | 只保留最新一筆的單格信箱（寫入覆蓋舊的、讀的人拿最新的，永遠不排隊） |
+| `drive.py` | Nano | 推論＋控制迴圈 `DriveLoop`（不碰介面）和顯示執行緒 `DisplayWorker`（慢了就跳幀、降 FPS／JPEG 品質）；`live_demo` 和 `studio` 共用 |
 | `control.py` | Nano | 轉向角（隊友公式／投影片公式）＋ PID ＋ 差速控制，含平滑和安全檢查 |
 | `train.py` | PC | 依任務呼叫各網路的 `train()`：訓練 → 剪枝 → finetune → 匯出，可多 seed |
 | `training.py` | PC | 共用訓練迴圈 `fit()`：隊友流程 ① 的訓練方式（部分凍結、凍結 BN、AdamW、cosine、gradient clipping、用 px 挑模型、可選的提早停止） |
@@ -217,6 +219,7 @@ python3 convert_trt.py --method trtexec   # 改用 ONNX → trtexec（需要 X.o
 - `flush()`：丟掉迴圈卡住期間堆積的舊畫面。換模型後會自動呼叫。
   - 原因：jetbot 的 GStreamer `appsink` 不會丟舊畫面。換模型時 TRT engine 反序列化會卡住 GIL，相機讀取執行緒跟著停，畫面就堆起來；之後讀取速度和相機速度一樣，堆積永遠消化不掉，畫面會一直延遲。
   - `'jetbot'` 來源的 flush 是重啟相機管線（約 1~2 秒）；`'csi'` 來源設了 `drop=true max-buffers=1`，本來就不會堆積。
+- `read()` 永遠立刻回傳最新一幀，沒有新畫面時回傳**同一個物件**（推論迴圈用 `is` 判斷相機有沒有卡住）。`'csi'`、`'opencv'` 的讀取本身是阻塞式的，所以包在 `ThreadedReader` 裡：背景執行緒一直讀，存進 `LatestSlot`。
 - `preprocess(frame, device, dtype)`：投影片 P.59 的前處理，dtype 依模型決定，不再寫死 `.half()`。
 - `draw_overlay()`、`to_jpeg()`：畫預測點和轉向條，供畫面顯示。
 
@@ -296,7 +299,7 @@ python train.py --help
 | 連線狀態 | 車子、鏡頭有沒有連上。偵測不到 JetBot 就用假馬達（只顯示數值）；鏡頭打不開就顯示「未連接鏡頭」 |
 | 畫面 | 模型實際看到的影像（紅色車道線）、綠色預測點、上方橘色轉向條 |
 | 控制參數（全部是按鈕或滑桿） | 轉向角公式、max / min speed、kp、ki、kd、steering bias、轉彎減速、角度平滑 α、馬達變化率、馬達上限、內側輪可反轉、安全逾時 |
-| 即時讀數 | x、y、angle、steering、實際 speed、左右馬達、P / I / D 項、FPS、前處理＋推論延遲、控制狀態 |
+| 即時讀數 | x、y、angle、steering、實際 speed、左右馬達、P / I / D 項、控制狀態；stats 列：控制 FPS、**控制週期 p50 / p95**、讀圖／前處理／推論／控制各段耗時、顯示 FPS（和目標值）、JPEG 品質、畫一張的時間、每秒跳過幾筆 |
 | 運轉 | **開始行駛／停止**（同一個按鈕：綠色「開始行駛」↔ 紅色「停止」）、錄製 CSV |
 
 **安全機制**（開車時才會停車；推論不會停）：
@@ -312,13 +315,34 @@ python train.py --help
 
 停車時按鈕會自動變回綠色，紅字顯示原因。
 
+**推論和畫面分開**（`drive.py`）：
+
+```
+相機（只保留最新一幀）
+   │ read()：不阻塞
+   ▼
+DriveLoop 執行緒：讀圖 → 標車道線 → 推論 → 控制 → 送馬達 → 寫 CSV（不碰任何 widget）
+   │ put()：覆蓋
+   ▼
+LatestSlot（只有最新一筆）
+   │ wait_newer()：沒有新的就等；好幾筆沒拿就只拿最新那筆
+   ▼
+DisplayWorker 執行緒：畫圖 → JPEG → 更新畫面和讀數（慢了就跳幀）
+```
+
+- 以前是同一個執行緒依序做「推論 → 送馬達 → 畫圖 → JPEG → 寫 widget」，Wi-Fi 一塞，下一次推論和送馬達就跟著延後。現在顯示再慢也只影響畫面。
+- 顯示執行緒最多每秒 `DISPLAY_FPS` 次。畫一張的時間超過預算（1 / 目前 FPS）就把 FPS 降 30%、JPEG 品質降 10（最低 1 FPS、品質 40）；連續約 1 秒都很快，再每次加 1 FPS、品質加 5。
+- 模型載入、停車、錯誤這些事件也交給顯示執行緒去更新介面，推論執行緒完全不寫 widget。
+- CSV 多了 `period_ms`、`read_ms`、`prep_ms`、`infer_ms`、`control_ms`、`display_fps`、`jpeg_quality`、`render_ms`，可以看網路塞住時控制週期有沒有變化。
+- 「結束」按鈕：先停車並結束推論＋看門狗（最多 1 秒），再結束顯示執行緒，最後釋放相機。
+
 **沒有車也能看介面**：PC 上裝好 `jupyter`、`ipywidgets` 和 `requirements-pc.txt` 的套件後，開 `live_demo.ipynb` 執行全部 cell 即可。PC 沒有 TensorRT，下拉選單會是空的或載入失敗，這是正常的；要看推論畫面的話，第 1 節可以改 `CAMERA_SOURCE = 'opencv'`（筆電 webcam）或 `'folder'`，`MODELS_DIR` 改指向 `models/`。
 
 ---
 
 ## 測試
 
-在 `project4/` 裡（PC，不需要資料集、GPU、網路，約 15 秒）：
+在 `project4/` 裡（PC，不需要資料集、GPU、網路，約 1 分鐘）：
 
 ```bash
 python3 -m unittest discover -s tests
@@ -332,6 +356,9 @@ python3 -m unittest discover -s tests
 | `test_metrics.py` | 轉向角誤差和 `control.py` 的公式一致；完美預測誤差為 0 |
 | `test_sanity.py` | sanity 畫面依 `lanes` 存標過 / 原圖，同一個模型比對會通過，訊息是 ASCII |
 | `test_version.py` | 程式碼版本比對規則 |
+| `test_latest_slot.py` | 連續 put 1000 次只留最後一筆；多執行緒讀寫不會漏掉最新值；`wait_newer` 會逾時、`close()` 會放開等待的人 |
+| `test_decoupling.py` | 假相機（30 FPS）＋假模型：顯示故意每張慢 0.5 秒時，控制週期 p95 變化 < 10%、顯示 FPS 和 JPEG 品質下降、記憶體不增加；`close()` 1 秒內停掉兩個執行緒且馬達為 0；看門狗、相機卡住、暫停／恢復、CSV 計時欄；`ThreadedReader.read()` 不阻塞超過 1 ms |
+| `test_live_demo_nb.py` | 用 nbclient 無頭執行 `live_demo.ipynb`（假畫面、假馬達、常數輸出的模型）：載入 → 開車 → 顯示變慢 → 停車 → 結束。沒裝 `nbclient`／`ipykernel`／`ipywidgets` 時自動跳過 |
 | `test_files.py` | 所有 `.py` 都是 ASCII（車上容器是 ASCII 語系）、`.json` 只輸出 ASCII、notebook 和產生器一致 |
 
 TensorRT 轉換另外用 `check_trt_offline.py`（PC，需要 torch2trt 原始碼）和車上的 `check_trt_coord.py` 檢查。
@@ -455,7 +482,9 @@ python preprocessing.py review --data <資料夾>     # 看 label_review.jpg
 | 換模型之後畫面一直延遲 | 確認第 1 節 `FLUSH_ON_SWITCH = True`。還是延遲的話，改用 `CAMERA_SOURCE = 'csi'`（Restart Kernel 後重跑） |
 | 畫面沒更新 | **先看模型選單下方有沒有紅字**。推論出錯時會停車、卸載模型，並把錯誤和 traceback 顯示在那裡 |
 | 顯示「未連接鏡頭」 | 其他 notebook 還佔著相機：關掉所有 kernel 再試，還不行就 `sudo systemctl restart nvargus-daemon`，然後 Restart Kernel |
-| 車子一直被「逾時」停下 | 推論太慢或相機卡住。看 FPS 和延遲；確定沒問題的話可以把「安全逾時」調大一點 |
+| 車子一直被「逾時」停下 | 推論太慢或相機卡住。看 stats 列的控制週期 p95 和各段耗時；確定沒問題的話可以把「安全逾時」調大一點 |
+| Wi-Fi 慢時畫面卡、跳幀，或 JPEG 變模糊 | 正常：顯示執行緒自動降低 FPS 和 JPEG 品質，車子照常控制。看 stats 列的「控制週期 p95」有沒有變；有變才是問題，請記下數字回報 |
+| 控制週期 p95 忽大忽小（沒有開車也一樣） | 可能是 CPU 搶資源：PC 上測試時 torch 的多執行緒讓前處理的 p95 從 39 ms 跳到 58 ms。可以在第 1 節加 `torch.set_num_threads(1)` 比較看看 |
 | 綠點亂跳或完全不對 | 是模型或資料的問題，不是控制的問題（投影片 P.61）。換一個模型比較看看 |
 | 綠點合理但車子擺動 | 是控制的問題：降低 kp 或 max speed，再加一點 kd 或調小角度平滑 α |
 | `No module named torch2trt` | 在 Nano 上確認有裝課程的 torch2trt |

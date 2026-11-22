@@ -27,14 +27,32 @@
 
 - 沿用 `project4` 的規則：車上會 import 的模組保持 Python 3.6 相容；每行有實質內容的程式碼上一行都要有英文註解；程式碼和訊息只寫英文、JSON 只用 ASCII；文件可以寫中文。
 - `project4/` 不搬動，`studio` 以匯入的方式重用它，不複製程式碼。
+- **M0：推論迴圈從 notebook 搬到模組 `project4/drive.py`**（TASKS 原本只說改 notebook）。理由：(1) 才能在沒有 Jupyter 的情況下寫回歸測試；(2) M2 的 studio 行駛頁要用同一個迴圈，不能有兩份。notebook 只剩介面。
+- `DriveLoop` 不認識 ipywidgets，也不輸出中文：停車原因、事件都是英文代碼（`drive.STOP_CODES`），介面自己翻譯。
+- 事件（模型載入、停車、錯誤）也交給顯示執行緒更新介面 → 推論執行緒**完全不寫 widget**（TASKS M0-3 原本允許出錯時寫 `model_info`）。代價：按停車後按鈕變色最多慢一個顯示週期，但馬達是立刻停的。
+- 顯示調整規則：畫一張超過預算（1/目前 FPS）→ FPS ×0.7、JPEG 品質 −10（下限 1 FPS／40）；約 1 秒都在預算一半以內 → +1 FPS、品質 +5（上限 `DISPLAY_FPS`／80）。
+- `'opencv'` 來源打不開時改成直接報錯（以前會一直回傳 None），和 `'csi'` 一致，notebook 會顯示「未連接鏡頭」。
 
 ## 已完成
 
-（隨進度更新）
+### M0 相機預覽與推論解耦（2026-11-22）
+
+| ID | 狀態 | 內容 |
+|---|---|---|
+| M0-1 量測 | ✅ 程式完成，⏳ 車上數字待量 | `DriveLoop` 每秒更新：控制 FPS、控制週期 p50／p95（最近 300 步）、讀圖／前處理／推論／控制平均耗時；顯示端：實際／目標 FPS、JPEG 品質、畫一張的時間、每秒跳過幾筆。都顯示在 stats 列，也寫進 CSV（新增 8 欄） |
+| M0-2 `LatestSlot` | ✅ | `project4/latest_slot.py`：`put`／`get`／`wait_newer(seq, timeout)`／`close`，`threading.Condition` |
+| M0-3 拆推論執行緒 | ✅ | `project4/drive.py` 的 `DriveLoop`：讀圖、標車道線、推論、控制、送馬達、寫 CSV、看門狗；結果 `put` 進信箱；不碰任何 widget |
+| M0-4 顯示執行緒 | ✅ | `DisplayWorker`：`wait_newer` → `render(item, quality)`；FPS／JPEG 品質自動調整；也負責把事件顯示到介面 |
+| M0-5 相機非阻塞 | ✅ | `camera.ThreadedReader` 包住 `'csi'`、`'opencv'`；`'folder'` 改成同一張圖回傳同一個物件 |
+| M0-6 暫停／結束 | ✅ | `DriveLoop.pause()/resume()`（benchmark 用）、`close()` 先停馬達再結束執行緒；結束按鈕：推論 → 顯示 → 相機 |
+| M0-7 回歸測試 | ✅ | `tests/test_decoupling.py`、`tests/test_latest_slot.py`、`tests/test_live_demo_nb.py` |
+| M0-8 實機驗證 | ⏳ 需要使用者在車上做 | 見「下一步」 |
+| M0-9 文件 | ✅ | `project4/README.md`：檔案表、`camera.py`、`live_demo` 架構圖與調整規則、測試表、疑難排解 3 條 |
 
 ## 未完成
 
-- M0 ～ M4 全部。
+- M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
+- M1 ～ M4 全部。
 
 ## 測試指令與結果
 
@@ -42,11 +60,35 @@
 # Python 環境（sandbox）：scratchpad/venv，Python 3.12，torch 2.15（CPU 執行），tornado 6.6
 cd project4 && python -m unittest discover -s tests
 # → Ran 17 tests, OK（開工前的基準）
+# → M0 之後：Ran 30 tests, OK（約 55 秒）
+
+# M0-7 解耦測試（假相機 30 FPS、假模型 5 ms、torch 單執行緒）
+python -m unittest tests.test_decoupling -v
+# → 控制週期 p95：顯示正常 36~39 ms，顯示每張慢 0.5 秒 37~40 ms（4 次都 < 10%）
+#   顯示：60 張 → 8 張（1.8 FPS），JPEG 品質 80 → 40，每秒跳過約 28 筆，記憶體成長 < 1 MB
+#   close()：兩個執行緒 1 秒內結束、馬達 0；看門狗／相機卡住都會停車
+#   ThreadedReader.read()：200 次最慢 < 1 ms（grab 每次阻塞 50 ms）
+
+# live_demo.ipynb 無頭執行（nbclient，假畫面、假馬達、常數輸出的 ResNet-18，CPU）
+python -m unittest tests.test_live_demo_nb -v
+# → 載入 → 開車（按鈕「停止」、左馬達 0.21）→ 控制週期 p95 84.6 ms → 顯示慢 0.5 秒後 80.8 ms、
+#   顯示 1.8 FPS、JPEG 40、仍在行駛 → 停車（按鈕變回「開始行駛」、顯示「手動停止」）→
+#   結束：0.52 秒、沒有執行緒殘留、馬達 0
+
+# 其他檢查
+vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 ✅；notebook 的 code cell 也是 3.2 ✅
+# 註解規則檢查（scratchpad/check_comments.py，AST 找每個 statement 上一行是不是註解）→ 新檔 0 個問題
 ```
+
+**找到的測試環境問題**：PC 上 torch 預設用 12 個執行緒，小 tensor 的前處理反而抖動（控制週期 p95 58 ms，單執行緒 39 ms），和顯示無關。測試裡固定 `torch.set_num_threads(1)`；Nano（4 核）上要不要設，等 M0-1 的實際數字再決定（README 疑難排解有寫）。
 
 ## 下一步
 
-1. M0：量測、`LatestSlot`、拆開推論與顯示執行緒、相機來源改成非阻塞、回歸測試。
+1. **（使用者，車上）M0-8**：把 `project4/*.py`、`live_demo.ipynb` 同步到 Nano，照常開 `live_demo`，開車時：
+   - 正常 Wi-Fi 跑 1 分鐘，記下 stats 列的「控制週期 p50 / p95」和各段耗時；
+   - 用手機熱點／離遠一點／瀏覽器開發者工具限速，再跑 1 分鐘，看 p95 有沒有變、畫面有沒有降 FPS／JPEG、看門狗會不會誤停；
+   - 兩次都按「錄製 CSV」，把 CSV 傳回來就能畫圖。
+2. M1：`studio/` 骨架（tornado、登入、任務清單、參數表單、串流、安全停車、資源管理）。
 
 ---
 

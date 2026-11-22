@@ -19,10 +19,16 @@ hard-coded ``.half()`` -- trtexec engines expect FP32 (handoff 4.2).
 Every source also has ``flush()``: drop frames that queued up while the loop
 was stalled (e.g. loading a model), so the next ``read()`` is live again.
 
+``read()`` never blocks: ``'csi'`` and ``'opencv'`` are read by a background
+thread into a ``LatestSlot``, so like ``jetbot.Camera.value`` it returns the
+newest frame at once. A frame that has not changed since the last call is the
+*same object*, which lets the control loop detect a stalled camera with ``is``.
+
 Python 3.6 compatible (runs on the Jetson Nano).
 """
 import glob
 import os
+import threading
 import time
 
 import cv2
@@ -31,8 +37,11 @@ import PIL.Image
 import torch
 import torchvision.transforms.functional as TF
 
+# Newest-frame mailbox shared with the background reader thread
+from latest_slot import LatestSlot
+
 # Public names of this module
-__all__ = ["open_camera", "preprocess", "draw_overlay", "to_jpeg"]
+__all__ = ["open_camera", "preprocess", "draw_overlay", "to_jpeg", "ThreadedReader"]
 
 # ImageNet per-channel mean used for normalisation (same as training)
 MEAN = [0.485, 0.456, 0.406]
@@ -122,17 +131,12 @@ class _CSISource(object):
             # Explain the most likely cause
             raise RuntimeError("cannot open CSI camera; is another notebook / jetbot.Camera using it?")
 
-    # Grab the newest frame
-    def read(self):
-        # Blocking read of the next frame
+    # Blocking read of the next frame (called by ThreadedReader's thread)
+    def grab(self):
+        # Wait for the next frame from the pipeline
         ok, frame = self.cap.read()
         # None when the read failed
         return frame if ok else None
-
-    # Nothing to flush
-    def flush(self):
-        # appsink drop=true max-buffers=1 never queues
-        return True
 
     # Release the camera
     def stop(self):
@@ -146,14 +150,18 @@ class _OpenCVSource(object):
     def __init__(self, index, width, height):
         # OpenCV capture device
         self.cap = cv2.VideoCapture(index)
+        # No such camera: fail now instead of returning no frames forever
+        if not self.cap.isOpened():
+            # Report the index that could not be opened
+            raise RuntimeError("cannot open camera %r" % (index,))
         # Ask the driver to buffer as few frames as possible
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         # Size every frame is resized to
         self.size = (width, height)
 
-    # Grab the next frame, resized
-    def read(self):
-        # Blocking read
+    # Blocking read of the next frame, resized (called by ThreadedReader's thread)
+    def grab(self):
+        # Wait for the next frame from the driver
         ok, frame = self.cap.read()
         # Read failed (camera unplugged, ...)
         if not ok:
@@ -162,26 +170,87 @@ class _OpenCVSource(object):
         # Resize to the network's input size
         return cv2.resize(frame, self.size)
 
-    # Throw away frames buffered by the driver
-    def flush(self, max_frames=30):
-        """Grab until a grab actually waits for the camera (= queue is empty)."""
-        # Try at most max_frames grabs
-        for _ in range(max_frames):
-            # Time this grab
-            t0 = time.time()
-            # Grab (and discard) one frame
-            self.cap.grab()
-            # A slow grab means we had to wait for the camera: the buffer is empty
-            if time.time() - t0 > 0.015:
-                # Stop flushing
-                break
-        # Flushing never fails here
-        return True
-
     # Release the camera
     def stop(self):
         # Close the capture device
         self.cap.release()
+
+
+# Non-blocking wrapper: a thread keeps reading a blocking source into a LatestSlot
+class ThreadedReader(object):
+    """Run ``source.grab()`` in a background thread; ``read()`` returns at once.
+
+    The thread stores every frame in a ``LatestSlot`` (overwriting the old
+    one), so frames never queue up here and the driver's own buffer is
+    drained continuously. ``read()`` returns the newest frame, or the same
+    object again when no new frame arrived (or ``None`` before the first).
+    """
+
+    # Start the reader thread for a source with a blocking grab()
+    def __init__(self, source):
+        # The wrapped blocking source (has grab() and stop())
+        self.source = source
+        # Newest frame, overwritten by the thread
+        self.slot = LatestSlot()
+        # Set by stop() to end the thread
+        self._stop = False
+        # Number of failed grabs in a row (camera unplugged, ...)
+        self.failures = 0
+        # Daemon thread so it never keeps the process alive
+        self._thread = threading.Thread(target=self._run, name="camera-reader")
+        # Do not block interpreter shutdown
+        self._thread.daemon = True
+        # Start reading
+        self._thread.start()
+
+    # Thread body: read frames as fast as the camera delivers them
+    def _run(self):
+        # Until stop() is called
+        while not self._stop:
+            # A read error must not kill the thread
+            try:
+                # Blocking read of the next frame
+                frame = self.source.grab()
+            # Treat errors like a missing frame
+            except Exception:
+                # No frame this time
+                frame = None
+            # A failed read: count it and back off a little instead of spinning
+            if frame is None:
+                # One more failure in a row
+                self.failures += 1
+                # Short pause
+                time.sleep(0.01)
+                # Try again
+                continue
+            # Successful read: reset the failure counter
+            self.failures = 0
+            # Overwrite the newest frame
+            self.slot.put(frame)
+
+    # Newest frame without waiting
+    def read(self):
+        # The slot's item (None before the first frame)
+        return self.slot.get()[1]
+
+    # Wait for a frame captured after this call
+    def flush(self, timeout=1.0):
+        """The thread drains the driver continuously; just wait for one fresh frame."""
+        # Sequence number of the current frame
+        seq = self.slot.get()[0]
+        # True once a newer frame arrived in time
+        return self.slot.wait_newer(seq, timeout) is not None
+
+    # End the thread and release the source
+    def stop(self, timeout=1.0):
+        # Ask the thread to end
+        self._stop = True
+        # Wake anyone waiting in flush()
+        self.slot.close()
+        # Wait for the thread (a blocking grab may take one frame time)
+        self._thread.join(timeout)
+        # Release the camera
+        self.source.stop()
 
 
 # Frame source that replays the jpgs of a folder (offline testing)
@@ -200,13 +269,19 @@ class _FolderSource(object):
         self.period = 1.0 / fps
         # Start time of the replay
         self.t0 = time.time()
+        # Index and frame of the image shown last (the same object is returned until it changes)
+        self._index, self._frame = None, None
 
     # Image that is "live" at the current time
     def read(self):
         # Index advances with time and wraps around
         i = int((time.time() - self.t0) / self.period) % len(self.paths)
-        # Load and resize that image
-        return cv2.resize(cv2.imread(self.paths[i]), self.size)
+        # Load and resize the image only when the index changed
+        if i != self._index:
+            # Remember the new image
+            self._index, self._frame = i, cv2.resize(cv2.imread(self.paths[i]), self.size)
+        # The current image
+        return self._frame
 
     # Nothing to flush
     def flush(self):
@@ -267,12 +342,12 @@ def open_camera(source="jetbot", width=224, height=224, fps=21, index=0, folder=
         return _JetbotSource(width, height, fps)
     # Robot camera through our drop-old-frames pipeline
     if source == "csi":
-        # Own GStreamer pipeline
-        return _CSISource(width, height, fps)
+        # Own GStreamer pipeline, read by a background thread
+        return ThreadedReader(_CSISource(width, height, fps))
     # USB / PC camera
     if source == "opencv":
-        # cv2.VideoCapture wrapper
-        return _OpenCVSource(index, width, height)
+        # cv2.VideoCapture wrapper, read by a background thread
+        return ThreadedReader(_OpenCVSource(index, width, height))
     # Replay a folder of images
     if source == "folder":
         # Two images per second
