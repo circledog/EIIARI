@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}訓練{% end %}
+{% block body %}
+<p><a href="/task/lane_follow">← 車道線跟隨</a></p>
+<h2>訓練（在電腦上跑 project4/train.py）</h2>
+{% if role != 'pc' %}<div class="warnings"><div>這台是車子：訓練只在電腦上跑（使用者決定）。請在電腦上開 studio 的這一頁。</div></div>{% end %}
+<div class="task-grid">
+  <section class="card">
+    <h3>設定</h3>
+    <form id="train-form" class="params" onsubmit="return false"></form>
+    <div class="row"><button id="train-start" class="primary" {% if role != 'pc' %}disabled{% end %}>開始訓練</button><span id="train-msg" class="small"></span></div>
+    <p class="muted small">每個選項都會原樣傳給 <code>train.py</code>；預設值和 <code>train.py</code>、各網路的 <code>DEFAULTS</code> 相同。產出在 <code>project4/models/</code>。GPU 記憶體不足時會自動把 batch 減半重試（最多 3 次）。</p>
+  </section>
+  <section class="card">
+    <h3>訓練工作</h3>
+    <div id="train-jobs">讀取中…</div>
+  </section>
+</div>
+<section class="card"><h3>紀錄</h3><div class="row"><select id="train-log-job"></select></div><pre id="train-log" class="telemetry" style="max-height:400px"></pre></section>
+{% end %}
+{% block scripts %}<script>var LANE_PAGE = "training";</script><script src="{{ static_url('form.js') }}"></script><script src="{{ static_url('lane.js') }}"></script>{% end %}

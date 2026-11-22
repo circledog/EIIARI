@@ -1,0 +1,200 @@
+<div class="row">
+  <a href="/lane/datasets">資料集</a> ·
+  <a href="/lane/training">訓練（電腦）</a> ·
+  <a href="/lane/models">模型庫與 TensorRT 轉換</a>
+</div>
+<div class="row">
+  <select id="lf-model" style="min-width:260px"><option value="">（啟動任務後可以選模型）</option></select>
+  <button id="lf-refresh">重新掃描</button>
+  <button id="lf-load">載入</button>
+</div>
+<div id="lf-model-info" class="small"><b>未載入模型</b></div>
+<div id="lf-sanity" class="small"></div>
+<div class="row">
+  <button id="lf-drive" class="primary" style="min-width:140px;height:40px;background:#1a8a3a;border-color:#1a8a3a">開始行駛</button>
+  <button id="lf-record">錄製 CSV：關</button>
+  <span id="lf-status">停車中</span>
+</div>
+<table class="small" id="lf-readings">
+  <tr><td>x / y</td><td id="lf-xy">-</td><td>angle</td><td id="lf-angle">-</td></tr>
+  <tr><td>steering</td><td id="lf-steer">-</td><td>實際 speed</td><td id="lf-speed">-</td></tr>
+  <tr><td>左 / 右馬達</td><td id="lf-motors">-</td><td>P / I / D</td><td id="lf-pid">-</td></tr>
+</table>
+<div id="lf-stats" class="small muted"></div>
+<div class="row"><button id="lf-bench">推論速度比較（先停車，量資料夾裡每個模型）</button></div>
+<div id="lf-bench-result" class="small"></div>
+<script>
+window.addEventListener("load", function () {
+  // Short element lookup
+  var $ = function (id) { return document.getElementById(id); };
+  // Texts for the loop's stop reasons (project4/drive.py STOP_CODES) and refusals
+  var REASONS = { manual: "手動停止", model_switch: "切換模型", camera_stalled: "相機沒有新畫面",
+    watchdog: "推論或相機逾時", inference_error: "推論錯誤", loop_error: "迴圈錯誤", loop_ended: "迴圈結束",
+    closed: "結束", invalid_prediction: "模型輸出 NaN / inf", out_of_range: "模型輸出超出畫面範圍",
+    target_too_close: "目標點太靠近車頭", estop: "緊急停止", link_lost: "頁面斷線", shutdown: "任務停止",
+    web_gone: "網頁行程斷線", no_camera: "未連接鏡頭，無法開車", no_model: "未載入模型，無法開車",
+    sanity_failed: "sanity 比對沒通過，禁止開車", link_down: "沒有頁面在回應，不能開動", ok: "ok", no_model_status: "未載入模型" };
+  // Readable reason
+  function reason(code) { return REASONS[code] || code; }
+  // Whether the robot drives (from telemetry / events)
+  var driving = false, recording = false;
+  // Drive button look
+  function showDrive(on) {
+    // Remember
+    driving = on;
+    // Red stop / green start
+    $("lf-drive").textContent = on ? "停止" : "開始行駛";
+    // Colours
+    $("lf-drive").style.background = $("lf-drive").style.borderColor = on ? "#c62828" : "#1a8a3a";
+  }
+  // Fill the model list
+  function loadModels() {
+    // Needs the running task
+    if (!studio.running()) return;
+    // Ask the runner
+    studio.control.command("list_models").then(function (r) {
+      // Error
+      if (!r.ok) { $("lf-model-info").textContent = t(r.error); return; }
+      // Selection to keep
+      var sel = $("lf-model"), keep = sel.value;
+      // Clear
+      sel.innerHTML = "";
+      // Empty folder
+      if (!r.result.models.length) sel.innerHTML = "<option value=''>（" + r.result.folder + " 裡沒有模型）</option>";
+      // One option per model
+      r.result.models.forEach(function (m) {
+        // Option element
+        var o = document.createElement("option");
+        // File name as value
+        o.value = m.name;
+        // Label, test error
+        o.textContent = (m.label || m.name) + (m.test_metrics ? "  ·  test " + m.test_metrics.mean_px.toFixed(1) + " px" : "");
+        // Add it
+        sel.appendChild(o);
+      });
+      // Restore the selection
+      if (keep) sel.value = keep;
+    });
+  }
+  // Rescan button
+  $("lf-refresh").onclick = loadModels;
+  // Load button
+  $("lf-load").onclick = function () {
+    // Selected file
+    var name = $("lf-model").value;
+    // Nothing selected
+    if (!name) return;
+    // Show progress
+    $("lf-model-info").textContent = "載入中… " + name;
+    // Clear the old check
+    $("lf-sanity").textContent = "";
+    // Ask the runner
+    studio.control.command("load_model", { name: name }).then(function (r) { if (!r.ok) $("lf-model-info").textContent = t(r.error); });
+  };
+  // Drive button: start / stop
+  $("lf-drive").onclick = function () {
+    // Toggle
+    studio.control.command(driving ? "stop_drive" : "start_drive").then(function (r) {
+      // Refused: show why
+      if (!r.ok) $("lf-status").innerHTML = "<span class='err'>" + reason(r.error.replace(/^ValueError\('|'\)$/g, "")) + "</span>";
+    });
+  };
+  // Record button
+  $("lf-record").onclick = function () {
+    // Toggle
+    studio.control.command("record", { on: !recording }).then(function (r) {
+      // Refused (quota)
+      if (!r.ok) $("lf-status").innerHTML = "<span class='err'>" + r.error + "</span>";
+    });
+  };
+  // Benchmark: same frame, every model, robot standing (live_demo section 5)
+  $("lf-bench").onclick = function () {
+    // Progress text
+    $("lf-bench-result").textContent = "量測中…（每個模型 120 次推論）";
+    // Ask the runner
+    studio.control.command("benchmark", { n: 100, warmup: 20 }).then(function (r) {
+      // Error
+      if (!r.ok) { $("lf-bench-result").textContent = r.error; return; }
+      // Table, fastest first
+      $("lf-bench-result").innerHTML = "<table><tr><th>模型</th><th>ms</th><th>FPS</th><th></th></tr>" + r.result.rows.map(function (x) {
+        // One row
+        return "<tr><td>" + (x.label || x.name) + "</td><td>" + (x.ms ? x.ms.toFixed(2) : "-") + "</td><td>" +
+          (x.fps ? x.fps.toFixed(1) : "-") + "</td><td>" + (x.kind || x.error || "") + "</td></tr>";
+      }).join("") + "</table>";
+    });
+  };
+  // Readings from every displayed frame
+  window.onFrame = function (h) {
+    // Readings of that frame
+    var m = h.meta || {};
+    // Without a model only the picture is shown
+    if (!m.xy) return;
+    // Target point
+    $("lf-xy").textContent = m.xy[0].toFixed(3) + " / " + m.xy[1].toFixed(3);
+    // Angle and steering
+    $("lf-angle").textContent = m.ctrl.angle.toFixed(3); $("lf-steer").textContent = m.ctrl.steering.toFixed(3);
+    // Speed and motors
+    $("lf-speed").textContent = m.ctrl.speed.toFixed(3); $("lf-motors").textContent = m.left.toFixed(3) + " / " + m.right.toFixed(3);
+    // PID terms
+    $("lf-pid").textContent = m.ctrl.p.toFixed(3) + " / " + m.ctrl.i.toFixed(3) + " / " + m.ctrl.d.toFixed(3);
+  };
+  // State from telemetry (5 per second)
+  window.onTelemetry = function (d) {
+    // Driving state
+    if (d.driving !== driving) showDrive(d.driving);
+    // Recording state
+    recording = !!d.recording;
+    // Record button text
+    $("lf-record").textContent = recording ? "錄製 CSV：開" : "錄製 CSV：關";
+    // Loop statistics
+    var s = d.loop || {}, f = function (v, n) { return v === undefined || v === null ? "-" : v.toFixed(n); };
+    // Control timing line (TASKS M0-1)
+    $("lf-stats").textContent = "控制 " + f(s.fps, 1) + " FPS · 週期 p50 " + f(s.period_p50_ms, 1) + " / p95 " +
+      f(s.period_p95_ms, 1) + " ms · 讀圖 " + f(s.read_ms, 2) + " · 前處理 " + f(s.prep_ms, 1) + " · 推論 " +
+      f(s.infer_ms, 1) + " · 控制 " + f(s.control_ms, 2) + " ms · " + d.device + (d.camera ? "" : " · 未連接鏡頭") +
+      (d.robot === "fake" ? " · 假馬達" : "");
+    // Fill the model list once the task runs
+    if (!loadModels.done) { loadModels.done = true; loadModels(); }
+  };
+  // Events of the drive loop
+  window.onEvent = function (ev, replay) {
+    // Kind without the prefix
+    var k = ev.kind;
+    // Loading started
+    if (k === "drive.model_loading") $("lf-model-info").textContent = "載入中…";
+    // Flushing the camera
+    else if (k === "drive.flushing") $("lf-model-info").textContent = "清空相機佇列…";
+    // Loading failed
+    else if (k === "drive.model_failed") $("lf-model-info").innerHTML = "<span class='err'><b>載入失敗：</b>" + ev.error + "</span>";
+    // Model active
+    else if (k === "drive.model_loaded") {
+      // Summary of its .json
+      var s = ev.summary || {};
+      // Info line
+      $("lf-model-info").innerHTML = "<b>" + ev.describe + "</b>" + (s.label ? " · " + s.label : "") +
+        (s.preprocessing === "none" ? " · <span style='color:darkorange'>不標車道線</span>" : "") +
+        (s.val_metrics ? " · val " + s.val_metrics.mean_px.toFixed(1) + " px" : "") +
+        (s.test_metrics ? " · test " + s.test_metrics.mean_px.toFixed(1) + " px" : "");
+      // Sanity result: green passed, red failed, orange missing
+      var st = (ev.sanity || {}).status, col = st === "passed" ? "green" : st === "failed" ? "red" : "darkorange";
+      // Text
+      $("lf-sanity").innerHTML = "<b style='color:" + col + "'>" + (st === "passed" ? "sanity 比對通過" : st === "failed" ?
+        "sanity 比對沒通過，禁止開車" : "sanity 未比對") + "</b>：" + ((ev.sanity || {}).message || "");
+    }
+    // Inference / loop error
+    else if (k === "drive.inference_error" || k === "drive.loop_error") $("lf-model-info").innerHTML = "<span class='err'><b>" +
+      (k === "drive.inference_error" ? "推論錯誤，模型已卸載" : "迴圈錯誤") + "：</b>" + ev.error + "</span>";
+    // Started
+    else if (k === "drive.drive_started" && !replay) { showDrive(true); $("lf-status").innerHTML = "<b style='color:#c62828'>行駛中</b>"; }
+    // Stopped
+    else if (k === "drive.drive_stopped" && !replay) {
+      // Button
+      showDrive(false);
+      // Reason, red when it was a fault
+      $("lf-status").innerHTML = ev.fault ? "<b class='err'>已停車：" + reason(ev.code) + "</b>" : "停車中：" + reason(ev.code);
+    }
+    // CSV opened
+    else if (k === "drive.recording_started") $("lf-status").textContent += " · 錄製到 " + ev.path;
+  };
+});
+</script>

@@ -72,11 +72,24 @@
 | M1-9 開機自動啟動 | ✅ 寫好，⏳ 未在車上試 | `studio/deploy/studio.service`、`install.sh`；容器名稱 `jetbot_jupyter`、`/workspace/EIIARI` 是推測值 |
 | M1-10 測試 | ✅ | `studio/tests/`，28 個 |
 
+### M2 車道線任務（2026-11-22）
+
+| ID | 狀態 | 內容 |
+|---|---|---|
+| M2-1 任務模組 | ✅ | `studio/tasks/lane_follow/`：`runtime.py` 直接用 `project4/drive.py` 的 `DriveLoop`、`control.py`、`camera.py`、`loader.py`；沒有複製 project4 的程式 |
+| M2-2 資料集頁 | ✅ | `/lane/datasets`：兩種格式、張數、縮圖＋標籤、車道線標示前後對照、檢查壞檔（完整解碼，和 `data_loader._readable` 同一種檢查） |
+| M2-3 訓練設定頁 | ✅ | `/lane/training`：`TRAIN_SCHEMA` 對應 `train.py` 現有的選項。TASKS 寫的「一般／柏林噪聲／壓縮失真最多疊 2 種」是舊版；`train.py` 現在是單一 `--augment`（7 種方法最多疊 2 種），表單照現在的 `train.py` |
+| M2-4 訓練執行 | ✅ | 背景工作；loss 曲線、進度、剩餘時間、取消；GPU 記憶體不足 → batch 減半重試（最多 3 次）；關掉瀏覽器不影響（工作屬於網頁行程，進度存在 `job.json`）。網頁伺服器重開時正在跑的訓練會標成「中斷」 |
+| M2-5 模型庫 | ✅ | `/lane/models`：列表、`.json` 內容、比較兩個、刪除、上傳、下載、車上轉 TensorRT（`convert_trt.py` 背景工作，`needs_device_free`）。⏳ 車上的實際轉換還沒透過網頁跑過 |
+| M2-6 行駛頁 | ✅（⏳ 實車） | 選模型 → sanity → 即時畫面、`live_demo` 的所有控制選項、開始／停止、錄 CSV（先查配額）、推論速度比較。⏳ M0-8 的網路干擾實車測試 |
+| M2-7 文件 | ✅ | `project4/README.md`「live_demo.ipynb 和 studio 網頁的差別」、`studio/README.md` |
+
 ## 未完成
 
 - M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
+- M2 需要車上驗證：上傳模型 → 網頁上轉 TensorRT → 行駛頁載入 TRT 模型開車；看控制週期 p95。
 - M1 需要車上驗證：在 Jupyter 容器裡啟動 studio、`drive_check` 架高測試馬達方向、`motor_guard`（kill 任務行程時馬達有沒有停）、systemd 開機啟動、瀏覽器限速 3G 看畫面延遲。
-- M2 ～ M4 全部。
+- M3、M4 全部（M3-1、M4-1 的 spike 需要車上的數字）。
 
 ## 測試指令與結果
 
@@ -116,6 +129,14 @@ cd studio/tests && python -m unittest discover -s .
 # 手動走一次（PC）：set-password → python -m studio --camera dummy → 登入 → 範圍外參數 400 →
 #   啟動 drive_check 3.5 秒 → 第二次啟動 409 → 停止 → 任務頁 200
 
+# M2：studio/tests/test_lane.py（PC）→ 10 個 OK；整個 studio → Ran 38 tests, OK；project4 → 30 OK
+#   真的 train.py（tiny 資料集、1 epoch、--no-pretrained）透過 job 佇列跑完，進度解析到 epoch 1
+#   行駛（CPU、ResNet-18、torch 1 執行緒、假畫面）：控制 16.5 FPS、週期 p50 58~66 / p95 74~75 ms、推論 56 ms
+# studio 在 Python 3.6 docker → Ran 38, OK (skipped=1：image 沒有 torch_pruning，訓練只在 PC 跑)
+# 真實資料手動檢查（PC，folder 相機輪播 splits/test，models 用主機的兩個 aug2 模型）：
+#   資料集 dataset_xy 200 張（壞檔 0）、splits 277/60/61；兩個模型載入後 sanity 都通過（8 張，差 0.000 px）；
+#   畫面 meta 有預測值。開車後很快自己停：folder 相機每秒只有 2 張，0.5 秒的相機逾時正確觸發
+
 # 其他檢查
 vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 ✅；notebook 的 code cell 也是 3.2 ✅
 # 註解規則檢查（scratchpad/check_comments.py，AST 找每個 statement 上一行是不是註解）→ 新檔 0 個問題
@@ -130,7 +151,8 @@ vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 �
    - 用手機熱點／離遠一點／瀏覽器開發者工具限速，再跑 1 分鐘，看 p95 有沒有變、畫面有沒有降 FPS／JPEG、看門狗會不會誤停；
    - 兩次都按「錄製 CSV」，把 CSV 傳回來就能畫圖。
 2. **（使用者，車上）M1**：照 `studio/README.md`「車上」一節啟動，打開 `http://<車子 IP>:8890`，跑「相機與馬達檢查」（架高），確認畫面和馬達方向；在任務頁按住前進時把分頁關掉，看 5 秒後有沒有停。
-3. M2：車道線任務（`studio/tasks/lane_follow/`）。
+3. **（使用者，車上）M2**：模型庫上傳 `.pth`＋`.json` → 轉 TensorRT → 行駛頁載入、架高測試、跑道上開；看 stats 的控制週期 p95，和 `live_demo` 比較。
+4. M3：先做 M3-1 spike（深度模型在 Nano 上的 FPS／記憶體）需要車上；不依賴車的部分（標註收集格式、地板比對法、目標追蹤、規劃器）可以先做。
    - 3.6 測試環境：本機 Docker image `studio-py36`（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU、opencv 4.5.5），Dockerfile 在 scratchpad/py36（sandbox 重開就沒了，要重建）。
 
 ---

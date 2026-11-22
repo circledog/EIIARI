@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}模型庫{% end %}
+{% block body %}
+<p><a href="/task/lane_follow">← 車道線跟隨</a></p>
+<h2>模型庫</h2>
+<section class="card">
+  <h3>上傳模型（.pth + 同名 .json，要用 trtexec 再加 .onnx）</h3>
+  <div class="row"><input type="file" id="up-files" multiple accept=".pth,.json,.onnx"><button id="up-go">上傳到 models/</button><span id="up-msg" class="small"></span></div>
+  <p class="muted small">電腦上訓練好的模型在電腦的這一頁按「下載」，再到車子的這一頁上傳。上傳後在車上按「轉 TensorRT」。</p>
+</section>
+<section class="card"><h3>PyTorch 模型（models/）</h3><div id="m-torch">讀取中…</div></section>
+<section class="card"><h3>TensorRT 模型（models_trt/，行駛頁只列這裡的）</h3><div id="m-trt">讀取中…</div></section>
+<section class="card"><h3>比較（勾兩個）</h3><div id="m-compare" class="muted">勾選兩個模型就會在這裡並排比較。</div></section>
+<section class="card"><h3>轉換工作</h3><div id="m-jobs"></div></section>
+{% end %}
+{% block scripts %}<script>var LANE_PAGE = "models";</script><script src="{{ static_url('lane.js') }}"></script>{% end %}

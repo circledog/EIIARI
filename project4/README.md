@@ -37,7 +37,7 @@ Jetson Nano  convert_trt.py（.pth → TensorRT）
 | `train.py` | PC | 依任務呼叫各網路的 `train()`：訓練 → 剪枝 → finetune → 匯出，可多 seed |
 | `training.py` | PC | 共用訓練迴圈 `fit()`：隊友流程 ① 的訓練方式（部分凍結、凍結 BN、AdamW、cosine、gradient clipping、用 px 挑模型、可選的提早停止） |
 | `train_experiments.ipynb` | PC / Colab | 一格一個訓練實驗（設定 + `run(...)`），印 test 結果；已訓練過的同設定自動跳過；最後一格總表。第一格是安裝環境 |
-| `live_demo.ipynb` | Nano（PC 也能開介面） | 推論＋控制的操作介面，只列 TensorRT 模型 |
+| `live_demo.ipynb` | Nano（PC 也能開介面） | 推論＋控制的操作介面，只列 TensorRT 模型（日常操作也可以改用 `studio` 網頁，見下方「`live_demo.ipynb` 和 studio 網頁的差別」） |
 | `tools/make_train_experiments.py` | PC | 產生 `train_experiments.ipynb`；要改實驗改這個檔案再重新產生 |
 | `tests/` | PC | 自動化測試（不需要資料、GPU、網路），見下方「測試」 |
 | `requirements-pc.txt` | PC | PC / Colab 端套件 |
@@ -337,6 +337,20 @@ DisplayWorker 執行緒：畫圖 → JPEG → 更新畫面和讀數（慢了就�
 - 「結束」按鈕：先停車並結束推論＋看門狗（最多 1 秒），再結束顯示執行緒，最後釋放相機。
 
 **沒有車也能看介面**：PC 上裝好 `jupyter`、`ipywidgets` 和 `requirements-pc.txt` 的套件後，開 `live_demo.ipynb` 執行全部 cell 即可。PC 沒有 TensorRT，下拉選單會是空的或載入失敗，這是正常的；要看推論畫面的話，第 1 節可以改 `CAMERA_SOURCE = 'opencv'`（筆電 webcam）或 `'folder'`，`MODELS_DIR` 改指向 `models/`。
+
+### `live_demo.ipynb` 和 studio 網頁的差別
+
+車道線跟隨現在也可以用 `studio` 網頁平台操作（repo 根目錄的 `studio/`，`python3 -m studio`，見 `studio/README.md`）。兩者用的是**同一個推論＋控制迴圈**（`drive.py` 的 `DriveLoop`），控制公式、參數、安全機制都一樣。
+
+| | `live_demo.ipynb` | studio「車道線跟隨」 |
+|---|---|---|
+| 定位 | 除錯工具：可以直接改程式、印變數、跑 `benchmark()` | 日常操作：選模型、開車、調參數、錄 CSV |
+| 介面 | Jupyter widgets | 瀏覽器（手機也可以），密碼登入 |
+| 推論和畫面 | 同一個 kernel 裡的兩個執行緒 | 不同行程：網頁行程卡住也不影響控制 |
+| 斷線時 | 車子繼續開（只有 kernel 內的看門狗） | 所有頁面超過「斷線容忍時間」（預設 5 秒）沒回應就停車 |
+| 資料集、訓練、模型庫、TRT 轉換 | 沒有（用命令列） | 有（`/lane/datasets`、`/lane/training`、`/lane/models`） |
+
+兩者不能同時開：相機同時只能被一個程式使用。
 
 ---
 

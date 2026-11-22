@@ -104,6 +104,8 @@ class JobQueue(object):
         self.jobs = {}
         # Progress parsers by job kind: fn(job, new_text)
         self.parsers = {}
+        # Hooks by job kind called once when a job ends: fn(queue, job)
+        self.on_finish = {}
         # Earlier jobs
         root = config.home_dir("jobs")
         # Every job folder
@@ -251,6 +253,18 @@ class JobQueue(object):
                     job.status = "done" if job.returncode == 0 else "failed"
                 # Store
                 job.save()
+                # Kind-specific follow-up (e.g. retry with a smaller batch)
+                hook = self.on_finish.get(job.kind)
+                # Run it; a broken hook must not stop the queue
+                if hook is not None:
+                    # Guarded call
+                    try:
+                        # Follow-up
+                        hook(self, job)
+                    # Log it
+                    except Exception:
+                        # Server log
+                        log.exception("finish hook failed for job %s", job.id)
             # Still running
             else:
                 # Save progress now and then

@@ -90,6 +90,21 @@ sudo bash studio/deploy/install.sh
 - 同時只能有一個任務使用相機和馬達；第二個任務會被拒絕並顯示原因。
 - 背景工作（訓練、TRT 轉換）一次一個，排隊執行；TRT 轉換需要 GPU 和大部分 RAM，有任務在跑時會等。工作的紀錄在 `~/.studio/jobs/<id>/`，關掉瀏覽器不影響；伺服器重開時正在跑的工作會標成「中斷」。
 
+## 任務：車道線跟隨（`lane_follow`）
+
+把 `project4` 包成網頁，程式都是從 `project4/` 匯入的，沒有複製。
+
+| 頁面 | 在哪裡用 | 內容 |
+|---|---|---|
+| 任務頁 `/task/lane_follow`（行駛） | 車（電腦上用 PyTorch 模型＋假馬達也能看） | 選模型 → 載入時 sanity 比對 → 即時畫面（綠點、轉向條）→ 開始行駛／停止、錄製 CSV、推論速度比較；右邊是 `live_demo` 的全部控制選項（⚡ 可在行駛中改）；控制週期 p50／p95 和各段耗時 |
+| `/lane/datasets` | 電腦 | `project4/data` 底下的資料集（單一資料夾或 train/validation/test）、張數、縮圖（綠點＝標籤）、切換「車道線標示後」、檢查壞檔 |
+| `/lane/training` | 電腦（車上會被拒絕） | 表單對應 `train.py` 的每個選項（預設值和 `train.py`／各網路 `DEFAULTS` 相同，有測試檢查）；背景執行、即時 loss 曲線（val px）、進度和剩餘時間、取消；GPU 記憶體不足時自動把 batch 減半重試（最多 3 次） |
+| `/lane/models` | 兩邊 | `models/`、`models_trt/` 的模型與 `.json`（val／test 誤差、sanity、TRT 比對結果與延遲）、勾兩個並排比較、下載、上傳、刪除；車上可以「轉 TensorRT」（背景工作，有任務在跑時會等） |
+
+模型從電腦到車上：電腦的模型庫按「下載」（`.pth` 和 `.json`），到車上的模型庫「上傳」，再按「轉 TensorRT」。
+
+行駛頁的模型資料夾預設「自動」：車上用 `models_trt/`（和 `live_demo` 一樣只用 TRT），電腦上用 `models/`。資料夾位置可以在 `config.json` 用 `lane_data_dir`、`lane_models_dir`、`lane_trt_dir` 改。
+
 ## 寫一個新任務
 
 在 `studio/tasks/<任務名>/` 建資料夾：
@@ -120,14 +135,14 @@ sudo bash studio/deploy/install.sh
 | `ipc.py` | 兩個行程之間的訊息格式 |
 | `hardware.py`、`sensors.py` | 馬達（沒有車時用假的）、感測器介面 |
 | `motor_guard.py` | 最後手段：直接透過 I2C 停馬達 |
-| `tasks/` | 任務：`drive_check`（相機與馬達檢查）、`lane_follow`（M2）、`navigate`（M3，開發中）、`search`（M4，開發中） |
+| `tasks/` | 任務：`drive_check`（相機與馬達檢查）、`lane_follow`（車道線跟隨）、`navigate`（M3，開發中）、`search`（M4，開發中） |
 | `templates/`、`static/` | 頁面與前端（不需要建置工具） |
 | `deploy/` | systemd service 與安裝腳本 |
 | `tests/` | 測試 |
 
 ## 測試
 
-在 `studio/tests/` 裡（PC，不需要硬體；任務行程用假畫面和假馬達，約 25 秒）：
+在 `studio/tests/` 裡（PC，不需要硬體；任務行程用假畫面和假馬達，約 40 秒）：
 
 ```bash
 cd studio/tests && python3 -m unittest discover -s .
@@ -138,6 +153,7 @@ cd studio/tests && python3 -m unittest discover -s .
 | `test_auth.py` | 雜湊與驗證、鎖定（5 次 60 秒）；沒登入時頁面導向登入頁、API 回 401、WebSocket 被關；錯密碼 403；cookie 被改過無效；POST 沒有 XSRF token 被擋 |
 | `test_params.py` | 每種型別的驗證、NaN／inf／布林不算數字、執行中只能改 ⚡ 參數、宣告錯誤會被抓到、preset、透過 API 啟動時範圍外的值被擋 |
 | `test_runner.py` | 真的任務行程：串流背壓、沒有頁面時不能開動、斷線停車、緊急停止、網頁行程斷線時任務行程自己停車結束、任務行程被 kill 時跑 motor_guard、第二個任務被拒絕 |
+| `test_lane.py` | 車道線任務：兩種資料集格式、表單預設值等於 `train.py` 和各網路的 `DEFAULTS`、**每個表單選項都原樣傳給 `train.py`**（用 `train.build_parser()` 解析檢查）、控制預設值等於 `control.DEFAULTS`、訓練 log 解析與記憶體不足重試、真的用 job 佇列跑一次 `train.py`（1 epoch）、資料集／縮圖／壞檔 API、模型上傳／下載／刪除、電腦上轉 TRT 被拒、真的任務行程：載入模型 → sanity → 開車 → 畫面有預測值 → 即時改參數 → benchmark → 停車 |
 | `test_jobs.py` | 工作佇列（執行、日誌、進度解析、失敗、取消、等 GPU、重啟後標成中斷）、資源與配額、`LinkWatchdog`、網頁行程不會 import torch／cv2／numpy |
 
 也在 Python 3.6.15 + tornado 6.1 的 docker 裡跑過（和車上相同的 Python 版本），全部通過。

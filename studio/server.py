@@ -65,6 +65,8 @@ class Studio(object):
         # Settings passed to runners
         self.settings = {"role": self.role, "camera_source": cfg.get("camera_source", "jetbot"),
                          "camera_folder": cfg.get("camera_folder", "")}
+        # Task folder overrides from config.json (e.g. lane_data_dir, lane_models_dir, lane_trt_dir)
+        self.settings.update((k, v) for k, v in cfg.items() if k.startswith("lane_"))
         # Tasks and broken task packages
         self.tasks, self.task_errors = tasks_mod.discover()
         # id -> task
@@ -528,10 +530,20 @@ def make_app(studio, debug=False):
     for t in studio.tasks:
         # A broken web.py is reported, not fatal
         try:
-            # Add each with the same arguments
-            for pattern, handler in tasks_mod.web_handlers(t["id"]):
+            # The task's web module, if any
+            mod = tasks_mod.web_module(t["id"])
+            # No extra pages
+            if mod is None:
+                # Next task
+                continue
+            # Add each handler with the same arguments
+            for pattern, handler in getattr(mod, "HANDLERS", []):
                 # Route
                 routes.append((pattern, handler, a))
+            # One-time setup (job parsers, hooks)
+            if hasattr(mod, "setup"):
+                # Give it the shared state
+                mod.setup(studio)
         # Record it with the task errors
         except Exception as e:
             # Shown on the home page

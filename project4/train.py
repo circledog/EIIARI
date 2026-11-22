@@ -248,8 +248,9 @@ def summarise(per_seed):
     return out
 
 
-# Command-line training pipeline
-def main():
+# Parser of the command-line options
+def build_parser():
+    """Command-line parser (also used by studio's training page to check its commands)."""
     # Parser that shows the module docstring as help text
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     # Dataset folder
@@ -313,7 +314,14 @@ def main():
     # Training device
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # Parse the command line
-    args = ap.parse_args()
+    # The finished parser
+    return ap
+
+
+# Command-line entry point
+def main():
+    # Parse the command line
+    args = build_parser().parse_args()
 
     # One existing baseline cannot stand for several seeds
     if args.base and len(args.seeds) > 1:

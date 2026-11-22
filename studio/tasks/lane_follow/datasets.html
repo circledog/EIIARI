@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}資料集{% end %}
+{% block body %}
+<p><a href="/task/lane_follow">← 車道線跟隨</a></p>
+<h2>資料集</h2>
+<div class="card"><table id="ds-table"><tr><td>讀取中…</td></tr></table></div>
+<section id="ds-view" class="card hidden">
+  <div class="row">
+    <b id="ds-name"></b>
+    <select id="ds-split"></select>
+    <label><input type="checkbox" id="ds-lanes"> 車道線標示後（模型看到的畫面）</label>
+    <button id="ds-prev">上一頁</button><span id="ds-page"></span><button id="ds-next">下一頁</button>
+    <button id="ds-check">檢查壞檔</button><span id="ds-check-result" class="small"></span>
+  </div>
+  <p class="muted small">綠點＝標籤（檔名裡的座標），綠線從車頭（畫面下方中央）連過去。</p>
+  <div id="ds-grid" class="thumbs"></div>
+</section>
+<style>.thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}.thumbs figure{margin:0;font-size:10px;color:#666}.thumbs img{width:100%;display:block;background:#222}</style>
+{% end %}
+{% block scripts %}<script>var LANE_PAGE = "datasets";</script><script src="{{ static_url('lane.js') }}"></script>{% end %}

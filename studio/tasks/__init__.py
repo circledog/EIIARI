@@ -107,23 +107,30 @@ def discover():
     return tasks, errors
 
 
-# Task-specific web handlers
-def web_handlers(task_id):
-    """``HANDLERS`` of ``studio.tasks.<id>.web`` or an empty list."""
+# Task-specific web module
+def web_module(task_id):
+    """``studio.tasks.<id>.web`` or None when the task has no web.py."""
     # Optional module
     try:
         # Import it
-        mod = importlib.import_module("studio.tasks.%s.web" % task_id)
+        return importlib.import_module("studio.tasks.%s.web" % task_id)
     # No web.py in this task
     except ImportError as e:
         # Only a missing web.py is fine; other import errors must surface
         if getattr(e, "name", None) == "studio.tasks.%s.web" % task_id:
-            # No extra handlers
-            return []
+            # No module
+            return None
         # Real error inside web.py
         raise
+
+
+# Task-specific web handlers
+def web_handlers(task_id):
+    """``HANDLERS`` of ``studio.tasks.<id>.web`` or an empty list."""
+    # The module, if any
+    mod = web_module(task_id)
     # Its handlers
-    return list(getattr(mod, "HANDLERS", []))
+    return list(getattr(mod, "HANDLERS", [])) if mod is not None else []
 
 
 # Load the runner-side class named by a task (runner process only)
