@@ -52,7 +52,16 @@
 ## 未完成
 
 - M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
-- M1 ～ M4 全部。
+- **M1 進行中（未完成，還沒跑過也還沒測過）**。已寫好的檔案（commit「M1 WIP」）：
+  - `studio/__init__.py`、`config.py`（`STUDIO_HOME=~/.studio`、`car`/`pc` 角色自動判斷、4 GB Nano 的資源預算 `BUDGET_MB`）
+  - `auth.py`（PBKDF2-SHA256、`Lockout`：同一個位址錯 5 次鎖 60 秒）
+  - `params.py`（參數表驗證、preset 存取）
+  - `tasks/__init__.py`（掃描任務套件、自動加上 `link_timeout` 安全參數）
+  - `ipc.py`（runner 和網頁行程之間的訊息格式：JSON 標頭＋二進位資料）
+  - `hardware.py`、`sensors.py`（相機已實作；里程計／IMU／距離感測器只有介面）、`motor_guard.py`（runner 當掉時直接透過 I2C 停馬達，**還沒在實機測過**）
+  - `safety.py`（`LinkWatchdog`）、`runner.py`（任務行程：讀取、命令、影像、遙測四個執行緒）、`runlink.py`（網頁端：啟動 runner、有頁面在回應時才轉發心跳、只保留最新一幀、runner 死掉就跑 motor_guard）
+  - **還沒寫**：`jobs.py`（工作佇列、資源監控、硬碟配額）、`stream.py`（WebSocket 影像＋ack 背壓、控制 socket）、`server.py`、`__main__.py`（serve／set-password）、templates、static（form.js、stream.js、i18n.js）、`tasks/drive_check`（相機＋手動馬達測試，拿來驗證平台）、`tasks/lane_follow`／`navigate`／`search` 的宣告、`deploy/`、`studio/README.md`、`studio/tests/`
+- M2 ～ M4 全部。
 
 ## 測試指令與結果
 
@@ -88,7 +97,10 @@ vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 �
    - 正常 Wi-Fi 跑 1 分鐘，記下 stats 列的「控制週期 p50 / p95」和各段耗時；
    - 用手機熱點／離遠一點／瀏覽器開發者工具限速，再跑 1 分鐘，看 p95 有沒有變、畫面有沒有降 FPS／JPEG、看門狗會不會誤停；
    - 兩次都按「錄製 CSV」，把 CSV 傳回來就能畫圖。
-2. M1：`studio/` 骨架（tornado、登入、任務清單、參數表單、串流、安全停車、資源管理）。
+2. M1：把上面「還沒寫」的部分做完，接著用 tornado.testing 測試（登入、參數驗證、背壓串流、用假馬達測安全停車）。
+   - 3.6 測試環境：本機 Docker image `studio-py36`（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU、opencv 4.5.5），Dockerfile 在 scratchpad/py36。車上的程式要用它跑一次測試。
+   - 車上 Python 3.6 不能用 `asyncio.run`、`asyncio.create_task`、`get_running_loop`；改用 tornado 的 `spawn_callback`／`gen`。
+   - **待使用者決定**：`link_timeout` 預設 0.5 秒（TASKS M1-7）和 M0-8 的「網路卡住時車子照常循線」有衝突；目前是可以調的參數（0.3～5 秒）。
 
 ---
 
