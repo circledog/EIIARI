@@ -62,6 +62,18 @@ var T = {
   "Last protection, independent of any model: stop when the sectors ahead are blocked closer.": "最後一道保護，不依賴模型：正前方的扇區比這個距離還近就停車。",
   "Arrived when the target is this low": "目標低於這個位置就算到達", "Record 'free' pictures while driving": "行駛中記錄「正常行駛」畫面",
   "Loop / camera timeout (s)": "迴圈／相機逾時（秒）",
+  // search
+  "Search": "搜尋", "Map": "地圖", "Target name": "目標物名稱", "Name of a registered target (see 'Targets' on this page).": "已登錄的目標物名稱（見本頁「目標物登錄」）。",
+  "Time limit (s)": "時間上限（秒）", "Hits in a row to confirm": "連續命中幾幀才算找到",
+  "Camera horizontal field of view (deg)": "相機水平視角（度）", "Ignored when a calibration file is given.": "有校正檔時不使用。",
+  "Camera height above the floor (m)": "相機離地高度（公尺）", "Sets the map's scale: measure it.": "決定地圖的比例，請實際量。",
+  "Camera tilt down (deg)": "相機往下傾斜（度）", "Calibration file": "校正檔",
+  "JSON from python3 -m studio.tasks.search.calibrate (fisheye K and D).": "python3 -m studio.tasks.search.calibrate 產生的 JSON（魚眼 K、D）。",
+  "Map size (m)": "地圖大小（公尺）", "Map cell size (m)": "地圖格子大小（公尺）", "Keyframe every (m)": "每走幾公尺存一張關鍵幀",
+  "Turn-on-the-spot power": "原地轉向的馬達值",
+  "Free distance to drive into (m)": "可以開進去的空地距離（公尺）", "Stop distance (m, obstacle ahead)": "停車距離（公尺，前方障礙）",
+  "Last protection, independent of any model: stop when the floor straight ahead ends closer than this.": "最後一道保護，不依賴模型：正前方的地板在這個距離內就結束時停車。",
+  "Turns picture rows into metres: measure it.": "用來把畫面的列換算成公尺，請實際量。",
   // Runner / server messages
   "task is not running": "任務沒有在執行",
   "link_down": "沒有開著的頁面在回應，不能開動（請確認網路）",

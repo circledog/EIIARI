@@ -400,6 +400,10 @@ class Runner(object):
         if kind == "heartbeat":
             # Link is alive
             self.watchdog.beat()
+        # Motors off before an orderly shutdown (not an emergency)
+        elif kind == "halt":
+            # Stop
+            self.safe_stop("task_stop")
         # Emergency stop
         elif kind == "estop":
             # Stop now

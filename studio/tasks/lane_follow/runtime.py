@@ -214,7 +214,7 @@ class Runtime(TaskRuntime):
     # Safety stop (e-stop, link lost, shutdown)
     def stop_motion(self, code, detail=None):
         # The loop stops the motors under its lock
-        self.loop.stop_drive(code, detail=detail, fault=code not in ("shutdown", "manual"))
+        self.loop.stop_drive(code, detail=detail, fault=code not in ("shutdown", "manual", "task_stop"))
 
     # Moving while the loop drives
     def is_moving(self):

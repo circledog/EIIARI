@@ -70,9 +70,13 @@ class Runtime(TaskRuntime):
                               tape_is_floor=p["tape_is_floor"])
         # Clicked-target tracker
         self.tracker = Tracker()
-        # Planner with the stop rule
+        # Camera geometry: picture rows -> metres on the floor
+        from studio.tasks.search.camera_model import CameraModel
+        # Pinhole model from the parameters
+        self.cam = CameraModel(size=224, hfov_deg=p["hfov_deg"], height=p["cam_height"], pitch_deg=p["cam_pitch"])
+        # Planner with the stop rule, thresholds in metres
         self.planner = Planner(free_threshold=p["free_threshold"], stop_distance=p["stop_distance"],
-                               horizon=p["horizon"])
+                               horizon=p["horizon"], distance=self.cam.score_distance(p["horizon"]))
         # project4 controller with gentle defaults for indoor driving
         self.controller = SteeringController()
         # Label files with the recordings quota
@@ -124,6 +128,10 @@ class Runtime(TaskRuntime):
             if key in values:
                 # Set the attribute
                 setattr(self.planner, key, values[key])
+        # A new horizon changes the row -> metres mapping
+        if "horizon" in values and hasattr(self, "cam"):
+            # New distance function
+            self.planner.distance = self.cam.score_distance(values["horizon"])
         # Changing the mode while driving: stop first
         if "mode" in values and self.driving:
             # Normal stop
@@ -454,10 +462,12 @@ class Runtime(TaskRuntime):
     # ----------------------------------------------------------- safety
     # Safety stop from the runner (e-stop, link lost, shutdown)
     def stop_motion(self, code, detail=None):
+        # Whether the robot was driving (only then an e-stop means "obstacle ahead")
+        was_driving = self.driving
         # Motors off
-        self.stop_drive(code, fault=code not in ("shutdown",), detail=detail)
-        # Emergency stop = "obstacle ahead" label (TASKS M3 idea)
-        if code == "estop" and self.frame is not None:
+        self.stop_drive(code, fault=code not in ("shutdown", "task_stop"), detail=detail)
+        # Emergency stop while driving = "obstacle ahead" label (TASKS M3 idea)
+        if code == "estop" and was_driving and self.frame is not None:
             # Store the picture
             self.labels.blocked(self.frame, scores=self.state.get("scores"), mode=self.ctx.params["mode"])
 

@@ -1,0 +1,6 @@
+{
+  "name": "studio-browser-check",
+  "private": true,
+  "description": "jsdom check of the studio pages (see pages.js)",
+  "dependencies": { "jsdom": "^24.0.0", "ws": "^8.0.0" }
+}

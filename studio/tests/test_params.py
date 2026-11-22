@@ -94,9 +94,9 @@ class RegistryTest(unittest.TestCase):
         # id -> task
         by_id = dict((t["id"], t) for t in found)
         # The four tasks
-        self.assertTrue({"drive_check", "navigate", "search"} <= set(by_id))
-        # Development tasks are marked
-        self.assertEqual(by_id["search"]["status"], "dev")
+        self.assertTrue({"drive_check", "lane_follow", "navigate", "search"} <= set(by_id))
+        # All of them are ready now
+        self.assertEqual(set(t["status"] for t in found), {"ready"})
         # Safety parameter added to every task
         link = [p for p in by_id["drive_check"]["params"] if p["name"] == "link_timeout"][0]
         # Default chosen by the user: 5 s
@@ -119,8 +119,14 @@ class ParamsHttpTest(StudioTestCase):
         self.assertEqual(status, 400)
         # No runner was created
         self.assertIsNone(self.studio.manager.runner)
-        # A development task cannot start
-        self.assertEqual(self.api("POST", "/api/tasks/search/start", {"values": {}})[0], 409)
+        # A development task cannot start; a task for another machine neither
+        dev = dict(self.studio.task_map["drive_check"], status="dev")
+        # Refused with the reason
+        self.assertEqual(self.studio.startable(dev), (False, "this task is still in development"))
+        # Car-only task on a PC
+        car_only = dict(self.studio.task_map["drive_check"], roles=["car"])
+        # Refused
+        self.assertFalse(self.studio.startable(car_only)[0])
 
     # Presets through the API
     def test_presets_http(self):

@@ -39,6 +39,10 @@
 - 任務行程只有在網頁行程要畫面時才壓 JPEG（沒人看就不花 CPU）。
 - `motor_guard.py`：任務行程被 kill 時，馬達驅動晶片會保持最後的速度，所以網頁行程要另外開一個行程直接透過 I2C（Adafruit_MotorHAT，channel 1、2）停馬達，失敗才退回 `jetbot.Robot().stop()`。
 - 車上 studio 跑在 jetbot 的 Jupyter 容器裡（torch／jetbot 只在容器裡）；`STUDIO_HOME=/workspace/.studio` 放在持久化的 volume 上。
+- **停車距離用公尺**（M4 模擬時發現）：這顆廣角往下的相機，畫面下方 40% 只看得到車前約 3 cm，原本「畫面比例 0.12」其實只有 4 cm。`Planner` 加上 `distance`（相機模型換算），navigate／search 的停車距離預設 15 cm、可通行 35 cm，另外任何扇區近於 8 cm 也停車（側前方的障礙）。navigate 因此多了相機參數（視角、高度、傾角）。
+- **停止任務不是緊急停止**：網頁行程停止任務時改送 `halt`（以前送 `estop`，害 navigate 每次停止任務都多存一張「前方有障礙」標註）；緊急停止也只有在**行駛中**按才存成標註。
+- `dummy` 相機改成每秒 30 張（以前每次 `read()` 都是新畫面，navigate／search 的迴圈空轉到 2000 FPS 吃滿一顆 CPU）。
+- M4 不用現成 SLAM：地板鳥瞰視覺里程計（尺度來自相機高度）＋2D 佔據格，3D 在跑完後離線重建（`tasks/search/SPIKE.md`）。地圖檢視器自己用 canvas 畫，不用 three.js（車子的區網可能沒有網路，不能靠 CDN）。
 - `'opencv'` 來源打不開時改成直接報錯（以前會一直回傳 None），和 `'csi'` 一致，notebook 會顯示「未連接鏡頭」。
 
 ## 已完成
@@ -96,13 +100,32 @@
 | M3-6 微調 | ✅ 流程（改成在 PC 上訓練） | 使用者決定訓練只在 PC：zip 下載 → PC 訓練頁 → TRT → 任務頁載入、切學習版。學習版保留停車規則。⏳「保留的 20% 標註上誤差下降」要有真實標註才能驗證 |
 | M3-7 測試與文件 | ✅ | `studio/tests/test_navigate.py`（9 個）、`studio/README.md` |
 
+### M4 目標物搜尋＋3D 地圖（2026-11-22）
+
+| ID | 狀態 | 內容 |
+|---|---|---|
+| M4-1 spike | ✅ 合成場景，⏳ 實車 | `tasks/search/SPIKE.md`：選 (a) 地板鳥瞰視覺里程計＋(c) 跑完後重建，不用 (b) 現成 SLAM。合成 5 m 方形回到起點 3 cm／1.3°。⏳ 實車繞 5 m 方形 |
+| M4-2 目標物登錄 | ✅ | 上傳 1~10 張；ORB 特徵數、「難辨識」警告、照片之間互相檢查；`~/.studio/targets/<名稱>/` |
+| M4-3 偵測 | ✅（合成） | 顏色篩（直方圖反投影比例，和背景多寡無關）→ ORB＋比例測試＋RANSAC homography、外框要凸；連續 K 幀才算找到。3 個目標 × 30＋30 張：召回 84/90（93%）、誤報 0/90。第一版用整張圖的直方圖相關性，目標物只佔畫面 1/4 時會被背景蓋過（30 張漏掉 8 張）→ 改成反投影 |
+| M4-4 定位與 2D 地圖 | ✅ | `odometry.py`、`grid_map.py`（log-odds；同一幀裡被打到的格子不會被旁邊的射線標成空地，測試時發現）；任務頁畫面右上角小地圖 |
+| M4-5 探索 | ✅（模擬） | `explore.py`（前沿、原地轉向）＋M3 規劃器＋卡住偵測。模擬 3 m × 3 m：5/5 找到、0 碰撞（見 SPIKE.md 的修正過程）。⏳ 實車 |
+| M4-6 3D 重建 | ✅ | `reconstruct.py`（背景工作）：地板點＋三角化點、體素合併、點數上限、`.ply`＋`cloud.json`；基線 < 5 cm 的關鍵幀對不三角化。合成場景點都在地板上（p95 < 1 mm） |
+| M4-7 地圖檢視器 | ✅ | `/search/map/<id>`：2D 地圖（路線、起點、目標物）、3D 點雲（canvas，拖曳／滾輪／雙指）、點目標物看照片、下載 `.ply`／軌跡 CSV |
+| M4-8 測試與文件 | ✅ | `test_search.py`（9）、`test_explore_sim.py`（1）、`studio/README.md`、SPIKE.md |
+| 相機校正 | ✅ 工具 | `tasks/search/calibrate.py`（棋盤格 → 魚眼 K、D）。JetBot 的 IMX219-160 是魚眼，實車定位前要先校正 |
+
+### 全部頁面的瀏覽器檢查（2026-11-22）
+
+`studio/tests/test_pages_browser.py` ＋ `tests/browser/pages.js`：用 jsdom 對真的 studio 伺服器打開 8 個頁面、執行頁面的 JavaScript（fetch、WebSocket），四個任務都按啟動／停止。第一次跑就找到兩個 bug：行駛頁的模型清單在「執行中」狀態還沒到時就去拿、之後不再拿（清單永遠空的）；`dummy` 相機讓迴圈空轉。修正後 8 頁 0 個 JS 錯誤。
+
 ## 未完成
 
 - M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
 - M2 需要車上驗證：上傳模型 → 網頁上轉 TensorRT → 行駛頁載入 TRT 模型開車；看控制週期 p95。
 - M1 需要車上驗證：在 Jupyter 容器裡啟動 studio、`drive_check` 架高測試馬達方向、`motor_guard`（kill 任務行程時馬達有沒有停）、systemd 開機啟動、瀏覽器限速 3G 看畫面延遲。
 - M3 需要車上：spike 數字、20 張真實照片的障礙判斷、架高與實地繞箱子、收集標註後訓練學習版並比較。
-- M4 全部。
+- M4 需要車上：相機校正、量相機高度／傾角、實車繞 5 m 方形看里程計誤差、3 m × 3 m 場地搜尋 5 次、實際照片的偵測召回率。
+- 沒有用真正的瀏覽器（Chrome／手機）看過版面，只有 jsdom（不排版、不解碼圖片）。
 
 ## 測試指令與結果
 
@@ -155,6 +178,13 @@ cd studio/tests && python -m unittest discover -s .
 #   追蹤器第一版在無關畫面上分數 0.64~0.8 還一直升（模板被更新成錯的東西）→ 加上唯一性條件、只在強匹配時更新模板
 # spike（python -m studio.tasks.navigate.spike）：PC 地板比對 0.33~0.89 ms、追蹤 1.2~2.9 ms（224~320）
 
+# M4：test_search.py 9 個、test_explore_sim.py 1 個 OK
+#   [search] 里程計 5 m 方形：3.0 cm、1.3°、0 次失敗；偵測召回 84/90、誤報 0/90；重建點 |z| p95 < 1 mm
+#   [explore-sim] 5/5 找到（31~149 s）、0 碰撞
+# 瀏覽器：test_pages_browser.py → 8 頁 0 個 JS 錯誤（需要 node + npm install jsdom）
+# 最後一次全部（PC）：studio Ran 58 tests OK（約 2 分鐘）、project4 30 OK
+# Python 3.6 docker：studio 58 OK (skipped=2：image 裡沒有 torch_pruning、node)
+
 # 其他檢查
 vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 ✅；notebook 的 code cell 也是 3.2 ✅
 # 註解規則檢查（scratchpad/check_comments.py，AST 找每個 statement 上一行是不是註解）→ 新檔 0 個問題
@@ -171,7 +201,9 @@ vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 �
 2. **（使用者，車上）M1**：照 `studio/README.md`「車上」一節啟動，打開 `http://<車子 IP>:8890`，跑「相機與馬達檢查」（架高），確認畫面和馬達方向；在任務頁按住前進時把分頁關掉，看 5 秒後有沒有停。
 3. **（使用者，車上）M2**：模型庫上傳 `.pth`＋`.json` → 轉 TensorRT → 行駛頁載入、架高測試、跑道上開；看 stats 的控制週期 p95，和 `live_demo` 比較。
 4. **（使用者，車上）M3**：`python3 -m studio.tasks.navigate.spike` 的數字貼回來；「避障＋點選目標」架高測試、地上放箱子試繞路／停車；拍 20 張有／沒有障礙的照片。
-5. M4：目標物搜尋＋地圖。先做不依賴車的部分：目標物登錄與偵測（M4-2、M4-3）、2D 佔據格地圖、檢視器；視覺里程計的 spike（M4-1）需要車上錄的影片。
+5. **（使用者，車上）M4**：拍棋盤格校正相機 → 量相機高度／傾角填進參數 → 地上貼一個 5 m 的方形繞一圈看「位置」回到多少 → 3 m × 3 m 場地放箱子和目標物搜尋 5 次。
+6. 用真的瀏覽器（電腦和手機）看一次每一頁的版面。
+7. Depth Anything V2：要量的話需要核准 huggingface.co 的網路存取（sandbox 目前被擋），或在別的電腦匯出 ONNX 帶到車上用 `spike.py --depth-onnx` 量。
    - 3.6 測試環境：本機 Docker image `studio-py36`（Python 3.6.15、tornado 6.1、torch 1.10.2 CPU、opencv 4.5.5），Dockerfile 在 scratchpad/py36（sandbox 重開就沒了，要重建）。
 
 ---

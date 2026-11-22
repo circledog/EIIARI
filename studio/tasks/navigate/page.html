@@ -21,7 +21,7 @@ window.addEventListener("load", function () {
   var R = { manual: "手動停止", arrived: "已到達目標", target_lost: "目標追丟", too_close: "前方太近", blocked: "沒有可走的方向",
     watchdog: "迴圈逾時", camera_stalled: "相機沒有新畫面", estop: "緊急停止", link_lost: "頁面斷線", no_target: "請先在畫面上點目標",
     no_model: "學習版請先載入模型", no_camera: "未連接鏡頭", link_down: "沒有頁面在回應，不能開動", mode_change: "切換模式",
-    target_cleared: "取消目標", model_switch: "切換模型", shutdown: "任務停止", loop_error: "迴圈錯誤", ok: "行駛中", detour: "繞路中", idle: "待命" };
+    target_cleared: "取消目標", model_switch: "切換模型", shutdown: "任務停止", task_stop: "任務停止", loop_error: "迴圈錯誤", ok: "行駛中", detour: "繞路中", idle: "待命" };
   // Readable reason
   function r(code) { return R[code] || code; }
   // Driving state
@@ -105,8 +105,8 @@ window.addEventListener("load", function () {
     // Line
     $("nv-stats").textContent = "迴圈 " + f(s.fps, 1) + " FPS · 週期 p95 " + f(s.period_p95_ms, 1) + " ms · 空地 " + f(s.free_ms, 1) +
       " · 追蹤 " + f(s.track_ms, 1) + " · 規劃 " + f(s.plan_ms, 1) + " ms · 模式 " + d.mode + " · " + r((d.state || {}).status);
-    // Model list once
-    if (!models.done) { models.done = true; models(); }
+    // Model list once the task really runs
+    if (!models.done && studio.running()) { models.done = true; models(); }
   };
   // Stop events: show the reason
   window.onEvent = function (ev, replay) {

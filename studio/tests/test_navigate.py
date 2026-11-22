@@ -321,6 +321,12 @@ class NavigateRunnerTest(StudioTestCase):
         IOLoop.current().spawn_callback(hb)
         # First frames and heartbeats
         await gen.sleep(1.5)
+        # E-stop while standing: not an "obstacle ahead" label
+        conn.write_message(json.dumps({"type": "estop"}))
+        # Telemetry after it
+        tel = await self.until(rd, lambda m: m.get("type") == "telemetry", 5)
+        # No blocked label
+        self.assertEqual(tel["data"]["labels"]["blocked"], 0)
         # Driving without a target is refused
         reply = await self.command(conn, rd, 1, "start_drive")
         # no_target

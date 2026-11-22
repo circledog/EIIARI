@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}地圖 {{ sid }}{% end %}
+{% block body %}
+<p><a href="/task/search">← 目標物搜尋</a></p>
+<h2>地圖 {{ sid }}</h2>
+<div class="row small">
+  <a href="/api/search/sessions/{{ sid }}/map.ply">下載點雲 .ply</a> ·
+  <a href="/api/search/sessions/{{ sid }}/trajectory.csv">下載軌跡 CSV</a> ·
+  <span id="mv-summary"></span>
+</div>
+<div class="task-grid">
+  <section class="card"><h3>2D 地圖（白＝空地、黑＝障礙、灰＝未探索；藍線＝路線、綠點＝起點、紅點＝目標物）</h3>
+    <canvas id="mv-2d" style="width:100%;max-width:520px;background:#888;touch-action:none"></canvas></section>
+  <section class="card"><h3>3D 點雲（拖曳旋轉、滾輪／雙指縮放）</h3>
+    <canvas id="mv-3d" style="width:100%;height:420px;background:#111;touch-action:none"></canvas>
+    <div id="mv-3d-msg" class="small muted"></div></section>
+</div>
+<section class="card hidden" id="mv-found"><h3>找到目標物時的照片</h3><img src="/api/search/sessions/{{ sid }}/found.jpg" style="max-width:320px"><div id="mv-found-info" class="small"></div></section>
+{% end %}
+{% block scripts %}<script>var MAP_SID = "{{ sid }}";</script><script src="{{ static_url('mapview.js') }}"></script>{% end %}

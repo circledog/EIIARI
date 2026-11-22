@@ -10,9 +10,20 @@ lane model predicts -- so ``project4/control.py``'s ``SteeringController``
   (the teammate formula stops by itself when the point reaches the bottom).
 
 Choice of the sector: the target's sector when it is free enough, otherwise
-the free sector closest to it. **Last protection, independent of any
-model**: when the sectors straight ahead are blocked closer than
-``stop_distance`` the planner returns ``'too_close'`` and the robot stops.
+the free sector closest to it.
+
+Thresholds in **metres** when a ``distance`` function (sector score ->
+metres, from the camera model) is given -- use this on the robot: with a
+wide, tilted camera the bottom 40 % of the picture covers only the first few
+centimetres of floor, so fractions of the picture height are misleading
+(found by the exploration simulation: a 0.12 fraction meant ~4 cm). Without
+it the thresholds are fractions of the analysed height (unit tests).
+
+**Last protection, independent of any model**: when the sectors straight
+ahead are blocked closer than ``stop_distance``, or any sector closer than
+``side_distance`` (an obstacle beside the front, which the centre sectors do
+not see -- the simulation's robot scraped along a box corner without it), the
+planner returns ``'too_close'`` and the robot stops.
 
 Python 3.6 compatible (runs on the Jetson Nano).
 """
@@ -23,7 +34,8 @@ class Planner(object):
     """``step(target_u, scores)`` -> ``(xy or None, status, sector)``."""
 
     # Store the settings
-    def __init__(self, free_threshold=0.35, stop_distance=0.12, horizon=0.45, centre_sectors=3):
+    def __init__(self, free_threshold=0.35, stop_distance=0.12, horizon=0.45, centre_sectors=3, distance=None,
+                 side_distance=None):
         # Free distance a sector needs to be driven into
         self.free_threshold = float(free_threshold)
         # Free distance straight ahead below which the robot must stop
@@ -32,6 +44,15 @@ class Planner(object):
         self.horizon = float(horizon)
         # Sectors in the middle that count as "straight ahead"
         self.centre_sectors = int(centre_sectors)
+        # Sector score -> metres (None: thresholds are fractions)
+        self.distance = distance
+        # Closest any sector may be (default: 8 cm in metres mode, off in fraction mode)
+        self.side_distance = side_distance if side_distance is not None else (0.08 if distance is not None else 0.0)
+
+    # Free distance of a sector in the thresholds' unit
+    def _free(self, score):
+        # Metres via the camera model, or the fraction itself
+        return self.distance(score) if self.distance is not None else score
 
     # Sector index of a horizontal position u (0..1)
     @staticmethod
@@ -54,15 +75,17 @@ class Planner(object):
         # Half of the centre band
         half = self.centre_sectors // 2
         # Free distance straight ahead (worst of the centre sectors)
-        ahead = min(scores[max(0, mid - half):mid + half + 1])
-        # Last protection: obstacle right in front
-        if ahead < self.stop_distance:
+        ahead = min(self._free(s) for s in scores[max(0, mid - half):mid + half + 1])
+        # Closest obstacle in any sector (beside the front)
+        nearest = min(self._free(s) for s in scores)
+        # Last protection: obstacle right in front, or very close at the side
+        if ahead < self.stop_distance or nearest < self.side_distance:
             # Stop
             return None, "too_close", None
         # Sector of the target (straight ahead without a target)
         want = self.sector_of(target_u, n) if target_u is not None else mid
         # Sectors free enough to drive into
-        free = [i for i in range(n) if scores[i] >= self.free_threshold]
+        free = [i for i in range(n) if self._free(scores[i]) >= self.free_threshold]
         # Nowhere to go
         if not free:
             # Stop

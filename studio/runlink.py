@@ -233,8 +233,8 @@ class RunnerLink(object):
             return
         # Expected exit from now on (no motor guard)
         self.status = "stopping"
-        # Stop the motors first, then ask it to end
-        self._send({"type": "estop"})
+        # Stop the motors first (not an e-stop: tasks treat those as events / labels), then ask it to end
+        self._send({"type": "halt"})
         # Orderly shutdown
         self._send({"type": "shutdown"})
         # Wait for it to exit

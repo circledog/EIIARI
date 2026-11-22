@@ -299,14 +299,31 @@ class _DummySource(object):
     """A moving synthetic 'road' so the whole loop can run without hardware."""
 
     # Remember the frame size and the start time
-    def __init__(self, width, height):
+    def __init__(self, width, height, fps=30):
         # Size of the generated frames
         self.size = (width, height)
         # Start time, drives the road's sideways motion
         self.t0 = time.time()
+        # Frame period like a real camera (a new frame object only every 1/fps s)
+        self.period = 1.0 / fps
+        # Index and object of the last generated frame
+        self._index, self._frame = None, None
+
+    # Newest frame: a new object only when the next frame is due (like a real camera)
+    def read(self):
+        # Frame number at the current time
+        i = int((time.time() - self.t0) / self.period)
+        # Same frame as before
+        if i == self._index:
+            # The same object (the loop sees "no new frame")
+            return self._frame
+        # Remember the new frame
+        self._index, self._frame = i, self._draw()
+        # The new frame
+        return self._frame
 
     # Draw a frame with two white lines that sway left and right
-    def read(self):
+    def _draw(self):
         # Frame width and height
         w, h = self.size
         # Dark grey background

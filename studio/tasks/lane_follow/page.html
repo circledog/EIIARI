@@ -32,7 +32,7 @@ window.addEventListener("load", function () {
     watchdog: "推論或相機逾時", inference_error: "推論錯誤", loop_error: "迴圈錯誤", loop_ended: "迴圈結束",
     closed: "結束", invalid_prediction: "模型輸出 NaN / inf", out_of_range: "模型輸出超出畫面範圍",
     target_too_close: "目標點太靠近車頭", estop: "緊急停止", link_lost: "頁面斷線", shutdown: "任務停止",
-    web_gone: "網頁行程斷線", no_camera: "未連接鏡頭，無法開車", no_model: "未載入模型，無法開車",
+    web_gone: "網頁行程斷線", task_stop: "任務停止", no_camera: "未連接鏡頭，無法開車", no_model: "未載入模型，無法開車",
     sanity_failed: "sanity 比對沒通過，禁止開車", link_down: "沒有頁面在回應，不能開動", ok: "ok", no_model_status: "未載入模型" };
   // Readable reason
   function reason(code) { return REASONS[code] || code; }
@@ -153,8 +153,8 @@ window.addEventListener("load", function () {
       f(s.period_p95_ms, 1) + " ms · 讀圖 " + f(s.read_ms, 2) + " · 前處理 " + f(s.prep_ms, 1) + " · 推論 " +
       f(s.infer_ms, 1) + " · 控制 " + f(s.control_ms, 2) + " ms · " + d.device + (d.camera ? "" : " · 未連接鏡頭") +
       (d.robot === "fake" ? " · 假馬達" : "");
-    // Fill the model list once the task runs
-    if (!loadModels.done) { loadModels.done = true; loadModels(); }
+    // Fill the model list once the task really runs (telemetry can arrive before the running state)
+    if (!loadModels.done && studio.running()) { loadModels.done = true; loadModels(); }
   };
   // Events of the drive loop
   window.onEvent = function (ev, replay) {

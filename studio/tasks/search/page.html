@@ -1,0 +1,131 @@
+<div class="row">
+  <select id="sr-target" style="min-width:160px"><option value="">（先登錄目標物）</option></select>
+  <button id="sr-start" class="primary">開始搜尋</button>
+  <button id="sr-stop">停止</button>
+  <span id="sr-status">待命</span>
+</div>
+<div id="sr-info" class="small"></div>
+<details class="card"><summary><b>目標物登錄</b>（上傳 1~10 張照片，不同角度）</summary>
+  <div class="row"><input id="tg-name" placeholder="名稱（英數字）" size="14"><input type="file" id="tg-files" multiple accept="image/*"><button id="tg-up">上傳</button></div>
+  <div id="tg-list" class="small">讀取中…</div>
+  <p class="muted small">特徵點太少（例如素色、反光的東西）會標「難辨識」。兩張以上時會互相檢查：用其他照片能不能認出這一張。</p>
+</details>
+<details class="card" open><summary><b>搜尋紀錄與地圖</b></summary><div id="sr-sessions" class="small">讀取中…</div></details>
+<script>
+window.addEventListener("load", function () {
+  // Short element lookup
+  var $ = function (id) { return document.getElementById(id); };
+  // Readable states and stop reasons
+  var R = { idle: "待命", exploring: "探索中", found: "找到目標", done: "探索完成", stopped: "已停止", manual: "手動停止",
+    explored: "沒有可探索的地方了", time_limit: "時間到", watchdog: "迴圈逾時", camera_stalled: "相機沒有新畫面", estop: "緊急停止",
+    link_lost: "頁面斷線", task_stop: "任務停止", loop_error: "迴圈錯誤", no_camera: "未連接鏡頭", link_down: "沒有頁面在回應，不能開動", shutdown: "任務停止" };
+  // Readable text
+  function r(c) { return R[c] || c; }
+  // Escape text
+  function esc(s) { return String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); }
+  // Targets list and select
+  function targets() {
+    // Ask the server
+    api("GET", "/api/search/targets").then(function (res) {
+      // List
+      var list = res.data.targets || [];
+      // Keep the selection
+      var keep = $("sr-target").value;
+      // Select options
+      $("sr-target").innerHTML = list.length ? list.map(function (t) { return "<option>" + esc(t.name) + "</option>"; }).join("") : "<option value=''>（先登錄目標物）</option>";
+      // Restore
+      if (keep) $("sr-target").value = keep;
+      // Table
+      $("tg-list").innerHTML = list.length ? "<table>" + list.map(function (t) {
+        // Feature counts per photo, with the cross-check
+        var photos = t.photos.map(function (p, i) {
+          // Cross-check mark
+          var c = t.cross_check ? (t.cross_check[i] ? " ✓" : " ✗") : "";
+          // Count, hard flag
+          return (p.hard ? "<span class='err'>" + p.features + "（難辨識）</span>" : p.features) + c;
+        }).join("、");
+        // Row
+        return "<tr><td><b>" + esc(t.name) + "</b></td><td>" + t.photos.length + " 張，特徵點 " + photos + "</td><td><button data-del='" + esc(t.name) + "'>刪除</button></td></tr>";
+      }).join("") + "</table>" : "還沒有目標物";
+      // Delete buttons
+      document.querySelectorAll("#tg-list [data-del]").forEach(function (b) {
+        // Confirm and delete
+        b.onclick = function () { if (confirm("刪除目標物 " + b.dataset.del + "？")) api("DELETE", "/api/search/targets/" + b.dataset.del).then(targets); };
+      });
+    });
+  }
+  // Upload photos
+  $("tg-up").onclick = function () {
+    // Name and files
+    var name = $("tg-name").value.trim(), files = $("tg-files").files;
+    // Both needed
+    if (!name || !files.length) return;
+    // Multipart body
+    var fd = new FormData();
+    // Name field
+    fd.append("name", name);
+    // Every file
+    for (var i = 0; i < files.length; i++) fd.append("files", files[i], files[i].name);
+    // Progress
+    $("tg-list").textContent = "上傳與分析中…";
+    // Send with the XSRF header
+    fetch("/api/search/targets", { method: "POST", body: fd, headers: { "X-XSRFToken": cookie("_xsrf") }, credentials: "same-origin" })
+      .then(function (x) { return x.json(); }).then(function (d) { if (d.error) alert(d.error); targets(); $("sr-target").value = name; });
+  };
+  // Sessions list
+  function sessions() {
+    // Ask the server
+    api("GET", "/api/search/sessions").then(function (res) {
+      // Rows
+      var list = res.data.sessions || [];
+      // Table
+      $("sr-sessions").innerHTML = list.length ? "<table><tr><th>時間</th><th>目標</th><th>結果</th><th>探索面積</th><th>3D</th><th></th></tr>" + list.map(function (s) {
+        // Reconstruction state
+        var rec = s.reconstruction ? s.reconstruction.points + " 點" : "<button data-rec='" + s.id + "'>建 3D 地圖</button>";
+        // Row
+        return "<tr><td><a href='/search/map/" + s.id + "'>" + s.id + "</a></td><td>" + esc(s.target) + "</td><td>" + (s.found ? "<b>找到</b>" : r(s.state)) +
+          "</td><td>" + (s.grid ? s.grid.explored_m2 + " m²" : "-") + "</td><td>" + rec + "</td><td>" + s.size_mb + " MB <button data-sdel='" + s.id + "'>刪除</button></td></tr>";
+      }).join("") + "</table>" : "還沒有搜尋紀錄";
+      // Reconstruction buttons
+      document.querySelectorAll("[data-rec]").forEach(function (b) {
+        // Queue the job
+        b.onclick = function () { api("POST", "/api/search/sessions/" + b.dataset.rec + "/reconstruct").then(function () { b.textContent = "已排入背景工作"; b.disabled = true; }); };
+      });
+      // Delete buttons
+      document.querySelectorAll("[data-sdel]").forEach(function (b) {
+        // Confirm and delete
+        b.onclick = function () { if (confirm("刪除這次的紀錄和地圖？")) api("POST", "/api/search/sessions/" + b.dataset.sdel + "/delete").then(sessions); };
+      });
+    });
+  }
+  // Start
+  $("sr-start").onclick = function () {
+    // Ask the runner
+    studio.control.command("start_search", { target: $("sr-target").value }).then(function (res) {
+      // Refused
+      if (!res.ok) $("sr-status").innerHTML = "<span class='err'>" + r(res.error.replace(/^ValueError\(['"]|['"]\)$/g, "")) + "</span>";
+    });
+  };
+  // Stop
+  $("sr-stop").onclick = function () { studio.control.command("stop_search").then(sessions); };
+  // Telemetry
+  window.onTelemetry = function (d) {
+    // State
+    $("sr-status").innerHTML = "<b>" + r(d.state) + "</b>" + (d.session ? " · 第 " + d.session + " 次 · " + d.elapsed_s + " 秒" : "");
+    // Details
+    var o = d.odometry, g = d.grid, det = d.detection || {}, l = d.loop || {}, f = function (v, n) { return v === undefined || v === null ? "-" : v.toFixed(n); };
+    // Line
+    $("sr-info").innerHTML = (o ? "位置 (" + f(o.x, 2) + ", " + f(o.y, 2) + ") m、方向 " + f(o.yaw_deg, 0) + "°、里程計失敗 " + o.lost + " 次 · " : "") +
+      (g ? "已探索 " + g.explored_m2 + " m² · " : "") + "關鍵幀 " + d.keyframes + " · 偵測 " + (det.hit ? "<b>命中</b> " + det.inliers + " 點（連續 " + det.streak + "）" : "—") +
+      " · 迴圈 " + f(l.fps, 1) + " FPS" + (d.found ? "<br><b>找到目標</b>：地圖位置 " + JSON.stringify(d.found.object_xy) : "");
+  };
+  // Events: refresh the sessions when something ends
+  window.onEvent = function (ev, replay) { if (!replay && (ev.kind === "search.found" || ev.kind === "search.stopped")) sessions(); };
+  // First load
+  targets();
+  // Sessions now and every 10 s
+  sessions();
+  // Periodic
+  setInterval(sessions, 10000);
+});
+</script>
