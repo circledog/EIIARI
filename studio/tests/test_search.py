@@ -14,7 +14,7 @@ from tornado.ioloop import IOLoop
 from tornado.testing import gen_test
 
 # Test helpers (temporary STUDIO_HOME, login, WebSockets)
-from _base import StudioTestCase, REPO
+from _base import StudioTestCase
 # Synthetic world, square drive, posters
 from _world import World, square_path, poster, poster_scene
 # Message reader
@@ -226,6 +226,27 @@ class ReconstructionTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(d, "cloud.json")))
         # Far below the 300 MB map budget
         self.assertLess(s["ply_mb"], 30)
+
+    # Keyframes of a session whose runner died: only the line file exists
+    def test_keyframes_line_file_fallback(self):
+        # Function under test
+        from studio.tasks.search.reconstruct import load_keyframes
+        # Empty session folder
+        d = tempfile.mkdtemp()
+        # Nothing yet
+        self.assertEqual(load_keyframes(d), [])
+        # Two complete lines and a partial one (crash while writing)
+        with open(os.path.join(d, "keyframes.jsonl"), "w") as f:
+            # Content
+            f.write('{"file": "00000.jpg", "pose": [0, 0, 0]}\n{"file": "00001.jpg", "pose": [0.1, 0, 0]}\n{"fi')
+        # The complete ones
+        self.assertEqual([k["file"] for k in load_keyframes(d)], ["00000.jpg", "00001.jpg"])
+        # The final list wins once written
+        with open(os.path.join(d, "keyframes.json"), "w") as f:
+            # One entry
+            json.dump([{"file": "00000.jpg", "pose": [0, 0, 0]}], f)
+        # Read from keyframes.json
+        self.assertEqual(len(load_keyframes(d)), 1)
 
 
 # Folder of camera pictures showing the poster (folder camera of the runner test)

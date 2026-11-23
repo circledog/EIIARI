@@ -53,20 +53,23 @@ MAX_EVENTS = 200
 
 
 # Turn numpy values (and containers of them) into plain JSON types
-def jsonable(value):
-    """Recursively convert numpy scalars / arrays, tuples and sets for ``json.dumps``."""
+def jsonable(value, fallback=None):
+    """Recursively convert numpy scalars / arrays, tuples and sets for ``json.dumps``.
+
+    ``fallback(value)`` (e.g. ``repr``) replaces any other non-JSON value.
+    """
     # Dicts: convert keys to str and values recursively
     if isinstance(value, dict):
         # New dict
-        return dict((str(k), jsonable(v)) for k, v in value.items())
+        return dict((str(k), jsonable(v, fallback)) for k, v in value.items())
     # Sequences: lists
     if isinstance(value, (list, tuple, set)):
         # New list
-        return [jsonable(v) for v in value]
+        return [jsonable(v, fallback) for v in value]
     # numpy arrays: lists
     if isinstance(value, np.ndarray):
         # Nested lists
-        return jsonable(value.tolist())
+        return jsonable(value.tolist(), fallback)
     # numpy scalars: Python scalars
     if isinstance(value, np.generic):
         # Python value
@@ -75,6 +78,10 @@ def jsonable(value):
     if isinstance(value, float) and not np.isfinite(value):
         # Represent as null
         return None
+    # Other non-JSON values: stand-in when asked
+    if fallback is not None and not isinstance(value, (str, int, float, bool, type(None))):
+        # Readable replacement
+        return fallback(value)
     # Anything else as is
     return value
 
@@ -208,7 +215,11 @@ class Runner(object):
 
     # Send a message, ignoring a closed connection
     def send(self, header, payload=b""):
-        """Send; returns False when the connection is gone."""
+        """Send; returns False when the connection is gone. Never raises.
+
+        A value ``json`` cannot encode (task bug) must not kill the calling
+        worker thread: it is replaced by its ``repr`` and reported.
+        """
         # The web process may have died
         try:
             # Send it
@@ -218,6 +229,20 @@ class Runner(object):
         # Connection closed
         except (OSError, EOFError):
             # The reader notices the closed socket and shuts down
+            return False
+        # Not JSON-encodable
+        except (TypeError, ValueError) as e:
+            # Report it (the event itself is plain text)
+            self.emit("error", where="send %s" % header.get("type"), error=repr(e))
+        # Same message with readable stand-ins (always encodable)
+        try:
+            # Send it
+            self.conn.send(jsonable(header, fallback=repr), payload)
+            # Sent
+            return True
+        # Connection closed meanwhile
+        except (OSError, EOFError):
+            # Gone
             return False
 
     # Stop the motors through the runtime, never raising
@@ -462,8 +487,8 @@ class Runner(object):
                 if not self.handle(msg):
                     # Shutdown requested
                     break
-        # Web process gone: stop immediately
-        except (EOFError, OSError):
+        # Web process gone (or sent garbage): stop immediately
+        except (EOFError, OSError, ValueError):
             # Stop the motors
             self.safe_stop("web_gone")
             # Not an orderly shutdown
@@ -482,20 +507,16 @@ class Runner(object):
             if self.watchdog is not None:
                 # End its thread
                 self.watchdog.stop()
-            # Release the task's resources
-            try:
-                # Task cleanup
-                self.runtime.close()
-            # Do not fail the shutdown
-            except Exception:
-                # Print to the runner log
-                traceback.print_exc()
-            # Release the camera
-            self.sensors.close()
-            # Last stop of the motors
-            self.robot.stop()
-            # Close the socket
-            self.conn.close()
+            # Task cleanup, camera, last motor stop, socket: each step runs even if one fails
+            for step in (self.runtime.close, self.sensors.close, self.robot.stop, self.conn.close):
+                # Do not fail the shutdown
+                try:
+                    # This step
+                    step()
+                # Print to the runner log and go on
+                except Exception:
+                    # Traceback
+                    traceback.print_exc()
         # Exit code
         return code
 

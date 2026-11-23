@@ -12,7 +12,7 @@ from tornado.ioloop import IOLoop
 from tornado.testing import gen_test
 
 # Test helpers (temporary STUDIO_HOME, login, WebSockets)
-from _base import StudioTestCase, REPO
+from _base import StudioTestCase
 # Message reader that never loses a message
 from test_runner import Reader, parse_frame
 # project4 on the import path (train.py, control.py, test helpers)

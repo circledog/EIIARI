@@ -145,6 +145,8 @@ class RunnerLink(object):
         self.presence = {}
         # Periodic callbacks (heartbeat, process watch)
         self._timers = []
+        # True while the motor guard runs after a crash (devices still held)
+        self.guarding = False
         # Runner log file
         self.log_path = config.home_file("logs", "runner-%s.log" % task["id"])
 
@@ -272,6 +274,10 @@ class RunnerLink(object):
                 self.proc.kill()
                 # Reap it
                 self.proc.wait()
+                # Killed before it could stop the motors itself
+                guard = await self._guard()
+                # Record it for the pages
+                self._event({"kind": "runner_killed", "motor_guard": guard})
         # Close the connection
         if self.stream is not None:
             # Close it
@@ -542,13 +548,37 @@ class RunnerLink(object):
         for t in self._timers:
             # Stop it
             t.stop()
-        # The motors may still be running: stop them from a fresh process
-        guard = self.motor_guard()
-        # Tell the pages
-        self._event({"kind": "runner_died", "returncode": self.proc.returncode, "motor_guard": guard,
-                     "log": self.log_tail(15)})
-        # Wake pages waiting for frames
-        self.frame_cond.notify_all()
+        # Devices stay held until the motor guard is done
+        self.guarding = True
+        # Guard and cleanup run without blocking the IOLoop
+        IOLoop.current().spawn_callback(self._after_death)
+
+    # After an unexpected exit: stop the motors, release everything, tell the pages
+    async def _after_death(self):
+        # Always release the devices in the end
+        try:
+            # The motors may still be running: stop them from a fresh process
+            guard = await self._guard()
+            # Close the stream and server, fail pending commands, wake frame waiters
+            await self._terminate()
+            # Tell the pages
+            self._event({"kind": "runner_died", "returncode": self.proc.returncode, "motor_guard": guard,
+                         "log": self.log_tail(15)})
+        # Devices free again
+        finally:
+            # Done
+            self.guarding = False
+
+    # Run the motor guard in a worker thread (it starts a process and may take seconds)
+    async def _guard(self):
+        # Never raise: the caller is cleanup code
+        try:
+            # Off the IOLoop
+            return await IOLoop.current().run_in_executor(None, self.motor_guard)
+        # Report the failure as text
+        except Exception as e:
+            # Reason
+            return "motor guard failed: %r" % e
 
     # Default motor guard: only on the car (a PC has no motors)
     def _run_motor_guard(self):

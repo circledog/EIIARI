@@ -237,6 +237,25 @@ class ControlSocket(_TaskSocket):
 
     # Periodic: attach to the current link and push the state
     def _tick(self):
+        # Follow task start / stop
+        self._sync_link()
+        # Skip while busy
+        if self._writing():
+            # Dropped
+            return
+        # Runner shown even when finished (error text)
+        r = self.studio.manager.runner
+        # State of this task
+        state = r.describe() if r is not None and r.task["id"] == self.task_id else None
+        # Another task holds the devices
+        other = r.describe() if r is not None and r.task["id"] != self.task_id and \
+            r.status in ("starting", "running", "stopping") else None
+        # Send it
+        self._busy = self.send_json({"type": "state", "runner": state, "other": other, "t": time.time()})
+
+    # Current link of this task; (un)registers the listener when it changed
+    def _sync_link(self):
+        """Also called per message, so heartbeats count right after a task started."""
         # Running link of this task (None when not running)
         link = self.studio.manager.link_for(self.task_id)
         # The link changed (task started / stopped)
@@ -255,19 +274,8 @@ class ControlSocket(_TaskSocket):
                     self.send_json({"type": "event", "id": eid, "event": ev, "replay": True})
             # Remember it
             self.link = link
-        # Skip while busy
-        if self._writing():
-            # Dropped
-            return
-        # Runner shown even when finished (error text)
-        r = self.studio.manager.runner
-        # State of this task
-        state = r.describe() if r is not None and r.task["id"] == self.task_id else None
-        # Another task holds the devices
-        other = r.describe() if r is not None and r.task["id"] != self.task_id and \
-            r.status in ("starting", "running", "stopping") else None
-        # Send it
-        self._busy = self.send_json({"type": "state", "runner": state, "other": other, "t": time.time()})
+        # The current link
+        return link
 
     # Message from the browser
     def on_message(self, message):
@@ -283,8 +291,8 @@ class ControlSocket(_TaskSocket):
         kind = msg.get("type")
         # Heartbeat: this page is present
         if kind == "hb":
-            # Record it on the running link
-            if self.link is not None:
+            # Record it on the running link (looked up now, not at the last tick)
+            if self._sync_link() is not None:
                 # Present
                 self.link.touch(self.cid)
         # Emergency stop: whatever task runs
@@ -306,8 +314,8 @@ class ControlSocket(_TaskSocket):
 
     # Run a command and send the reply
     async def _command(self, msg):
-        # Not running
-        if self.link is None:
+        # Not running (looked up now)
+        if self._sync_link() is None:
             # Error reply
             reply = {"ok": False, "error": "task is not running"}
         # Running
@@ -323,8 +331,8 @@ class ControlSocket(_TaskSocket):
         # Only live parameters, range-checked again here
         clean, errors = params_mod.validate(self.task["params"], msg.get("values") or {}, partial=True,
                                             live_only=True)
-        # Forward the valid ones to the runner
-        if clean and self.link is not None:
+        # Forward the valid ones to the runner (looked up now)
+        if clean and self._sync_link() is not None:
             # Apply
             self.link.set_params(clean)
         # Tell the browser what was accepted / refused

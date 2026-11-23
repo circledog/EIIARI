@@ -141,8 +141,16 @@ class ImageApi(LaneHandler):
         if label is None or os.path.basename(name) != name:
             # Bad request
             raise tornado.web.HTTPError(400, "not a dataset image")
+        # Folder of the split
+        try:
+            # Known split only
+            folder = library.split_folder(ds, self.get_argument("split", "all"))
+        # Unknown split
+        except ValueError as e:
+            # Bad request
+            raise tornado.web.HTTPError(400, str(e))
         # Full path
-        path = os.path.join(library.split_folder(ds, self.get_argument("split", "all")), name)
+        path = os.path.join(folder, name)
         # Missing file
         if not os.path.exists(path):
             # Not found

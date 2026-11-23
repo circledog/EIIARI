@@ -19,6 +19,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 # studio paths and budgets
@@ -411,6 +412,10 @@ class ResourceMonitor(object):
         self._gpu, self._gpu_t = None, 0.0
         # Cached quota usage and its time (walking folders is slow)
         self._quota, self._quota_t = None, 0.0
+        # Per category for quota_ok: {category: [used_mb, time]} and categories being rescanned
+        self._used, self._scanning = {}, set()
+        # Guards _used / _scanning (quota_ok may run in several threads)
+        self._used_lock = threading.Lock()
 
     # CPU usage since the previous call, percent
     def _cpu_percent(self):
@@ -474,15 +479,12 @@ class ResourceMonitor(object):
         # Cached value
         return self._gpu
 
-    # Disk usage of every quota category
-    def quotas(self, max_age=30.0):
-        """``{category: {'used_mb', 'limit_mb', 'folders'}}`` (cached ``max_age`` s)."""
-        # Fresh enough
-        if self._quota is not None and time.monotonic() - self._quota_t < max_age:
-            # Cached
-            return self._quota
-        # Folders counted in each category
-        folders = {
+    # Folders counted for each quota category
+    @staticmethod
+    def quota_folders():
+        """``{category: [folders]}``."""
+        # Category -> folders
+        return {
             # PyTorch models and TensorRT engines
             "models": [os.path.join(PROJECT4_DIR, "models"), os.path.join(PROJECT4_DIR, "models_trt")],
             # Drive logs, recorded frames, collected labels
@@ -492,10 +494,18 @@ class ResourceMonitor(object):
             # Server, runner and job logs
             "logs": [config.home_dir("logs"), config.home_dir("jobs")],
         }
+
+    # Disk usage of every quota category
+    def quotas(self, max_age=30.0):
+        """``{category: {'used_mb', 'limit_mb', 'folders'}}`` (cached ``max_age`` s)."""
+        # Fresh enough
+        if self._quota is not None and time.monotonic() - self._quota_t < max_age:
+            # Cached
+            return self._quota
         # Category -> usage
         out = {}
         # Every category
-        for cat, dirs in folders.items():
+        for cat, dirs in self.quota_folders().items():
             # Sum of the folders
             used = sum(config.folder_size(d) for d in dirs) / 1e6
             # Usage and limit
@@ -506,23 +516,72 @@ class ResourceMonitor(object):
         return out
 
     # Whether a category may grow by `extra_mb`
-    def quota_ok(self, category, extra_mb=0.0):
-        """Return ``(ok, message)`` for writing ``extra_mb`` more into ``category``."""
-        # Current usage (fresh)
-        q = self.quotas(max_age=5.0)[category]
+    def quota_ok(self, category, extra_mb=0.0, max_age=10.0):
+        """Return ``(ok, message)`` for writing ``extra_mb`` more into ``category``.
+
+        Called from control loops (labels, keyframes), so it must not walk
+        folders there: only ``category`` is measured, the first time
+        synchronously, afterwards in a background thread when the value is
+        older than ``max_age`` (the old value is used meanwhile). Accepted
+        writes are added to the cached value until the next scan.
+        """
+        # Budget of the category
+        limit = config.BUDGET_MB[category]
+        # Read the cache; start a background rescan when it is stale
+        with self._used_lock:
+            # Cached [used_mb, time]
+            entry = self._used.get(category)
+            # Stale and not being rescanned already
+            if entry is not None and time.monotonic() - entry[1] > max_age and category not in self._scanning:
+                # Mark it
+                self._scanning.add(category)
+                # Background thread
+                t = threading.Thread(target=self._rescan, args=(category,), name="quota-" + category)
+                # Do not block shutdown
+                t.daemon = True
+                # Run it
+                t.start()
+        # Never measured: once, synchronously (task start)
+        if entry is None:
+            # Measure now
+            self._rescan(category)
+            # Fresh value
+            entry = self._used[category]
+        # Usage including writes accepted since the last scan
+        used = entry[0]
         # Over the category limit
-        if q["used_mb"] + extra_mb > q["limit_mb"]:
+        if used + extra_mb > limit:
             # Refuse with numbers
-            return False, "%s quota full: %.0f of %d MB used; delete old files first" % (
-                category, q["used_mb"], q["limit_mb"])
+            return False, "%s quota full: %.0f of %d MB used; delete old files first" % (category, used, limit)
         # Free disk after writing
         free = config.disk_free_mb() - extra_mb
         # Below the reserve
         if free < config.BUDGET_MB["disk_reserve"]:
             # Refuse
             return False, "only %.0f MB disk left (reserve %d MB)" % (free, config.BUDGET_MB["disk_reserve"])
+        # Count the accepted write until the next scan
+        with self._used_lock:
+            # Optimistic accounting
+            self._used[category][0] += extra_mb
         # Allowed
         return True, ""
+
+    # Measure one category (background thread or first call)
+    def _rescan(self, category):
+        # Always allow the next rescan
+        try:
+            # Sum of its folders (the slow part, outside the lock)
+            used = sum(config.folder_size(d) for d in self.quota_folders()[category]) / 1e6
+            # Store it with the time
+            with self._used_lock:
+                # Fresh value
+                self._used[category] = [used, time.monotonic()]
+        # Done
+        finally:
+            # Not scanning any more
+            with self._used_lock:
+                # Forget the mark
+                self._scanning.discard(category)
 
     # One sample of everything
     def sample(self, runner_pid=None):
@@ -603,8 +662,9 @@ class Manager(object):
     # Whether no task holds the devices
     def device_free(self):
         """True when no task runner is starting / running / stopping."""
-        # No link or a finished one
-        return self.runner is None or self.runner.status in ("stopped", "failed")
+        # No link, or a finished one whose motor guard (after a crash) is done
+        return self.runner is None or (self.runner.status in ("stopped", "failed")
+                                       and not getattr(self.runner, "guarding", False))
 
     # Start a task
     async def start_task(self, task, values, user=None):

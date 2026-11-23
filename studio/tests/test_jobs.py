@@ -119,6 +119,34 @@ class ResourceTest(unittest.TestCase):
         # Explains
         self.assertIn("MB", msg)
 
+    # quota_ok never walks folders in the caller after the first call; it counts accepted writes
+    def test_quota_rescans_in_background(self):
+        import os
+        # Studio home folders
+        from studio import config
+        # Monitor
+        mon = jobs.ResourceMonitor()
+        # First call measures synchronously
+        self.assertTrue(mon.quota_ok("maps", 1)[0])
+        # Measured value (includes the accepted 1 MB)
+        before = mon._used["maps"][0]
+        # 3 MB appear on disk
+        with open(os.path.join(config.home_dir("maps"), "big.bin"), "wb") as f:
+            # Content
+            f.write(b"x" * 3000000)
+        # A stale cache: the call returns at once with the old value and starts a rescan
+        self.assertTrue(mon.quota_ok("maps", 0, max_age=0.0)[0])
+        # Wait for the background scan
+        t0 = time.monotonic()
+        # Until updated
+        while mon._used["maps"][0] < before + 2.0 and time.monotonic() - t0 < 5:
+            # Short wait
+            time.sleep(0.02)
+        # The new file is counted
+        self.assertGreaterEqual(mon._used["maps"][0], before + 2.0)
+        # And no scan is left running
+        self.assertEqual(mon._scanning, set())
+
 
 # Link watchdog with a fake clock
 class LinkWatchdogTest(unittest.TestCase):

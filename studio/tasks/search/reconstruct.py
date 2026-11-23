@@ -33,8 +33,48 @@ import time
 import cv2
 import numpy as np
 
+
 # Camera geometry
 from studio.tasks.search.camera_model import CameraModel
+
+
+# Keyframe list of a session folder
+def load_keyframes(folder):
+    """``keyframes.json`` (written when a session ends), else ``keyframes.jsonl`` (written while it runs).
+
+    The ``.jsonl`` fallback keeps the keyframes of a search whose runner died;
+    a half-written last line is skipped. Returns ``[]`` when neither exists.
+    """
+    # Complete list
+    path = os.path.join(folder, "keyframes.json")
+    # Written at the end of the session
+    if os.path.exists(path):
+        # Read it
+        with open(path, encoding="utf-8") as f:
+            # List of {"file", "pose", "t"}
+            return json.load(f)
+    # Entries so far
+    out = []
+    # Line file
+    path = os.path.join(folder, "keyframes.jsonl")
+    # Missing: no keyframes
+    if not os.path.exists(path):
+        # Empty
+        return out
+    # Read it
+    with open(path, encoding="utf-8") as f:
+        # One entry per line
+        for line in f:
+            # A crash may leave a partial last line
+            try:
+                # Parsed
+                out.append(json.loads(line))
+            # Skip it
+            except ValueError:
+                # Next
+                continue
+    # Entries
+    return out
 
 
 # Camera model of a session
@@ -199,9 +239,7 @@ def reconstruct(folder, voxel=0.02, max_points=200000, floor_voxel=0.03, progres
         # Parsed
         session = json.load(f)
     # Keyframe poses
-    with open(os.path.join(folder, "keyframes.json"), encoding="utf-8") as f:
-        # List of {"file", "pose"}
-        keyframes = json.load(f)
+    keyframes = load_keyframes(folder)
     # Camera
     cam = session_camera(session)
     # Feature detector and matcher

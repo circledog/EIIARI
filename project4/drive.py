@@ -298,28 +298,28 @@ class DriveLoop(object):
         self.model, self.sanity = None, None
         # Tell the UI loading started
         self.emit("model_loading", path=path)
-        # Loading can fail (missing file, SHA256 mismatch, no TensorRT on a PC, ...)
+        # Loading, checking and warm-up can fail (missing file, SHA256 mismatch, no TensorRT on a PC, ...)
         try:
             # Load the checkpoint
             m = self.load_fn(path)
+            # Lane marking only for models trained with it (train.py --no-lanes stores method 'none')
+            lanes = ((m.meta or {}).get("preprocessing") or {}).get("method") != "none"
+            # Compare with the outputs stored at training time
+            result = self.check_fn(m)
+            # Warm-up: the first TRT / CUDA inferences are slow, so do them before the flush
+            warm = self.camera.read() if self.camera is not None else None
+            # Only possible once the camera has a frame
+            if warm is not None:
+                # A few warm-up runs
+                for _ in range(3):
+                    # Same input path as the real loop
+                    m(cam_mod.preprocess(mark_lanes(warm) if lanes else warm, self.device, m.dtype))
         # Report and keep running without a model
         except Exception as e:
             # Tell the UI
             self.emit("model_failed", path=path, error=repr(e), traceback=traceback.format_exc())
             # No model
             return
-        # Lane marking only for models trained with it (train.py --no-lanes stores method 'none')
-        lanes = ((m.meta or {}).get("preprocessing") or {}).get("method") != "none"
-        # Compare with the outputs stored at training time
-        result = self.check_fn(m)
-        # Warm-up: the first TRT / CUDA inferences are slow, so do them before the flush
-        warm = self.camera.read() if self.camera is not None else None
-        # Only possible once the camera has a frame
-        if warm is not None:
-            # A few warm-up runs
-            for _ in range(3):
-                # Same input path as the real loop
-                m(cam_mod.preprocess(mark_lanes(warm) if lanes else warm, self.device, m.dtype))
         # Throw away frames queued during loading so the picture is live again
         if self.flush_on_switch and self.camera is not None:
             # Tell the UI
@@ -354,6 +354,8 @@ class DriveLoop(object):
                 if self._pause:
                     # Tell the benchmark the loop is idle
                     self.paused = True
+                    # The pause must not count as one long control period
+                    prev_step = None
                     # Wait
                     time.sleep(0.02)
                     # Check again

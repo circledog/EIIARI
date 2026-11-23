@@ -18,15 +18,12 @@ One loop thread at camera rate:
 Python 3.6 compatible (runs on the Jetson Nano).
 """
 import os
-import threading
 import time
-import traceback
 
 import cv2
-import numpy as np
 
-# Base class of task runtimes
-from studio.runner import TaskRuntime
+# Camera loop, watchdog and stop logic shared with the search task
+from studio.camloop import CameraLoopRuntime
 # Quota checks for the labels
 from studio.jobs import ResourceMonitor
 # Model folders of the lane task (the learned model lives there too)
@@ -39,32 +36,29 @@ from studio.tasks.navigate.tracker import Tracker
 from studio.tasks.navigate.planner import Planner
 # Label files
 from studio.tasks.navigate.dataset import LabelStore
-# project4 controller (studio.hardware put project4/ on sys.path)
+# project4 controller (studio.runner put project4/ on sys.path)
 from control import SteeringController  # noqa: E402
-# Rolling percentiles of the control period
-from drive import PeriodStats  # noqa: E402
 
 # Controller settings taken from the task parameters
 CONTROL_KEYS = ("max_speed", "min_speed", "kp", "kd", "max_output", "turn_slowdown")
 
 
 # Navigate runtime
-class Runtime(TaskRuntime):
+class Runtime(CameraLoopRuntime):
     """See the module docstring."""
+
+    # Event sent when driving stops
+    STOPPED_EVENT = "nav.stopped"
 
     # Only starting to drive moves the robot
     MOTION_COMMANDS = ("start_drive",)
 
     # Create the parts; the loop starts in start()
     def __init__(self, ctx):
-        # Base: context and display slot
-        TaskRuntime.__init__(self, ctx)
+        # Base: camera, lock, driving state, statistics
+        CameraLoopRuntime.__init__(self, ctx)
         # Shorter names
         p = ctx.params
-        # Camera source (project4 camera object) or None
-        sensor = ctx.sensors.get("camera")
-        # Non-blocking read() / flush() / stop()
-        self.camera = sensor.source if sensor is not None else None
         # Free-space estimator
         self.free = FreeSpace(sectors=p["sectors"], horizon=p["horizon"], floor_threshold=p["floor_threshold"],
                               tape_is_floor=p["tape_is_floor"])
@@ -92,16 +86,8 @@ class Runtime(TaskRuntime):
             else f["models"]
         # Kind of the models in that folder
         self.model_kind = "trt" if self.model_dir == f["trt"] else "torch"
-        # Lock around driving state and motor writes
-        self.lock = threading.RLock()
-        # Driving flag, time of the last successful step, newest raw frame and its time
-        self.driving, self.last_ok, self.frame, self.frame_t = False, 0.0, None, 0.0
         # Newest planner output, controller status, target state
         self.state = {"status": "idle", "sector": None, "scores": [], "target": None}
-        # Loop statistics (published once per second)
-        self.stats, self.periods = {}, PeriodStats()
-        # Set by close()
-        self.done = threading.Event()
         # Apply the parameters
         self.update_params(p)
 
@@ -138,20 +124,6 @@ class Runtime(TaskRuntime):
             self.stop_drive("mode_change")
 
     # ------------------------------------------------------------ driving
-    # Stop driving
-    def stop_drive(self, code, fault=False, detail=None):
-        """Motors off; event for the page."""
-        # Under the lock
-        with self.lock:
-            # Was it driving?
-            was = self.driving
-            # Not any more
-            self.driving = False
-            # Motors off
-            self.ctx.robot.stop()
-        # Tell the page
-        self.ctx.emit("nav.stopped", code=code, fault=fault, detail=detail, was_driving=was)
-
     # Start driving if possible
     def start_drive(self):
         """Raises ValueError with a reason code when refused."""
@@ -179,30 +151,6 @@ class Runtime(TaskRuntime):
         self.ctx.emit("nav.started", mode=self.ctx.params["mode"])
 
     # ------------------------------------------------------------- loop
-    # Start the loop and the watchdog
-    def start(self):
-        # Both threads
-        for target in (self._loop, self._watchdog):
-            # Daemon thread
-            t = threading.Thread(target=target, name=target.__name__.strip("_"))
-            # Do not block shutdown
-            t.daemon = True
-            # Run
-            t.start()
-
-    # Watchdog: no successful step for safety_timeout while driving -> stop
-    def _watchdog(self):
-        # Until close()
-        while not self.done.wait(0.02):
-            # Check under the lock
-            with self.lock:
-                # Driving and late
-                late = self.driving and time.monotonic() - self.last_ok > float(self.ctx.params["safety_timeout"])
-            # Stop
-            if late:
-                # Fault stop
-                self.stop_drive("watchdog", fault=True)
-
     # Target point from the learned model
     def _predict(self, frame):
         # project4 camera helpers and lane marking
@@ -216,8 +164,8 @@ class Runtime(TaskRuntime):
         # Normalised point
         return float(xy[0]), float(xy[1])
 
-    # One step with a new frame
-    def _step(self, frame):
+    # One step with a new frame (called by the base class loop)
+    def step(self, frame):
         # Timings of this step
         t0 = time.monotonic()
         # Free-space sectors
@@ -304,70 +252,6 @@ class Runtime(TaskRuntime):
         self.slot.put(dict(self.state, frame=frame, scores_np=scores, steering=self.controller.last["steering"]))
         # Stage times
         return {"free": t1 - t0, "track": t2 - t1, "plan": t3 - t2, "control": time.monotonic() - t3}
-
-    # Loop thread body
-    def _loop(self):
-        # Last frame object, previous step time, per-second accumulators
-        last, prev, acc, win = None, None, {"n": 0, "free": 0.0, "track": 0.0, "plan": 0.0, "control": 0.0}, time.monotonic()
-        # Until close()
-        while not self.done.is_set():
-            # An error must not kill the loop
-            try:
-                # No camera: idle
-                if self.camera is None:
-                    # Wait
-                    time.sleep(0.1)
-                    # Again
-                    continue
-                # Newest frame (non-blocking)
-                frame = self.camera.read()
-                # Now
-                now = time.monotonic()
-                # Nothing new
-                if frame is None or frame is last:
-                    # Camera stalled while driving
-                    if self.driving and now - self.frame_t > float(self.ctx.params["safety_timeout"]):
-                        # Fault stop
-                        self.stop_drive("camera_stalled", fault=True)
-                    # Short wait
-                    time.sleep(0.003)
-                    # Again
-                    continue
-                # Remember it (also for clicks and blocked labels)
-                last, self.frame, self.frame_t = frame, frame, now
-                # One step
-                t = self._step(frame)
-                # Control period
-                if prev is not None:
-                    # Into the window
-                    self.periods.add(now - prev)
-                # Remember
-                prev = now
-                # Accumulate stage times
-                acc["n"] += 1
-                # Each stage
-                for k in t:
-                    # Sum
-                    acc[k] += t[k]
-                # Once per second: publish
-                if now - win >= 1.0:
-                    # Steps in the window
-                    n = max(1, acc["n"])
-                    # Statistics
-                    self.stats = {"fps": acc["n"] / (now - win), "period_p50_ms": self.periods.percentile(50),
-                                  "period_p95_ms": self.periods.percentile(95),
-                                  "free_ms": acc["free"] * 1000 / n, "track_ms": acc["track"] * 1000 / n,
-                                  "plan_ms": acc["plan"] * 1000 / n, "control_ms": acc["control"] * 1000 / n}
-                    # New window
-                    acc, win = dict((k, 0 if k == "n" else 0.0) for k in acc), now
-            # Report, stop, keep going
-            except Exception as e:
-                # Never keep driving after an error
-                self.stop_drive("loop_error", fault=True, detail={"error": repr(e)})
-                # Tell the page
-                self.ctx.emit("error", where="navigate loop", traceback=traceback.format_exc())
-                # Do not spin
-                time.sleep(0.5)
 
     # ---------------------------------------------------------- commands
     # Commands from the page
@@ -471,11 +355,6 @@ class Runtime(TaskRuntime):
             # Store the picture
             self.labels.blocked(self.frame, scores=self.state.get("scores"), mode=self.ctx.params["mode"])
 
-    # Moving while driving
-    def is_moving(self):
-        # Driving flag
-        return bool(self.driving)
-
     # Display item -> JPEG with sectors, target and steering
     def render(self, item, quality):
         # Sectors on the picture
@@ -514,10 +393,3 @@ class Runtime(TaskRuntime):
                 "labels_refused": self.labels.refused, "model": os.path.basename(self.model.path) if self.model else None,
                 "camera": self.camera is not None, "camera_error": self.ctx.sensors.errors.get("camera"),
                 "robot": self.ctx.robot_info["kind"]}
-
-    # End the threads
-    def close(self):
-        # Motors off
-        self.stop_drive("shutdown")
-        # End the loop and watchdog
-        self.done.set()

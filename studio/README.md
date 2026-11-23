@@ -132,6 +132,7 @@ sudo bash studio/deploy/install.sh
 
 - `__init__.py`：只放宣告 `TASK = {...}`（不能 import torch，網頁行程會讀它）。欄位見 `studio/tasks/__init__.py`，參數格式見 `studio/params.py`。
 - `runtime.py`：`TaskRuntime` 的子類別（`studio/runner.py`），在任務行程裡跑。要做的事：把要顯示的東西放進 `self.slot`、實作 `render()`（轉成 JPEG）、`command()`、`stop_motion()`（**一定要馬上停馬達、不能丟例外**）、`is_moving()`、`telemetry()`。會讓車子動的指令列在 `MOTION_COMMANDS`。
+  - 自己開車、每幀「看畫面 → 決定馬達」的任務，改繼承 `studio/camloop.py` 的 `CameraLoopRuntime`（避障、搜尋都用它）：讀鏡頭的迴圈、鏡頭卡住停車、看門狗（`safety_timeout` 內沒有成功的一步就停車）、`stop_drive()`、每秒統計都在裡面。子類別只要設 `STOPPED_EVENT`、實作 `step(frame)`（回傳各階段秒數；每次送馬達指令後更新 `self.last_ok`），需要的話覆寫 `on_safety_stop(code)`。
 - `page.html`（選用）：放在任務頁畫面下方的自訂內容和 script，可以用 `window.studio.control.command(name, args)`。
 - `web.py`（選用）：`HANDLERS = [(pattern, Handler), ...]`，任務自己的頁面或 API（同樣不能 import torch）。
 
@@ -151,6 +152,7 @@ sudo bash studio/deploy/install.sh
 | `stream.py` | 影像 WebSocket（ack 背壓）、控制 WebSocket（心跳、緊急停止、指令、即時參數） |
 | `runlink.py` | 網頁端：啟動任務行程、轉送心跳、最新一幀、任務行程死掉時跑 motor_guard |
 | `runner.py` | 任務行程本體與 `TaskRuntime` 基底類別 |
+| `camloop.py` | `CameraLoopRuntime`：避障、搜尋共用的鏡頭迴圈、看門狗、停車 |
 | `safety.py` | `LinkWatchdog` |
 | `jobs.py` | 裝置使用權、背景工作佇列、資源監控、硬碟配額 |
 | `ipc.py` | 兩個行程之間的訊息格式 |
@@ -173,12 +175,13 @@ cd studio/tests && python3 -m unittest discover -s .
 |---|---|
 | `test_auth.py` | 雜湊與驗證、鎖定（5 次 60 秒）；沒登入時頁面導向登入頁、API 回 401、WebSocket 被關；錯密碼 403；cookie 被改過無效；POST 沒有 XSRF token 被擋 |
 | `test_params.py` | 每種型別的驗證、NaN／inf／布林不算數字、執行中只能改 ⚡ 參數、宣告錯誤會被抓到、preset、透過 API 啟動時範圍外的值被擋 |
-| `test_runner.py` | 真的任務行程：串流背壓、沒有頁面時不能開動、斷線停車、緊急停止、網頁行程斷線時任務行程自己停車結束、任務行程被 kill 時跑 motor_guard、第二個任務被拒絕 |
+| `test_runner.py` | 真的任務行程：串流背壓、沒有頁面時不能開動、斷線停車、緊急停止、網頁行程斷線時任務行程自己停車結束、任務行程被 kill 時跑 motor_guard（不卡住網頁、跑完才釋放裝置）、任務行程卡死被強制 kill 時也跑 motor_guard、傳不出去的 JSON 值不會弄死執行緒、第二個任務被拒絕 |
+| `test_camloop.py` | `CameraLoopRuntime` 的三種安全停車（鏡頭卡住、看門狗、迴圈例外後繼續跑）、正常時不誤停 |
 | `test_lane.py` | 車道線任務：兩種資料集格式、表單預設值等於 `train.py` 和各網路的 `DEFAULTS`、**每個表單選項都原樣傳給 `train.py`**（用 `train.build_parser()` 解析檢查）、控制預設值等於 `control.DEFAULTS`、訓練 log 解析與記憶體不足重試、真的用 job 佇列跑一次 `train.py`（1 epoch）、資料集／縮圖／壞檔 API、模型上傳／下載／刪除、電腦上轉 TRT 被拒、真的任務行程：載入模型 → sanity → 開車 → 畫面有預測值 → 即時改參數 → benchmark → 停車 |
 | `test_navigate.py` | 空地估計（乾淨地板、正前方箱子、20 張合成圖判斷「前方有障礙」20/20）、追蹤器（轉 30° 仍追到、離開畫面／換場景會追丟）、規劃器規則、輸出可以直接給 `control.py`、標註格式能被 `project4/data_loader` 讀、配額滿時拒絕；真的任務行程：沒目標不能開、點選存標註、開往目標、緊急停止存「前方有障礙」、到達後停車、zip 下載 |
 | `test_search.py` | 相機模型（像素↔地板）、視覺里程計 5 m 方形回到起點 3 cm／1.3°、純色地板不亂跑、佔據格與前沿、探索規則、偵測（3 個目標 × 30＋30 張：召回 84/90、誤報 0/90）、連續命中才算找到、3D 重建（點都在地板上）；真的任務行程：上傳登錄目標物（互相檢查）→ 搜尋 → 找到 → 檔案 → 3D 背景工作 → 檢視頁 |
 | `test_explore_sim.py` | 用搜尋任務真正的探索程式開模擬車：3 m × 3 m 房間＋箱子，5 種配置都要在 10 分鐘內找到目標、0 次碰撞（TASKS M4-5 的驗收在模擬裡） |
 | `test_pages_browser.py` | 用 jsdom 在真的 DOM 裡打開全部 8 個頁面（登入、執行頁面的 JavaScript、WebSocket）：0 個 JS 錯誤、四個任務都能啟動／停止、畫面串流有收到並回 ack、表單有產生。需要 `node` 和 `cd studio/tests/browser && npm install`，沒有就跳過 |
-| `test_jobs.py` | 工作佇列（執行、日誌、進度解析、失敗、取消、等 GPU、重啟後標成中斷）、資源與配額、`LinkWatchdog`、網頁行程不會 import torch／cv2／numpy |
+| `test_jobs.py` | 工作佇列（執行、日誌、進度解析、失敗、取消、等 GPU、重啟後標成中斷）、資源與配額（配額在背景重新計算，不在控制迴圈裡掃資料夾）、`LinkWatchdog`、網頁行程不會 import torch／cv2／numpy |
 
 也在 Python 3.6.15 + tornado 6.1 的 docker 裡跑過（和車上相同的 Python 版本），全部通過。

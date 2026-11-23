@@ -118,6 +118,39 @@
 
 `studio/tests/test_pages_browser.py` ＋ `tests/browser/pages.js`：用 jsdom 對真的 studio 伺服器打開 8 個頁面、執行頁面的 JavaScript（fetch、WebSocket），四個任務都按啟動／停止。第一次跑就找到兩個 bug：行駛頁的模型清單在「執行中」狀態還沒到時就去拿、之後不再拿（清單永遠空的）；`dummy` 相機讓迴圈空轉。修正後 8 頁 0 個 JS 錯誤。
 
+### 除錯／優化／重構（2026-11-23）
+
+用 pyflakes、vulture 掃過，再逐一讀安全相關的程式（runner、runlink、stream、jobs、drive），每個修正都有測試。
+
+**Bug**
+| 問題 | 後果 | 修正 |
+|---|---|---|
+| `train.py` 的 `main()` 用到不存在的 `ap`（抽出 `build_parser()` 時留下的） | `--base` 配多個 `--seeds` 時 NameError，看不到原本的錯誤訊息 | `ap = build_parser()` |
+| 任務行程死掉時，網頁端在 IOLoop 上用阻塞的 `subprocess.run` 跑 motor_guard（timeout 20 秒） | 這段時間所有頁面、WebSocket、緊急停止全部卡住 | 改在 executor 跑；跑完才釋放裝置（`RunnerLink.guarding`），也會關掉連線、讓等待中的指令立刻回錯誤（原本要等 60 秒逾時） |
+| 「停止任務」時任務行程卡死、被 SIGKILL | 沒跑 motor_guard，馬達可能維持最後的速度 | 被 kill 時也跑 motor_guard，事件 `runner_killed` |
+| 任務行程的 `send()` 遇到 JSON 編不了的值會丟 `TypeError` | 遙測或畫面執行緒直接死掉，頁面不再更新（沒有錯誤訊息） | 換成 `repr` 後照送，並發 `error` 事件 |
+| 任務行程收到格式錯誤的訊息（`ValueError`） | 沒有走「網頁端斷線」的處理 | 一樣先停車再結束；結束清理每一步各自 try，一步失敗不會跳過後面（例如關相機失敗就沒停馬達） |
+| 任務頁的心跳、指令用 0.5 秒才更新一次的 `self.link` | 任務剛啟動的 0.5 秒內心跳被丟掉，馬上按開車會被拒（`link_down`） | 每個訊息都重新查目前的任務 |
+| `DriveLoop.pause()`（benchmark）之後的第一個週期包含整段暫停 | 控制週期 p95 被灌大 | 暫停時重設 |
+| `DriveLoop` 換模型時 sanity 檢查或暖機丟例外 | 只看到 `loop_error`，沒有 `model_failed` | 一起包進 try |
+| 縮圖 API 給不存在的 split | HTTP 500 | 400 |
+
+**效能**（車上控制迴圈裡的週期性卡頓；PC 數字，Nano 大約慢 10 倍）
+| 問題 | 修正 |
+|---|---|
+| 搜尋任務每 5 秒在控制迴圈裡重寫整個 `keyframes.json`（2000 個關鍵幀時 PC 3 ms，越跑越久） | 每個關鍵幀即時附加一行到 `keyframes.jsonl`，`keyframes.json` 只在結束時寫；3D 重建在任務行程當掉時改讀 `.jsonl`（最後半行跳過） |
+| 地圖的 `image()` 每次把整條軌跡逐段畫（每幀加一點），而畫面每一幀都會畫小地圖 → 越跑越慢 | 軌跡只在換格子時記一點，用一次 `cv2.polylines` 畫 |
+| `GridMap.update` 逐格 Python 迴圈 | 改成 numpy 向量化，結果和舊版逐格完全相同（600 個隨機位姿 × 3 種相機，差 0.0），快約 2 倍 |
+| `quota_ok()` 快取過期時把**所有**配額類別的資料夾都掃一遍，而避障的標註、搜尋的關鍵幀是在控制迴圈裡呼叫它 | 只算要問的那一類；第一次同步算，之後在背景執行緒重算、先用舊值，接受的寫入量先加進快取 |
+
+**重構**
+- `studio/camloop.py`：`CameraLoopRuntime`。避障和搜尋原本各有一份幾乎一樣的鏡頭迴圈、鏡頭卡住停車、看門狗、停車、每秒統計，現在共用；兩個任務只剩 `step(frame)` 和自己的狀態。新測試 `test_camloop.py` 直接測三種安全停車。
+- 刪掉沒用到的 import、`GridMap.ray`／`ray_cells`。
+
+驗證：studio PC 66 OK、Python 3.6 docker 66 OK (skipped=2)、project4 30 OK；探索模擬結果和改之前一模一樣（5/5、同樣的秒數）。
+
+**看過但沒改的**：tornado 的逾時用 `time.time()` 當絕對時間，懷疑是 bug，但 tornado 6.1／6.6 的 `IOLoop.time()` 就是 `time.time()`，兩版都實測過逾時正常。project4 的 `test_data_loader` 在 3.6 image 裡失敗：查到是 image 裡 Pillow 8.4 和 OpenCV 4.5.5 解 JPEG 的結果不同（同一張圖差到 10 個灰階），車道線標示的門檻把差異放大；PC 上兩者完全相同。車上不受影響：sanity 檢查用 PNG，車上的畫面直接來自相機、沒有 JPEG。
+
 ## 未完成
 
 - M0-8：Nano 實機驗證（限速／干擾 Wi-Fi 開車，看控制週期 p95 有沒有變）。M0-1 在 Nano 上的實際數字也還沒有。
@@ -184,6 +217,12 @@ cd studio/tests && python -m unittest discover -s .
 # 瀏覽器：test_pages_browser.py → 8 頁 0 個 JS 錯誤（需要 node + npm install jsdom）
 # 最後一次全部（PC）：studio Ran 58 tests OK（約 2 分鐘）、project4 30 OK
 # Python 3.6 docker：studio 58 OK (skipped=2：image 裡沒有 torch_pruning、node)
+
+# 除錯／優化／重構之後（2026-11-23）
+# studio（PC）→ Ran 66 tests, OK；Python 3.6 docker → Ran 66, OK (skipped=2)；project4（PC）→ 30 OK
+#   [safety] 斷線 0.60 s、緊急停止 0.05 s、SIGKILL → motor_guard 0.25 s、網頁端斷線 → 任務行程 0.55 s 結束
+#   [explore-sim] 5/5（31~149 s）、0 碰撞（和改之前相同）
+# pyflakes：只剩刻意的 import（noqa）
 
 # 其他檢查
 vermin --no-tips -t=3.6- latest_slot.py drive.py camera.py   # → Minimum 3.3 ✅；notebook 的 code cell 也是 3.2 ✅

@@ -220,8 +220,10 @@ class ReconstructApi(BaseHandler):
     def post(self, sid):
         # Session folder (checks the id)
         folder = _folder("maps", sid)
-        # Needs keyframes
-        if not os.path.exists(os.path.join(folder, "keyframes.json")):
+        # Keyframe reader (OpenCV / numpy only, no torch)
+        from studio.tasks.search.reconstruct import load_keyframes
+        # Needs keyframes (complete list, or the running / crashed session's line file)
+        if not load_keyframes(folder):
             # Conflict
             raise tornado.web.HTTPError(409, "this session has no keyframes")
         # Background job (CPU only; may run while a task drives)

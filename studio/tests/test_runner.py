@@ -9,6 +9,7 @@ import os
 import signal
 import struct
 import time
+import unittest
 
 from tornado import gen
 from tornado.ioloop import IOLoop
@@ -277,7 +278,40 @@ class RunnerTest(StudioTestCase):
         print("\n[safety] runner SIGKILL -> motor guard after %.2f s" % (calls[0] - t0))
         # Failed state
         self.assertEqual(link.status, "failed")
+        # Wait for the cleanup after the guard
+        while link.guarding and time.monotonic() - t0 < 5:
+            # Poll
+            await gen.sleep(0.05)
         # Devices are free again: the task can be started anew
+        self.assertTrue(self.studio.manager.device_free())
+        # The pages were told, with the guard's output
+        died = [ev for _, ev in link.events if ev.get("kind") == "runner_died"]
+        # Exactly one report
+        self.assertEqual(len(died), 1)
+        # Guard output included
+        self.assertEqual(died[0]["motor_guard"], "fake guard")
+
+    # A hung runner has to be killed on stop: the motor guard runs as well
+    @gen_test(timeout=TIMEOUT)
+    async def test_hung_runner_killed_runs_motor_guard(self):
+        # Calls of the fake motor guard
+        calls = []
+        # Factory that injects the fake guard
+        self.studio.manager.link_factory = lambda *a, **k: RunnerLink(
+            *a, motor_guard=lambda: calls.append(1) or "fake guard", **k)
+        # Running task
+        link = await self.start_task()
+        # Freeze it: it cannot answer shutdown or SIGTERM any more
+        os.kill(link.proc.pid, signal.SIGSTOP)
+        # Orderly stop gives up and kills it
+        await link.stop(timeout=0.3)
+        # Killed
+        self.assertEqual(link.proc.returncode, -signal.SIGKILL)
+        # The guard ran once
+        self.assertEqual(calls, [1])
+        # Reported to the pages
+        self.assertTrue(any(ev.get("kind") == "runner_killed" for _, ev in link.events))
+        # Devices free
         self.assertTrue(self.studio.manager.device_free())
 
     # A second task is refused while one runs; stop frees the devices
@@ -297,3 +331,39 @@ class RunnerTest(StudioTestCase):
         self.assertTrue(body["stopped"])
         # Free again
         self.assertTrue(self.studio.manager.device_free())
+
+
+# Runner.send with values JSON cannot encode (no process needed)
+class RunnerSendTest(unittest.TestCase):
+
+    # A bad telemetry value is replaced, reported, and the thread lives on
+    def test_unencodable_value_is_replaced(self):
+        # Real encoder (raises like the socket connection)
+        from studio.ipc import pack
+        # Class under test
+        from studio.runner import Runner
+
+        # Connection stand-in that encodes like the real one
+        class FakeConn(object):
+            # Sent headers
+            sent = []
+
+            # Encode and record
+            def send(self, header, payload=b""):
+                # Raises TypeError like the real connection
+                pack(header, payload)
+                # Record it
+                self.sent.append(header)
+
+        # Runner around it
+        runner = Runner(FakeConn())
+        # An object json cannot encode
+        ok = runner.send({"type": "telemetry", "data": {"odd": object(), "n": 1}})
+        # Still sent
+        self.assertTrue(ok)
+        # With a readable stand-in, other values unchanged
+        self.assertIn("object", runner.conn.sent[-1]["data"]["odd"])
+        # The plain value is kept
+        self.assertEqual(runner.conn.sent[-1]["data"]["n"], 1)
+        # The problem is reported to the page
+        self.assertEqual(runner.events[-1]["kind"], "error")

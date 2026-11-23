@@ -313,15 +313,16 @@ def build_parser():
     ap.add_argument("--no-pretrained", action="store_true", help="(testing) skip ImageNet weights")
     # Training device
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    # Parse the command line
     # The finished parser
     return ap
 
 
 # Command-line entry point
 def main():
+    # Command-line parser (kept for error messages)
+    ap = build_parser()
     # Parse the command line
-    args = build_parser().parse_args()
+    args = ap.parse_args()
 
     # One existing baseline cannot stand for several seeds
     if args.base and len(args.seeds) > 1:

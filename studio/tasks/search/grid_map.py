@@ -29,8 +29,10 @@ class GridMap(object):
         self.res, self.n = float(res), int(round(side / res))
         # Log-odds per cell
         self.logodds = np.zeros((self.n, self.n), np.float32)
-        # Trajectory in metres
-        self.path = []
+        # Number of update() calls (frames)
+        self.updates = 0
+        # Trajectory as cells, a new entry only when the cell changes (bounded by the distance driven)
+        self.track = []
 
     # World metres -> cell (column, row); rows grow towards -y
     def cell(self, x, y):
@@ -50,87 +52,84 @@ class GridMap(object):
         # Bounds check
         return 0 <= col < self.n and 0 <= row < self.n
 
-    # Cells of one ray: the free ones and the end cell
-    def ray_cells(self, x0, y0, x1, y1):
-        """``(free_cells, end_cell)`` of the segment (cells as (col, row))."""
-        # Cells of both ends
-        c0, c1 = self.cell(x0, y0), self.cell(x1, y1)
-        # Number of steps along the longer axis
-        n = max(abs(c1[0] - c0[0]), abs(c1[1] - c0[1]), 1)
-        # Every cell before the end
-        free = set((int(round(c0[0] + (c1[0] - c0[0]) * k / float(n))), int(round(c0[1] + (c1[1] - c0[1]) * k / float(n))))
-                   for k in range(n))
-        # Free cells and the end
-        return free, c1
-
-    # Apply one frame's observations
-    def _apply(self, free, hits):
-        # A cell hit in this frame is never also marked free by a neighbouring ray
-        for c in free - hits:
+    # Apply one frame's observations (arrays of columns / rows; duplicates allowed)
+    def _apply(self, free_cols, free_rows, hit_cols, hit_rows):
+        # Flat indices of the cells inside the grid, each cell once
+        def flat(cols, rows):
             # Inside only
-            if self.inside(*c):
-                # More free, clamped
-                self.logodds[c[1], c[0]] = max(-L_MAX, self.logodds[c[1], c[0]] + L_FREE)
+            ok = (cols >= 0) & (cols < self.n) & (rows >= 0) & (rows < self.n)
+            # Unique flat indices
+            return np.unique(rows[ok] * self.n + cols[ok])
         # Hit cells
-        for c in hits:
-            # Inside only
-            if self.inside(*c):
-                # More occupied, clamped
-                self.logodds[c[1], c[0]] = min(L_MAX, self.logodds[c[1], c[0]] + L_OCC)
-
-    # Mark one ray (single observation)
-    def ray(self, x0, y0, x1, y1, hit):
-        """Free along the segment; occupied at its end when ``hit``."""
-        # Cells of the ray
-        free, end = self.ray_cells(x0, y0, x1, y1)
-        # Apply
-        self._apply(free, {end} if hit else set())
+        hits = flat(hit_cols, hit_rows)
+        # A cell hit in this frame is never also marked free by a neighbouring ray
+        free = np.setdiff1d(flat(free_cols, free_rows), hits, assume_unique=True)
+        # Flat view of the grid
+        g = self.logodds.reshape(-1)
+        # More free, clamped
+        g[free] = np.maximum(-L_MAX, g[free] + L_FREE)
+        # More occupied, clamped
+        g[hits] = np.minimum(L_MAX, g[hits] + L_OCC)
 
     # Update from one frame's sectors
     def update(self, pose, scores, camera, horizon_frac, max_range=1.5):
         """``pose`` (x, y, yaw); ``scores`` free distance per sector (fractions of the analysed height)."""
         # Pose
         x, y, yaw = pose
-        # Remember the trajectory
-        self.path.append((x, y))
+        # Count the frame
+        self.updates += 1
+        # Robot cell
+        c0 = self.cell(x, y)
+        # Extend the trajectory when the robot entered a new cell
+        if not self.track or self.track[-1] != c0:
+            # New cell
+            self.track.append(c0)
         # Picture size and first analysed row
         h = camera.size
         # Top row of the analysed area
         top = horizon_frac * h
+        # Sector scores as an array
+        sc = np.asarray(scores, np.float64)
+        # Number of sectors
+        n = len(sc)
+        # Centre column of each sector
+        u = (np.arange(n) + 0.5) * camera.size / n
+        # Row where each sector's floor ends (not above the horizon)
+        v = np.maximum(h - sc * (h - top), camera.horizon_row() + 2)
+        # Floor points there (robot frame), all sectors at once
+        gx, gy = camera.ground_from_pixel(u, v)
+        # Rays that hit the floor
+        finite = np.isfinite(gx) & np.isfinite(gy)
+        # Distance; NaN: infinitely far
+        dist = np.where(finite, np.hypot(np.where(finite, gx, 0.0), np.where(finite, gy, 0.0)), np.inf)
+        # The floor ended inside the analysed area and within range
+        hit = (sc < 0.98) & (dist < max_range)
+        # Limit the rays to max_range
+        scale = np.where(dist > 0, np.minimum(1.0, max_range / np.where(dist > 0, dist, 1.0)), 0.0)
+        # End points in the robot frame (no floor: straight ahead at max_range)
+        ex = np.where(finite, np.where(finite, gx, 0.0) * scale, max_range)
+        # Sideways part
+        ey = np.where(finite, np.where(finite, gy, 0.0) * scale, 0.0)
         # Rotation of the robot
         c, s = math.cos(yaw), math.sin(yaw)
-        # Number of sectors
-        n = len(scores)
-        # Free and hit cells of this frame
-        free, hits = set(), set()
-        # Every sector
-        for i, sc in enumerate(scores):
-            # Centre column of the sector
-            u = (i + 0.5) * camera.size / n
-            # Row where its floor ends (just above it is the obstacle)
-            v = h - sc * (h - top)
-            # Floor point there (robot frame)
-            gx, gy = camera.ground_from_pixel(u, max(v, camera.horizon_row() + 2))
-            # Distance; NaN or too far: limit to max_range, no hit
-            dist = math.hypot(float(gx), float(gy)) if np.isfinite(gx) else float("inf")
-            # The floor ended inside the analysed area and within range
-            hit = sc < 0.98 and dist < max_range
-            # Limit the ray
-            scale = min(1.0, max_range / dist) if dist > 0 else 0.0
-            # End point in the robot frame
-            ex, ey = float(gx) * scale if np.isfinite(gx) else max_range, float(gy) * scale if np.isfinite(gy) else 0.0
-            # World end point
-            wx, wy = x + c * ex - s * ey, y + s * ex + c * ey
-            # Cells of the ray
-            f, end = self.ray_cells(x, y, wx, wy)
-            # Collect the free ones
-            free |= f
-            # And the hit
-            if hit:
-                # Occupied end
-                hits.add(end)
+        # End cells (columns / rows) in the world
+        c1 = np.floor((x + c * ex - s * ey) / self.res + self.n / 2.0).astype(np.int64)
+        # Rows
+        r1 = np.floor(-(y + s * ex + c * ey) / self.res + self.n / 2.0).astype(np.int64)
+        # Steps of each ray along its longer axis (at least 1)
+        steps = np.maximum(np.maximum(np.abs(c1 - c0[0]), np.abs(r1 - c0[1])), 1)
+        # Ray index and step k for every cell before the end
+        ray = np.repeat(np.arange(n), steps)
+        # Step within its ray
+        k = np.arange(ray.size) - np.repeat(np.cumsum(steps) - steps, steps)
+        # Fraction along the ray
+        t = k / steps[ray].astype(np.float64)
+        # Free cells: rounded points along the segment, end cell excluded
+        fc = np.round(c0[0] + (c1[ray] - c0[0]) * t).astype(np.int64)
+        # Rows
+        fr = np.round(c0[1] + (r1[ray] - c0[1]) * t).astype(np.int64)
         # Apply the whole frame at once
-        self._apply(free, hits)
+        self._apply(fc, fr, c1[hit], r1[hit])
 
     # Frontier clusters
     def frontiers(self, min_cells=4):
@@ -167,12 +166,10 @@ class GridMap(object):
         grey = (255 * (1.0 - p)).astype(np.uint8)
         # Colour image
         img = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
-        # Trajectory in blue
-        pts = [self.cell(x, y) for x, y in self.path]
-        # Draw it
-        for a, b in zip(pts, pts[1:]):
-            # Segment
-            cv2.line(img, a, b, (200, 80, 0), 1)
+        # Trajectory in blue (one call for the whole polyline)
+        if len(self.track) > 1:
+            # Draw it
+            cv2.polylines(img, [np.int32(self.track).reshape(-1, 1, 2)], False, (200, 80, 0), 1)
         # Start point in green
         cv2.circle(img, self.cell(0.0, 0.0), 3, (0, 180, 0), -1)
         # Enlarge

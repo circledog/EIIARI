@@ -21,13 +21,12 @@ import math
 import os
 import threading
 import time
-import traceback
 
 import cv2
 import numpy as np
 
-# Base class of task runtimes
-from studio.runner import TaskRuntime
+# Camera loop, watchdog and stop logic shared with the navigate task
+from studio.camloop import CameraLoopRuntime
 # Studio paths and quota checks
 from studio import config
 # Quotas
@@ -48,8 +47,6 @@ from studio.tasks.search.target import TargetModel, Detector
 from studio.tasks.search.explore import choose_goal, steer_to
 # project4 controller (studio.hardware put project4/ on sys.path)
 from control import SteeringController  # noqa: E402
-# Rolling percentiles
-from drive import PeriodStats  # noqa: E402
 
 
 # Folder of the registered targets
@@ -59,23 +56,26 @@ def targets_dir():
     return config.home_dir("targets")
 
 
+# Keyframe poses written while the search runs
+KEYFRAMES_JSONL = "keyframes.jsonl"
+
+
 # Search runtime
-class Runtime(TaskRuntime):
+class Runtime(CameraLoopRuntime):
     """See the module docstring."""
+
+    # Event sent when driving stops
+    STOPPED_EVENT = "search.stopped"
 
     # Starting a search moves the robot
     MOTION_COMMANDS = ("start_search",)
 
     # Build the parts
     def __init__(self, ctx):
-        # Base: context and display slot
-        TaskRuntime.__init__(self, ctx)
+        # Base: camera, lock, driving state, statistics
+        CameraLoopRuntime.__init__(self, ctx)
         # Short name
         p = ctx.params
-        # Camera source
-        sensor = ctx.sensors.get("camera")
-        # Non-blocking read()
-        self.camera = sensor.source if sensor is not None else None
         # Camera geometry: calibration file or field of view
         if p.get("calibration"):
             # Calibrated model
@@ -94,20 +94,16 @@ class Runtime(TaskRuntime):
                                              max_output=p["max_output"])
         # Quota monitor
         self.mon = ResourceMonitor()
-        # Lock around driving / motors
-        self.lock = threading.RLock()
         # Lock around the session files (loop thread vs commands / close)
         self.slock = threading.RLock()
         # State machine
-        self.state, self.driving, self.last_ok = "idle", False, 0.0
+        self.state = "idle"
         # Session parts (created by start_search)
         self.session, self.odo, self.grid, self.detector = None, None, None, None
         # Exploration: goal, visited goals, turning direction and until when
         self.goal, self.visited, self.turn = None, [], None
-        # Newest frame, detection, timing
-        self.frame, self.frame_t, self.det, self.stats, self.periods = None, 0.0, {}, {}, PeriodStats()
-        # Set by close()
-        self.done = threading.Event()
+        # Newest detection
+        self.det = {}
         # Clock of the exploration logic (replaceable by a simulation)
         self.clock = time.monotonic
         # Exploration start and last goal choice (clock seconds)
@@ -158,6 +154,8 @@ class Runtime(TaskRuntime):
         self._traj_w = csv.writer(self._traj)
         # Header
         self._traj_w.writerow(["t", "x", "y", "yaw", "odo_ok", "inliers", "state"])
+        # Keyframe poses, one JSON line each (appending is cheap; keyframes.json is written at the end)
+        self._kf_file = open(os.path.join(sdir, KEYFRAMES_JSONL), "w", encoding="utf-8")
         # Fresh parts
         self.odo, self.grid = FloorOdometry(self.cam), GridMap(side=p["map_size"], res=p["grid_res"])
         # Detector with K hits in a row
@@ -192,13 +190,19 @@ class Runtime(TaskRuntime):
         name = "%05d.jpg" % len(self.keyframes)
         # Save the raw frame
         cv2.imwrite(os.path.join(self.session["dir"], "keyframes", name), frame)
+        # Its entry
+        entry = {"file": name, "pose": [round(v, 4) for v in pose], "t": time.time()}
         # Remember it
-        self.keyframes.append({"file": name, "pose": [round(v, 4) for v in pose], "t": time.time()})
+        self.keyframes.append(entry)
+        # One line on disk right away (survives a crash)
+        self._kf_file.write(json.dumps(entry) + "\n")
+        # Into the OS buffers
+        self._kf_file.flush()
         # Last keyframe pose
         self._last_kf = pose
 
-    # Write the session files (grid picture, keyframes list, summary)
-    def _save_session(self):
+    # Write the session files (grid picture, summary; the full keyframes list only when ``final``)
+    def _save_session(self, final=False):
         # No session
         if self.session is None:
             # Nothing
@@ -209,10 +213,13 @@ class Runtime(TaskRuntime):
         cv2.imwrite(os.path.join(sdir, "grid.png"), self.grid.image())
         # Grid geometry for the viewer
         info = {"res": self.grid.res, "n": self.grid.n, "scale": 2}
-        # Keyframes
-        with open(os.path.join(sdir, "keyframes.json"), "w", encoding="utf-8") as f:
-            # JSON
-            json.dump(self.keyframes, f)
+        # Full keyframes list at the end only (rewriting it every few seconds grew with the run
+        # and stalled the control loop; keyframes.jsonl has every entry meanwhile)
+        if final:
+            # Write it
+            with open(os.path.join(sdir, "keyframes.json"), "w", encoding="utf-8") as f:
+                # JSON
+                json.dump(self.keyframes, f)
         # Summary
         with open(os.path.join(sdir, "summary.json"), "w", encoding="utf-8") as f:
             # State, found object, grid stats, odometry failures
@@ -225,7 +232,7 @@ class Runtime(TaskRuntime):
     # The object was confirmed: stop, photo, position
     def _found(self, frame, det, pose):
         # Stop
-        self._stop("found", fault=False)
+        self.stop_drive("found", fault=False)
         # State
         self.state = "found"
         # Photo with the outline
@@ -259,19 +266,6 @@ class Runtime(TaskRuntime):
         self.ctx.emit("search.found", **self.session["found"])
 
     # ------------------------------------------------------------ driving
-    # Stop the motors (state unchanged unless given)
-    def _stop(self, code, fault=False):
-        # Under the lock
-        with self.lock:
-            # Was it driving?
-            was = self.driving
-            # Not any more
-            self.driving = False
-            # Motors off
-            self.ctx.robot.stop()
-        # Tell the page
-        self.ctx.emit("search.stopped", code=code, fault=fault, was_driving=was)
-
     # Send motor values while exploring
     def _motors(self, left, right):
         # Under the lock
@@ -284,31 +278,10 @@ class Runtime(TaskRuntime):
                 self.last_ok = time.monotonic()
 
     # ------------------------------------------------------------ loop
-    # Start the loop and the watchdog
-    def start(self):
-        # Both threads
-        for target in (self._loop, self._watchdog):
-            # Daemon thread
-            t = threading.Thread(target=target, name=target.__name__.strip("_"))
-            # Do not block shutdown
-            t.daemon = True
-            # Run
-            t.start()
-
-    # Watchdog: no good step while driving -> stop
-    def _watchdog(self):
-        # Until close()
-        while not self.done.wait(0.02):
-            # Late?
-            with self.lock:
-                # Driving and no good step for too long
-                late = self.driving and time.monotonic() - self.last_ok > float(self.ctx.params["safety_timeout"])
-            # Stop
-            if late:
-                # Fault stop
-                self._stop("watchdog", fault=True)
-                # State
-                self.state = "stopped"
+    # After the base loop's own safety stops (watchdog, camera stalled, loop error)
+    def on_safety_stop(self, code):
+        # The search ends
+        self.state = "stopped"
 
     # Exploration step: motors from the goal and the free space
     def _explore(self, pose, scores):
@@ -317,7 +290,7 @@ class Runtime(TaskRuntime):
         # Time limit
         if now - self._explore_t0 > self.ctx.params["time_limit_s"]:
             # Stop
-            self._stop("time_limit")
+            self.stop_drive("time_limit")
             # Done
             self.state = "done"
             # Save
@@ -339,7 +312,7 @@ class Runtime(TaskRuntime):
         # Nothing to explore any more
         if self.goal is None:
             # First frames: no map yet, just look around by turning
-            if len(self.grid.path) < 30:
+            if self.grid.updates < 30:
                 # Turn left slowly
                 p = self.ctx.params["turn_power"]
                 # Motors
@@ -347,7 +320,7 @@ class Runtime(TaskRuntime):
                 # Status
                 return "look_around"
             # Stop
-            self._stop("explored")
+            self.stop_drive("explored")
             # Done
             self.state = "done"
             # Save
@@ -415,7 +388,14 @@ class Runtime(TaskRuntime):
         # Movement over the window
         return math.hypot(pose[0] - self._moves[0][1], pose[1] - self._moves[0][2]) < 0.03
 
-    # One frame
+    # One frame (called by the base class loop; session files are not closed meanwhile)
+    def step(self, frame):
+        # Hold the session lock
+        with self.slock:
+            # Process the frame
+            return self._step(frame)
+
+    # One frame, under the session lock
     def _step(self, frame):
         # Timings
         t0 = time.monotonic()
@@ -471,74 +451,6 @@ class Runtime(TaskRuntime):
         # Stage times
         return timing
 
-    # Loop thread body
-    def _loop(self):
-        # Last frame object, previous step time, per-second sums
-        last, prev, acc, win = None, None, {}, time.monotonic()
-        # Steps in the window
-        n = 0
-        # Until close()
-        while not self.done.is_set():
-            # An error must not kill the loop
-            try:
-                # No camera
-                if self.camera is None:
-                    # Idle
-                    time.sleep(0.1)
-                    # Again
-                    continue
-                # Newest frame
-                frame = self.camera.read()
-                # Now
-                now = time.monotonic()
-                # Nothing new
-                if frame is None or frame is last:
-                    # Camera stalled while driving
-                    if self.driving and now - self.frame_t > float(self.ctx.params["safety_timeout"]):
-                        # Fault stop
-                        self._stop("camera_stalled", fault=True)
-                        # State
-                        self.state = "stopped"
-                    # Short wait
-                    time.sleep(0.003)
-                    # Again
-                    continue
-                # Remember it
-                last, self.frame, self.frame_t = frame, frame, now
-                # One step (session files are not closed meanwhile)
-                with self.slock:
-                    # Process the frame
-                    timing = self._step(frame)
-                # Period
-                if prev is not None:
-                    # Into the window
-                    self.periods.add(now - prev)
-                # Remember
-                prev = now
-                # Count
-                n += 1
-                # Sum the stage times
-                for k, v in timing.items():
-                    # Sum
-                    acc[k] = acc.get(k, 0.0) + v
-                # Once per second
-                if now - win >= 1.0:
-                    # Statistics
-                    self.stats = dict({"fps": n / (now - win), "period_p95_ms": self.periods.percentile(95)},
-                                      **dict((k + "_ms", v * 1000.0 / max(1, n)) for k, v in acc.items()))
-                    # New window
-                    acc, n, win = {}, 0, now
-            # Report, stop, keep going
-            except Exception as e:
-                # Never keep driving after an error
-                self._stop("loop_error", fault=True)
-                # State
-                self.state = "stopped"
-                # Tell the page
-                self.ctx.emit("error", where="search loop", error=repr(e), traceback=traceback.format_exc())
-                # Do not spin
-                time.sleep(0.5)
-
     # ---------------------------------------------------------- commands
     # Commands from the page
     def command(self, name, args):
@@ -575,7 +487,7 @@ class Runtime(TaskRuntime):
         # Stop the search (session files are kept)
         if name == "stop_search":
             # Motors off
-            self._stop("manual")
+            self.stop_drive("manual")
             # Stopped (not found)
             if self.state == "exploring":
                 # State
@@ -595,10 +507,12 @@ class Runtime(TaskRuntime):
         with self.slock:
             # Save and close
             if self.session is not None:
-                # Files
-                self._save_session()
-                # Trajectory file
+                # Files, with the full keyframes list
+                self._save_session(final=True)
+                # Trajectory and keyframe files
                 self._traj.close()
+                # Close it
+                self._kf_file.close()
             # No session
             self.session = None
 
@@ -606,16 +520,11 @@ class Runtime(TaskRuntime):
     # Safety stop from the runner
     def stop_motion(self, code, detail=None):
         # Motors off
-        self._stop(code, fault=code not in ("shutdown", "task_stop"))
+        self.stop_drive(code, fault=code not in ("shutdown", "task_stop"))
         # A running search ends
         if self.state == "exploring":
             # Stopped
             self.state = "stopped"
-
-    # Moving while driving
-    def is_moving(self):
-        # Driving flag
-        return bool(self.driving)
 
     # Display item -> JPEG: sectors, detection, mini map, status
     def render(self, item, quality):
@@ -662,9 +571,7 @@ class Runtime(TaskRuntime):
 
     # Save and end
     def close(self):
-        # Motors off
-        self._stop("shutdown")
-        # End the threads
-        self.done.set()
+        # Motors off, threads end
+        CameraLoopRuntime.close(self)
         # Files
         self._close_session()
